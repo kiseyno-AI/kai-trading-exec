@@ -48,7 +48,7 @@ from app.services.monitoring import (
     _watch_buy_payload_is_quote_monitorable,
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
-    _load_core_desired_monitoring_symbols,
+    _load_core_monitoring_symbol_handoff,
 )
 from app.services.monitoring_price_source import is_us_regular_session
 from app.services.runtime_transitions import (
@@ -340,6 +340,7 @@ class MonitoringRuntimeSnapshot:
     items: list[CachedMonitoringItem]
     filled_today_symbols: list[str]
     execution_scope: dict[str, object] | None = None
+    passive_quote_symbols: list[str] = field(default_factory=list)
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -348,6 +349,8 @@ class MonitoringRuntimeSnapshot:
             "symbol_count": len(self.symbols),
             "item_count": len(self.items),
             "position_count": len(self.positions_by_symbol),
+            "passive_quote_symbols": list(self.passive_quote_symbols),
+            "passive_quote_symbol_count": len(self.passive_quote_symbols),
             "filled_today_symbols": list(self.filled_today_symbols),
             "execution_scope": (
                 dict(self.execution_scope)
@@ -1101,6 +1104,10 @@ class AutonomousRuntimeCoordinator:
                 raise RuntimeError("live broker position reconciliation failed")
         workset_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
         monitoring_workset_symbols = list(workset_snapshot.symbols)
+        authoritative_workset_symbols = _authoritative_monitoring_symbols(
+            workset_snapshot,
+            symbols=monitoring_workset_symbols,
+        )
         quote_symbols, session_inactive_symbols = _session_active_monitoring_symbols(
             workset_snapshot,
             now=started_at,
@@ -1116,7 +1123,7 @@ class AutonomousRuntimeCoordinator:
         )
         if self.session_factory is not None and self._reconcile_monitoring_orders_if_due(
             now=started_at,
-            symbols=set(monitoring_workset_symbols),
+            symbols=set(authoritative_workset_symbols),
         ):
             workset_snapshot = self._ensure_monitoring_runtime_snapshot(started_at)
             monitoring_workset_symbols = list(workset_snapshot.symbols)
@@ -1297,6 +1304,29 @@ class AutonomousRuntimeCoordinator:
             return payload
 
         if not prices:
+            db_evaluation_symbols = _authoritative_monitoring_symbols(
+                runtime_snapshot,
+                symbols=symbols,
+            )
+            if not db_evaluation_symbols:
+                payload = {
+                    "status_code": 200,
+                    "price_source_configured": (
+                        self._monitoring_price_source_state.configured
+                    ),
+                    "price_source": self._monitoring_price_source_state.snapshot(),
+                    "runtime_snapshot": workset_snapshot.snapshot(),
+                    **cached_payload,
+                    "monitored_symbols": monitored_symbols,
+                    "price_count": 0,
+                    "broker_action_symbols": [],
+                    "broker_action_price_count": 0,
+                    "db_evaluation_symbols": [],
+                    "db_scan_skipped": True,
+                    "db_scan_skip_reason": "passive_quote_only",
+                }
+                self._store_cycle_payload(worker_key="monitoring", payload=payload)
+                return payload
             # Empty/failed quote cycles still have work to do: persist a
             # checkpoint, surface coverage degradation, and retry previously
             # latched pending-dispatch exits that no longer require a quote.
@@ -1337,7 +1367,7 @@ class AutonomousRuntimeCoordinator:
                     db=db,
                     adapter=adapter,
                     prices=[],
-                    symbols=symbols,
+                    symbols=db_evaluation_symbols,
                     auth_session_factory=self._cycle_session_factory,
                     now=started_at,
                 )
@@ -1357,11 +1387,13 @@ class AutonomousRuntimeCoordinator:
                 "monitored_symbols": monitored_symbols,
                 "price_count": 0,
                 "broker_action_symbols": [
-                    symbol for symbol in symbols if symbol in submitted_symbols
+                    symbol
+                    for symbol in db_evaluation_symbols
+                    if symbol in submitted_symbols
                 ],
                 "broker_action_price_count": 0,
                 "broker_action_trace_scope": "confirmed_submissions",
-                "db_evaluation_symbols": symbols,
+                "db_evaluation_symbols": db_evaluation_symbols,
             }
             if post_entry_maintenance_count:
                 payload["pre_cached_post_entry_maintenance_count"] = (
@@ -1498,7 +1530,12 @@ class AutonomousRuntimeCoordinator:
             if int(result.payload.get("submitted_order_count") or 0) > 0:
                 snapshot_refreshed = self._reconcile_monitoring_orders_if_due(
                     now=datetime.now(UTC),
-                    symbols=set(symbols),
+                    symbols=set(
+                        _authoritative_monitoring_symbols(
+                            runtime_snapshot,
+                            symbols=symbols,
+                        )
+                    ),
                     force=True,
                 )
             if not snapshot_refreshed:
@@ -1929,21 +1966,35 @@ class AutonomousRuntimeCoordinator:
             return maintenance_count, review_count
 
     def _load_monitoring_runtime_snapshot(self, loaded_at: datetime) -> MonitoringRuntimeSnapshot:
-        desired_symbol_priority = _load_core_desired_monitoring_symbols(
-            settings=self.settings
+        core_handoff = _load_core_monitoring_symbol_handoff(
+            settings=self.settings,
+            observed_at=loaded_at,
         )
+        desired_symbol_priority = list(core_handoff.desired_symbols)
         with self._cycle_session_factory() as db:
-            symbols = list_autonomous_monitoring_symbols(
+            local_symbols = list_autonomous_monitoring_symbols(
                 settings=self.settings,
                 db=db,
                 effective_at=loaded_at,
                 desired_symbol_priority=desired_symbol_priority,
                 include_kis_us_symbols=self.settings.kis_us_trading_enabled,
             )
+            local_symbol_set = set(local_symbols)
+            passive_quote_symbols = [
+                symbol
+                for symbol in core_handoff.observation_only_symbols
+                if symbol not in local_symbol_set
+            ]
+            symbols = _merge_symbol_priority(local_symbols, passive_quote_symbols)
             snapshot = self._load_monitoring_runtime_snapshot_for_symbols_with_session(
                 db=db,
                 loaded_at=loaded_at,
+                symbols=local_symbols,
+            )
+            snapshot = replace(
+                snapshot,
                 symbols=symbols,
+                passive_quote_symbols=passive_quote_symbols,
             )
         prime_runtime_context = getattr(
             self.monitoring_price_source,
@@ -3240,7 +3291,21 @@ def _monitoring_snapshot_for_symbols(
         items=[
             item for item in snapshot.items if item.symbol in selected_symbol_set
         ],
+        passive_quote_symbols=[
+            symbol
+            for symbol in snapshot.passive_quote_symbols
+            if symbol in selected_symbol_set
+        ],
     )
+
+
+def _authoritative_monitoring_symbols(
+    snapshot: MonitoringRuntimeSnapshot,
+    *,
+    symbols: Iterable[str],
+) -> list[str]:
+    passive_symbols = set(snapshot.passive_quote_symbols)
+    return [symbol for symbol in symbols if symbol not in passive_symbols]
 
 
 def _session_active_monitoring_symbols(
@@ -3335,7 +3400,10 @@ def _monitoring_market_sessions(
 
 def _is_krx_symbol(symbol: str) -> bool:
     normalized = str(symbol or "").strip()
-    return len(normalized) == 6 and normalized.isdigit()
+    return bool(
+        len(normalized) == 6
+        and all("0" <= character <= "9" for character in normalized)
+    )
 
 
 def _select_monitoring_symbol_batch(

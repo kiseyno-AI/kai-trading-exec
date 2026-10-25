@@ -46,6 +46,16 @@ async def _wait_for_thread_event(event: threading.Event) -> None:
             await asyncio.sleep(0.001)
 
 
+def _core_monitoring_handoff(
+    desired_symbols: tuple[str, ...] = (),
+    observation_only_symbols: tuple[str, ...] = (),
+) -> monitoring_service.CoreMonitoringSymbolHandoff:
+    return monitoring_service.CoreMonitoringSymbolHandoff(
+        desired_symbols=desired_symbols,
+        observation_only_symbols=observation_only_symbols,
+    )
+
+
 def test_price_source_internal_type_error_is_not_retried_with_a_different_signature() -> None:
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
     observed_at = datetime(2026, 9, 11, 13, 0, tzinfo=UTC)
@@ -446,6 +456,60 @@ def test_monitoring_symbol_batches_keep_all_positions_and_cap_only_rotating_cand
     assert covered == set(desired)
 
 
+def test_nine_passive_quotes_rotate_across_two_six_symbol_cycles() -> None:
+    passive_symbols = [
+        "012030",
+        "032080",
+        "033560",
+        "070590",
+        "079940",
+        "086060",
+        "089890",
+        "323350",
+        "398120",
+    ]
+    cursor = 0
+    covered: set[str] = set()
+
+    for _ in range(2):
+        batch, cursor = _select_monitoring_symbol_batch(
+            desired_symbols=passive_symbols,
+            priority_symbols=set(),
+            batch_size=6,
+            cursor=cursor,
+        )
+        assert len(batch) == 6
+        covered.update(batch)
+
+    assert covered == set(passive_symbols)
+
+
+def test_passive_quotes_do_not_displace_held_or_actionable_local_priority() -> None:
+    local_held = "005930"
+    local_actionable = "000660"
+    passive_symbols = [
+        "012030",
+        "032080",
+        "033560",
+        "070590",
+        "079940",
+        "086060",
+        "089890",
+        "323350",
+        "398120",
+    ]
+
+    batch, _ = _select_monitoring_symbol_batch(
+        desired_symbols=[local_held, local_actionable, *passive_symbols],
+        priority_symbols={local_held},
+        batch_size=6,
+        cursor=0,
+    )
+
+    assert batch[:2] == [local_held, local_actionable]
+    assert len(batch) == 7
+
+
 def test_monitoring_cycle_does_not_mix_core_universe_into_active_local_work(
     monkeypatch,
 ) -> None:
@@ -469,8 +533,10 @@ def test_monitoring_cycle_does_not_mix_core_universe_into_active_local_work(
     )
     requested: list[str] = []
     monkeypatch.setattr(
-        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
-        lambda settings: ["100001", "100002", "100003"],
+        "app.services.autonomous_runtime._load_core_monitoring_symbol_handoff",
+        lambda **kwargs: _core_monitoring_handoff(
+            ("100001", "100002", "100003")
+        ),
     )
     monkeypatch.setattr(
         coordinator,
@@ -488,6 +554,284 @@ def test_monitoring_cycle_does_not_mix_core_universe_into_active_local_work(
     coordinator._monitoring_cycle_sync(datetime(2026, 8, 26, 1, 0, tzinfo=UTC))
 
     assert requested == ["005930", "AAPL"]
+
+
+def test_core_desired_krx_symbols_are_passive_quote_work_without_execution_authority(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'passive-core-quotes.db'}",
+        runtime_mode="paper",
+        monitoring_max_symbols_per_cycle=10,
+        monitoring_max_broker_actions_per_cycle=10,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    started_at = datetime(2026, 10, 26, 0, 1, tzinfo=UTC)
+    local_symbols = ["005930", "000660"]
+    requested_prices: list[str] = []
+    reconciled_symbol_sets: list[set[str]] = []
+
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "_load_core_monitoring_symbol_handoff",
+        lambda **kwargs: monitoring_service.CoreMonitoringSymbolHandoff(
+            desired_symbols=(
+                "035420",
+                "AAPL",
+                "12345",
+                "１２３４５６",
+                "005930",
+                "012030",
+                "035420",
+            ),
+            observation_only_symbols=("035420", "012030"),
+        ),
+    )
+
+    def load_local_symbols(**kwargs) -> list[str]:
+        assert kwargs["desired_symbol_priority"] == [
+            "035420",
+            "AAPL",
+            "12345",
+            "１２３４５６",
+            "005930",
+            "012030",
+            "035420",
+        ]
+        return list(local_symbols)
+
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "list_autonomous_monitoring_symbols",
+        load_local_symbols,
+    )
+
+    def load_snapshot(*, db, loaded_at, symbols):
+        del db
+        assert symbols == local_symbols
+        return MonitoringRuntimeSnapshot(
+            loaded_at=loaded_at,
+            symbols=list(symbols),
+            positions_by_symbol={
+                "005930": CachedMonitoringPosition(
+                    symbol="005930",
+                    quantity=1,
+                    provider="kis",
+                    exchange="KRX",
+                )
+            },
+            items=[
+                CachedMonitoringItem(
+                    id="local-actionable",
+                    symbol="000660",
+                    intent="intraday_watch_buy",
+                    status="watch_monitoring_active",
+                    trigger_price=Decimal("1"),
+                    provider="kis",
+                    exchange="KRX",
+                )
+            ],
+            filled_today_symbols=[],
+        )
+
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_runtime_snapshot_for_symbols_with_session",
+        load_snapshot,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_prices",
+        lambda **kwargs: (
+            requested_prices.extend(kwargs["symbols"])
+            or [
+                MonitoringPriceRequest(symbol=symbol, price=Decimal("70000"))
+                for symbol in kwargs["symbols"]
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_reconcile_monitoring_orders_if_due",
+        lambda **kwargs: (
+            reconciled_symbol_sets.append(set(kwargs["symbols"])) or False
+        ),
+    )
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "run_autonomous_monitoring_cycle",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("passive Core symbols must not enter broker-action evaluation")
+        ),
+    )
+
+    try:
+        snapshot = coordinator._load_monitoring_runtime_snapshot(started_at)
+        coordinator._monitoring_runtime_snapshot = snapshot
+        payload = coordinator._monitoring_cycle_sync(started_at)
+    finally:
+        engine.dispose()
+
+    assert snapshot.symbols == ["005930", "000660", "035420", "012030"]
+    assert [item.symbol for item in snapshot.items] == ["000660"]
+    assert snapshot.passive_quote_symbols == ["035420", "012030"]
+    assert requested_prices == ["005930", "000660", "035420", "012030"]
+    assert reconciled_symbol_sets == [{"005930", "000660"}]
+    assert payload["monitored_symbols"] == ["005930", "000660", "035420", "012030"]
+    assert payload["evaluated_item_count"] == 1
+    assert payload["triggered_item_count"] == 0
+    assert payload["items"] == [
+        {
+            "execution_plan_item_id": "local-actionable",
+            "symbol": "000660",
+            "intent": "intraday_watch_buy",
+            "status": "watch_monitoring_active",
+            "trigger_price": "1",
+            "observed_price": "70000",
+            "outcome": "waiting",
+        }
+    ]
+    assert payload["submitted_order_count"] == 0
+
+
+def test_passive_quote_only_cycle_with_missing_price_never_enters_order_evaluation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'passive-core-no-price.db'}",
+        runtime_mode="paper",
+        monitoring_max_broker_actions_per_cycle=10,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    started_at = datetime(2026, 10, 26, 0, 1, tzinfo=UTC)
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["012030"],
+        positions_by_symbol={},
+        items=[],
+        filled_today_symbols=[],
+        passive_quote_symbols=["012030"],
+    )
+    monkeypatch.setattr(coordinator, "_load_monitoring_prices", lambda **kwargs: [])
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "run_autonomous_monitoring_cycle",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("passive quotes must never enter order evaluation")
+        ),
+    )
+
+    try:
+        payload = coordinator._monitoring_cycle_sync(started_at)
+    finally:
+        engine.dispose()
+
+    assert payload["monitored_symbols"] == ["012030"]
+    assert payload["price_count"] == 0
+    assert payload["db_evaluation_symbols"] == []
+    assert payload["submitted_order_count"] == 0
+
+
+def test_triggered_local_item_filters_passive_quotes_from_broker_evaluation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'passive-trigger-filter.db'}",
+        runtime_mode="paper",
+        monitoring_max_broker_actions_per_cycle=10,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    started_at = datetime(2026, 10, 26, 0, 1, tzinfo=UTC)
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["000660", "032080"],
+        positions_by_symbol={},
+        items=[
+            CachedMonitoringItem(
+                id="local-triggered",
+                symbol="000660",
+                intent="intraday_watch_buy",
+                status="watch_monitoring_active",
+                trigger_price=Decimal("80000"),
+                provider="kis",
+                exchange="KRX",
+            )
+        ],
+        filled_today_symbols=[],
+        passive_quote_symbols=["032080"],
+    )
+    coordinator._monitoring_runtime_snapshot = snapshot
+    broker_evaluations: list[tuple[list[str], list[str]]] = []
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_prices",
+        lambda **kwargs: [
+            MonitoringPriceRequest(symbol=symbol, price=Decimal("70000"))
+            for symbol in kwargs["symbols"]
+        ],
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_reconcile_monitoring_orders_if_due",
+        lambda **kwargs: False,
+    )
+
+    def evaluate(**kwargs):
+        broker_evaluations.append(
+            (
+                list(kwargs["symbols"]),
+                [price.symbol for price in kwargs["prices"]],
+            )
+        )
+        return SimpleNamespace(
+            status_code=200,
+            payload={
+                "triggered_item_count": 1,
+                "submitted_order_count": 0,
+                "submitted_symbols": [],
+                "items": [],
+            },
+        )
+
+    monkeypatch.setattr(autonomous_runtime, "run_autonomous_monitoring_cycle", evaluate)
+    monkeypatch.setattr(
+        coordinator,
+        "_refresh_monitoring_runtime_snapshot",
+        lambda **kwargs: snapshot,
+    )
+
+    try:
+        payload = coordinator._monitoring_cycle_sync(started_at)
+    finally:
+        engine.dispose()
+
+    assert broker_evaluations == [(["000660"], ["000660"])]
+    assert payload["monitored_symbols"] == ["000660", "032080"]
+    assert payload["broker_action_symbols"] == []
 
 
 def test_session_active_monitoring_symbols_excludes_us_equities_after_close() -> None:
@@ -2243,8 +2587,8 @@ def test_cached_cycle_repairs_held_position_monitors_with_desired_symbols(monkey
     maintenance_calls: list[str] = []
 
     monkeypatch.setattr(
-        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
-        lambda settings: [],
+        "app.services.autonomous_runtime._load_core_monitoring_symbol_handoff",
+        lambda **kwargs: _core_monitoring_handoff(),
     )
     monkeypatch.setattr(coordinator, "_load_local_desired_monitoring_symbols", lambda: ["005930"])
     monkeypatch.setattr(coordinator, "_reconcile_monitoring_orders_if_due", lambda **kwargs: None)
@@ -2633,8 +2977,8 @@ def test_cached_cycle_removes_reviewed_position_from_reported_monitoring_set(
     coordinator._monitoring_runtime_snapshot = initial_snapshot
 
     monkeypatch.setattr(
-        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
-        lambda settings: [],
+        "app.services.autonomous_runtime._load_core_monitoring_symbol_handoff",
+        lambda **kwargs: _core_monitoring_handoff(),
     )
     monkeypatch.setattr(
         coordinator,
@@ -2719,8 +3063,8 @@ def test_cached_cycle_returns_review_transition_when_every_symbol_is_removed(
     )
     coordinator._monitoring_runtime_snapshot = initial_snapshot
     monkeypatch.setattr(
-        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
-        lambda settings: [],
+        "app.services.autonomous_runtime._load_core_monitoring_symbol_handoff",
+        lambda **kwargs: _core_monitoring_handoff(),
     )
     monkeypatch.setattr(
         coordinator,
@@ -3328,8 +3672,8 @@ def test_live_cycle_monitors_local_holdings_without_waiting_for_broker_discovery
         return ["005930"]
 
     monkeypatch.setattr(
-        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
-        lambda settings: [],
+        "app.services.autonomous_runtime._load_core_monitoring_symbol_handoff",
+        lambda **kwargs: _core_monitoring_handoff(),
     )
     monkeypatch.setattr(coordinator, "_load_local_desired_monitoring_symbols", load_local_symbols)
     monkeypatch.setattr(coordinator, "_reconcile_monitoring_orders_if_due", lambda **kwargs: None)
@@ -3395,8 +3739,8 @@ def test_fresh_monitoring_workset_rotates_without_database_access(monkeypatch) -
     maintenance_calls: list[list[str]] = []
 
     monkeypatch.setattr(
-        "app.services.autonomous_runtime._load_core_desired_monitoring_symbols",
-        lambda settings: (_ for _ in ()).throw(
+        "app.services.autonomous_runtime._load_core_monitoring_symbol_handoff",
+        lambda **kwargs: (_ for _ in ()).throw(
             AssertionError("fresh workset must not call Core")
         ),
     )

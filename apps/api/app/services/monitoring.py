@@ -164,6 +164,14 @@ logger = logging.getLogger(__name__)
 
 _CORE_DESIRED_MONITORING_SYMBOL_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
 _CORE_DESIRED_MONITORING_SYMBOL_WARNING_AT: dict[str, float] = {}
+MAX_CORE_OBSERVATION_ONLY_SYMBOLS = 512
+
+
+@dataclass(frozen=True)
+class CoreMonitoringSymbolHandoff:
+    desired_symbols: tuple[str, ...]
+    observation_only_symbols: tuple[str, ...]
+
 
 SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
 MONITORED_KIS_POSITION_EXCHANGES = tuple(
@@ -2387,12 +2395,18 @@ def _watch_buy_queue_warning_count(risk_context: dict[str, object]) -> int:
     return count
 
 
-def _load_core_desired_monitoring_symbols(*, settings: Settings) -> list[str]:
+def _load_core_monitoring_symbol_handoff(
+    *,
+    settings: Settings,
+    observed_at: datetime | None = None,
+) -> CoreMonitoringSymbolHandoff:
     env_priority = os.getenv("KAI_EXEC_MONITORING_SYMBOL_PRIORITY", "")
-    if env_priority.strip():
-        return _parse_symbol_priority(env_priority)
+    env_symbols = _parse_symbol_priority(env_priority) if env_priority.strip() else []
     if not settings.market_context_enabled or not settings.market_context_base_url:
-        return []
+        return CoreMonitoringSymbolHandoff(
+            desired_symbols=tuple(env_symbols),
+            observation_only_symbols=(),
+        )
     base_url = str(settings.market_context_base_url).rstrip("/")
     # Core owns the daily read model. Exec only consumes the cached handoff here;
     # forcing a rebuild on every workset refresh turns a priority hint into a
@@ -2411,7 +2425,9 @@ def _load_core_desired_monitoring_symbols(*, settings: Settings) -> list[str]:
         desired_symbols = realtime_subscription.get("desired_symbols")
         if not isinstance(desired_symbols, list):
             raise ValueError("Core monitored-symbol response is missing desired_symbols")
-        symbols = _parse_symbol_priority(",".join(str(symbol) for symbol in desired_symbols))
+        core_symbols = _parse_symbol_priority(
+            ",".join(str(symbol) for symbol in desired_symbols)
+        )
     except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
         cached = _cached_core_desired_monitoring_symbols(settings=settings, cache_key=base_url)
         _log_core_desired_monitoring_symbol_failure(
@@ -2420,9 +2436,143 @@ def _load_core_desired_monitoring_symbols(*, settings: Settings) -> list[str]:
             error=exc,
             fallback_symbols=cached,
         )
-        return cached
-    _CORE_DESIRED_MONITORING_SYMBOL_CACHE[base_url] = (time.monotonic(), tuple(symbols))
-    return symbols
+        return CoreMonitoringSymbolHandoff(
+            desired_symbols=tuple(env_symbols or cached),
+            observation_only_symbols=(),
+        )
+    _CORE_DESIRED_MONITORING_SYMBOL_CACHE[base_url] = (
+        time.monotonic(),
+        tuple(core_symbols),
+    )
+    observation_only_symbols = _validated_core_observation_only_symbols(
+        payload=payload,
+        core_desired_symbols=core_symbols,
+        settings=settings,
+        observed_at=_normalize_utc(observed_at or datetime.now(UTC)),
+    )
+    return CoreMonitoringSymbolHandoff(
+        desired_symbols=tuple(env_symbols or core_symbols),
+        observation_only_symbols=tuple(observation_only_symbols),
+    )
+
+
+def _load_core_desired_monitoring_symbols(*, settings: Settings) -> list[str]:
+    handoff = _load_core_monitoring_symbol_handoff(settings=settings)
+    return list(handoff.desired_symbols)
+
+
+def _validated_core_observation_only_symbols(
+    *,
+    payload: dict[str, object],
+    core_desired_symbols: list[str],
+    settings: Settings,
+    observed_at: datetime,
+) -> list[str]:
+    realtime_subscription = payload.get("realtime_subscription")
+    if not isinstance(realtime_subscription, dict):
+        return []
+    raw_symbols = realtime_subscription.get("observation_only_symbols")
+    if raw_symbols is None:
+        return []
+    if not isinstance(raw_symbols, list):
+        return []
+
+    observation_only_symbols: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in raw_symbols:
+        if not isinstance(raw_symbol, str):
+            return []
+        symbol = raw_symbol.strip()
+        if (
+            len(symbol) != 6
+            or any(character < "0" or character > "9" for character in symbol)
+        ):
+            return []
+        if symbol not in seen:
+            observation_only_symbols.append(symbol)
+            seen.add(symbol)
+    if not observation_only_symbols:
+        return []
+    if not seen.issubset(set(core_desired_symbols)):
+        return []
+    declared_limit = realtime_subscription.get("max_subscriptions")
+    observation_limit = (
+        declared_limit
+        if isinstance(declared_limit, int)
+        and not isinstance(declared_limit, bool)
+        and declared_limit > 0
+        else MAX_CORE_OBSERVATION_ONLY_SYMBOLS
+    )
+    observation_limit = min(observation_limit, MAX_CORE_OBSERVATION_ONLY_SYMBOLS)
+    if len(observation_only_symbols) > observation_limit:
+        return []
+
+    expected_market_date = observed_at.astimezone(KRX_TIMEZONE).date().isoformat()
+    if payload.get("market_date") != expected_market_date:
+        return []
+    source_coverage = payload.get("source_coverage")
+    if (
+        not isinstance(source_coverage, dict)
+        or source_coverage.get("membership_complete") is not True
+    ):
+        return []
+    freshness = payload.get("freshness")
+    if not isinstance(freshness, dict):
+        return []
+    if freshness.get("market_date") != expected_market_date:
+        return []
+    generated_at = _strict_queue_evidence_datetime(freshness.get("generated_at"))
+    if generated_at is None:
+        return []
+    age = observed_at - generated_at
+    maximum_age_seconds = max(
+        int(settings.market_context_cache_ttl_seconds),
+        int(settings.exec_agent_max_account_snapshot_age_seconds),
+        1,
+    )
+    if age < timedelta(0) or age > timedelta(seconds=maximum_age_seconds):
+        return []
+
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return []
+    items_by_symbol: dict[str, list[dict[str, object]]] = {}
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            continue
+        symbol = raw_item.get("symbol")
+        if isinstance(symbol, str):
+            items_by_symbol.setdefault(symbol.strip(), []).append(raw_item)
+    for symbol in observation_only_symbols:
+        matching_items = items_by_symbol.get(symbol, [])
+        if len(matching_items) != 1:
+            return []
+        item = matching_items[0]
+        if item.get("monitoring_statuses") != ["signal_wait_observation_only"]:
+            return []
+        if item.get("exec_monitoring_active") is not False:
+            return []
+        if item.get("exec_agent_approved") is not False:
+            return []
+        if any(
+            item.get(field_name) != []
+            for field_name in (
+                "planned_intents",
+                "tactical_actions",
+                "handoff_intents",
+            )
+        ):
+            return []
+        if item.get("trigger_price") is not None:
+            return []
+        if item.get("chase_limit_price") is not None:
+            return []
+        if (
+            item.get("exec_runtime_exclusion_reason")
+            != "observation_only_no_order_authority"
+        ):
+            return []
+    return observation_only_symbols
 
 
 def _cached_core_desired_monitoring_symbols(*, settings: Settings, cache_key: str) -> list[str]:

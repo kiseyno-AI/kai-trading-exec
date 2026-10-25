@@ -296,6 +296,17 @@ committed plan, order, fill, sizing, authority, or broker-session change
 invalidates the affected cache immediately. Core supplies only cached symbol
 priority; Exec does not force Core to rebuild that read model on every refresh.
 
+Core may additionally request passive KRX quote observation through the explicit
+`realtime_subscription.observation_only_symbols` handoff. Exec accepts that list
+only from a complete, same-market-date read model within the configured evidence
+age bound and only when each item is marked
+`signal_wait_observation_only` with no execution intent, trigger, chase limit, or
+agent approval. These symbols enter the rotating quote workset only: they are
+kept out of persisted item/position hydration, order reconciliation, broker-action
+evaluation, submission, and cancellation. `KAI_EXEC_MONITORING_SYMBOL_PRIORITY`
+and ordinary Core `desired_symbols` remain ordering hints and cannot grant this
+observation-only membership.
+
 An empty dispatch queue is rescanned at most once per 60 seconds unless a local
 write makes it dirty or a known scheduled job becomes due. Repeated no-price
 monitoring cycles likewise write one checkpoint and then suppress redundant DB
