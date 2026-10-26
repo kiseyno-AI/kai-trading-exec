@@ -7170,17 +7170,28 @@ def test_dynamic_delegated_gates_resume_only_with_fresh_authoritative_evidence()
 
 
 @pytest.mark.parametrize(
-    "freshness_update",
+    "freshness_case",
     [
-        {"source": "transport_received_at_untrusted"},
-        {"observed_at": (datetime.now(UTC) - timedelta(minutes=5)).isoformat()},
-        {"observed_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat()},
+        "untrusted",
+        "stale",
+        "future",
     ],
 )
 def test_dynamic_liquidity_gate_rejects_untrusted_stale_or_future_turnover(
-    freshness_update: dict[str, object],
+    freshness_case: str,
 ) -> None:
     evaluated_at = datetime.now(UTC)
+    freshness_update: dict[str, object]
+    if freshness_case == "untrusted":
+        freshness_update = {"source": "transport_received_at_untrusted"}
+    elif freshness_case == "stale":
+        freshness_update = {
+            "observed_at": (evaluated_at - timedelta(minutes=5)).isoformat()
+        }
+    else:
+        freshness_update = {
+            "observed_at": (evaluated_at + timedelta(minutes=5)).isoformat()
+        }
     freshness = {
         "valid": True,
         "source": "broker_realtime_exchange_time",
