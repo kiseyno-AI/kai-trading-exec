@@ -2994,6 +2994,11 @@ def test_verified_flat_isolates_old_conflict_for_cross_lane_watch_buy(
             filled_at=old_at,
             suffix="old-conflict-flat-watch-buy",
         )
+        old_order.request_metadata = {
+            **old_order.request_metadata,
+            "metadata": {},
+            "original_command": {"metadata": {}},
+        }
         session.add(
             ExecutionFill(
                 broker_order_pk=old_order.id,
@@ -3080,6 +3085,11 @@ def test_verified_flat_isolates_old_conflict_for_exact_family_sell(
             filled_at=old_at,
             suffix="old-conflict-flat-family-sell",
         )
+        old_order.request_metadata = {
+            **old_order.request_metadata,
+            "metadata": {},
+            "original_command": {"metadata": {}},
+        }
         session.add(
             ExecutionFill(
                 broker_order_pk=old_order.id,
@@ -3111,6 +3121,128 @@ def test_verified_flat_isolates_old_conflict_for_exact_family_sell(
 
     assert result.status_code == 201, result.payload
     assert len(adapter.order_calls) == 1
+    engine.dispose()
+
+
+def test_current_generation_legacy_identity_blocks_cross_lane_watch_buy(
+    tmp_path,
+) -> None:
+    settings = _settings(tmp_path, "legacy-identity-current-watch-buy.db")
+    adapter = _adapter(
+        holdings=[
+            BrokerAccountHolding(
+                symbol="005930",
+                quantity=5,
+                sellable_quantity=5,
+                average_price=Decimal("100"),
+                payload={"current_price": "100"},
+            )
+        ]
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=adapter)
+    _resume(app)
+    candidate = _watch_item(
+        settings=settings,
+        item_id="legacy-identity-current-short-buy",
+        lane="short-term-decider",
+        source_key="legacy-identity-current-short-family",
+    )
+    with app.state.db_session_factory() as session:
+        _seed_single_family_inventory(
+            settings=settings,
+            session=session,
+            candidate=candidate,
+            quantity=5,
+        )
+        current_order = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key == "held-family-filled-buy"
+            )
+        )
+        assert current_order is not None
+        current_order.request_metadata = {
+            **current_order.request_metadata,
+            "metadata": {},
+            "original_command": {"metadata": {}},
+        }
+        session.commit()
+        result = broker_orders_service.place_broker_order(
+            settings=settings,
+            db=session,
+            adapter=adapter,
+            command=_watch_command(candidate),
+            request_source=MONITORING_SOURCE,
+        )
+
+    assert result.status_code == 409, result.payload
+    assert result.payload["block_reason"] == (
+        "strategy_family_persisted_identity_mismatch"
+    )
+    assert result.payload["manual_review_required"] is True
+    assert adapter.order_calls == []
+    engine.dispose()
+
+
+def test_current_generation_legacy_identity_blocks_exact_family_sell(
+    tmp_path,
+) -> None:
+    settings = _settings(tmp_path, "legacy-identity-current-family-sell.db")
+    adapter = _adapter(
+        holdings=[
+            BrokerAccountHolding(
+                symbol="005930",
+                quantity=10,
+                sellable_quantity=10,
+                average_price=Decimal("105"),
+            )
+        ]
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=adapter)
+    _resume(app)
+    candidate = _family_item(
+        settings=settings,
+        item_id="legacy-current-family-a-sell",
+        index=2,
+        side="sell",
+        intent="stop_sell",
+        lane="signal-decider",
+        family="family-a",
+        trigger_price=Decimal("90"),
+    )
+    command = _sell_command(candidate)
+    _bind_monitoring_authority(candidate, command)
+    with app.state.db_session_factory() as session:
+        _seed_two_family_inventory(
+            settings=settings,
+            session=session,
+            exit_items=[candidate],
+        )
+        current_order = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.idempotency_key == "family-a-buy"
+            )
+        )
+        assert current_order is not None
+        current_order.request_metadata = {
+            **current_order.request_metadata,
+            "metadata": {},
+            "original_command": {"metadata": {}},
+        }
+        session.commit()
+        result = broker_orders_service.place_broker_order(
+            settings=settings,
+            db=session,
+            adapter=adapter,
+            command=command,
+            request_source=MONITORING_SOURCE,
+        )
+
+    assert result.status_code == 409, result.payload
+    assert result.payload["block_reason"] == (
+        "strategy_family_persisted_identity_mismatch"
+    )
+    assert result.payload["manual_review_required"] is True
+    assert adapter.order_calls == []
     engine.dispose()
 
 

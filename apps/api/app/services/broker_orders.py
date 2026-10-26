@@ -9327,6 +9327,9 @@ def _replay_exact_strategy_family_ledger(
         tuple[ExecutionFill, tuple[str, str], str, Decimal]
     ] = []
     for order in orders:
+        replay_fills = fills_by_order.get(order.id, [])
+        if not replay_fills:
+            continue
         order_identity, identity_error = _validated_order_strategy_family_identity(
             order
         )
@@ -9348,7 +9351,7 @@ def _replay_exact_strategy_family_ledger(
         plan_side = str(
             order.plan_item.side if order.plan_item is not None else ""
         ).strip().lower()
-        for fill in fills_by_order.get(order.id, []):
+        for fill in replay_fills:
             quantity = effective_fill_quantity(fill)
             if (
                 not quantity.is_finite()
