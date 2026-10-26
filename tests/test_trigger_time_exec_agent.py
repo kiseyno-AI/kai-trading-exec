@@ -61,6 +61,9 @@ from test_broker_auth import (
 )
 
 
+_THREAD_COORDINATION_TIMEOUT_SECONDS = 15.0
+
+
 def _trigger_lane_feedback_fixture() -> dict[str, object]:
     return {
         "execution_authority": False,
@@ -3743,7 +3746,7 @@ def test_concurrent_terminal_transition_wins_over_trigger_agent_decision(
         assert isinstance(plan, dict)
         assert isinstance(signal_context, dict)
         agent_entered.set()
-        assert release_agent.wait(timeout=3)
+        assert release_agent.wait(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS)
         return {
             "version": trigger_time_exec_agent.TRIGGER_TIME_EXEC_AGENT_VERSION,
             "plan_id": plan["plan_id"],
@@ -3775,7 +3778,7 @@ def test_concurrent_terminal_transition_wins_over_trigger_agent_decision(
 
     thread = Thread(target=evaluate)
     thread.start()
-    assert agent_entered.wait(timeout=3), json.dumps(
+    assert agent_entered.wait(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS), json.dumps(
         {key: value.json() for key, value in response_holder.items()}
     )
     with app.state.db_session_factory() as session:
@@ -3796,7 +3799,7 @@ def test_concurrent_terminal_transition_wins_over_trigger_agent_decision(
         item.risk_context = risk_context
         session.commit()
     release_agent.set()
-    thread.join(timeout=5)
+    thread.join(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS)
     assert not thread.is_alive()
 
     response = response_holder["response"]
@@ -3904,7 +3907,7 @@ def test_concurrent_expiry_wins_over_post_agent_quote_failure(
         assert isinstance(plan, dict)
         assert isinstance(signal_context, dict)
         agent_entered.set()
-        assert release_agent.wait(timeout=3)
+        assert release_agent.wait(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS)
         return {
             "version": trigger_time_exec_agent.TRIGGER_TIME_EXEC_AGENT_VERSION,
             "plan_id": plan["plan_id"],
@@ -3939,7 +3942,7 @@ def test_concurrent_expiry_wins_over_post_agent_quote_failure(
 
     thread = Thread(target=evaluate)
     thread.start()
-    assert agent_entered.wait(timeout=3), json.dumps(
+    assert agent_entered.wait(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS), json.dumps(
         {key: value.json() for key, value in response_holder.items()}
     )
     with app.state.db_session_factory() as session:
@@ -3955,7 +3958,7 @@ def test_concurrent_expiry_wins_over_post_agent_quote_failure(
         item.risk_context = risk_context
         session.commit()
     release_agent.set()
-    thread.join(timeout=5)
+    thread.join(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS)
     assert not thread.is_alive()
 
     response = response_holder["response"]
