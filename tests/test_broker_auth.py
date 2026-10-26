@@ -29640,6 +29640,74 @@ def test_snapshot_buy_reservation_uses_fractional_payload_quantity(
 
 
 @pytest.mark.parametrize(
+    (
+        "local_broker_order_id",
+        "broker_broker_order_id",
+        "local_idempotency_key",
+        "broker_idempotency_key",
+    ),
+    [
+        (
+            "local-broker-order",
+            "different-broker-order",
+            "shared-idempotency",
+            "shared-idempotency",
+        ),
+        (
+            "shared-broker-order",
+            "shared-broker-order",
+            "local-idempotency",
+            "different-idempotency",
+        ),
+    ],
+)
+def test_open_buy_reservation_rejects_conflicting_secondary_identity(
+    local_broker_order_id: str,
+    broker_broker_order_id: str,
+    local_idempotency_key: str,
+    broker_idempotency_key: str,
+) -> None:
+    local_order = BrokerOrder(
+        id="local-open-buy",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=local_idempotency_key,
+        broker_order_id=local_broker_order_id,
+        symbol="005930",
+        side="buy",
+        status="open",
+        quantity=2,
+        quote_notional=Decimal("200"),
+        limit_price=Decimal("100"),
+        venue="KRX",
+        asset_class="stock",
+    )
+    snapshot = BrokerAccountSnapshot(
+        open_orders=[
+            BrokerAccountOpenOrder(
+                symbol="005930",
+                side="buy",
+                quantity=2,
+                remaining_quantity=2,
+                limit_price=Decimal("100"),
+                broker_order_id=broker_broker_order_id,
+                idempotency_key=broker_idempotency_key,
+            )
+        ]
+    )
+
+    resolution = broker_orders_service._resolve_open_buy_reservations(
+        snapshot=snapshot,
+        local_orders=(local_order,),
+    )
+
+    assert resolution.broker_open_notional == Decimal("0")
+    assert resolution.local_unmatched_notional == Decimal("200")
+    assert resolution.broker_unknown_count == 1
+    assert resolution.local_unknown_count == 0
+
+
+@pytest.mark.parametrize(
     ("buying_power", "expected_status"),
     [("25", 409), ("40", 201)],
 )

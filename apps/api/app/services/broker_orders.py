@@ -8394,6 +8394,25 @@ def _order_identity_claims_overlap(
     )
 
 
+def _order_identity_claims_conflict(
+    *,
+    local: BrokerOrder,
+    snapshot: BrokerAccountOpenOrder,
+) -> bool:
+    return bool(
+        (
+            local.broker_order_id
+            and snapshot.broker_order_id
+            and local.broker_order_id != snapshot.broker_order_id
+        )
+        or (
+            local.idempotency_key
+            and snapshot.idempotency_key
+            and local.idempotency_key != snapshot.idempotency_key
+        )
+    )
+
+
 def _matched_local_open_buy_reservation_unit_price(
     *,
     local: BrokerOrder,
@@ -8402,17 +8421,7 @@ def _matched_local_open_buy_reservation_unit_price(
 ) -> Decimal | None:
     if not _order_identity_claims_overlap(local=local, snapshot=snapshot):
         return None
-    if (
-        local.broker_order_id
-        and snapshot.broker_order_id
-        and local.broker_order_id != snapshot.broker_order_id
-    ):
-        return None
-    if (
-        local.idempotency_key
-        and snapshot.idempotency_key
-        and local.idempotency_key != snapshot.idempotency_key
-    ):
+    if _order_identity_claims_conflict(local=local, snapshot=snapshot):
         return None
     if (
         str(local.symbol or "").strip().upper()
@@ -8466,11 +8475,22 @@ def _resolve_open_buy_reservations(
                 snapshot=broker_order,
             )
         ]
+        identity_claims_conflict = any(
+            _order_identity_claims_conflict(
+                local=local,
+                snapshot=broker_order,
+            )
+            for local in matching_local_orders
+        )
         reuses_matched_local = any(
             order.id in matched_local_ids for order in matching_local_orders
         )
-        matched_local_ids.update(order.id for order in matching_local_orders)
         remaining = _snapshot_open_order_remaining_quantity(broker_order)
+        if identity_claims_conflict:
+            if remaining is None or remaining > 0:
+                broker_unknown_count += 1
+            continue
+        matched_local_ids.update(order.id for order in matching_local_orders)
         if remaining is None:
             broker_unknown_count += 1
             continue
