@@ -10,7 +10,6 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem
-from app.models.runtime import ExecutionPosition
 from app.services import broker_orders
 from app.services import execution_api
 from app.services import monitoring
@@ -671,12 +670,7 @@ def test_partial_take_profit_rearms_only_its_exact_stop_family() -> None:
             breakeven_stop_buffer_pct=Decimal("1"),
         ),
         item=second_target,
-        position=ExecutionPosition(
-            mode="paper",
-            symbol="005930",
-            quantity=2,
-            average_price=Decimal("100"),
-        ),
+        family_average_entry_price=Decimal("100"),
         remaining_quantity=1,
         submitted_quantity=1,
         recorded_at=datetime(2026, 9, 11, tzinfo=UTC),

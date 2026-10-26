@@ -7003,14 +7003,17 @@ def test_post_entry_maintenance_caps_each_lane_to_its_fill_family() -> None:
         )
         session.flush()
 
-        blocked_family_quantities = _remaining_quantities_by_entry_family(
-            settings=app.state.settings,
-            db=session,
-            positions_by_symbol={"002380": position},
-            through=datetime(2026, 6, 8, 1, 11, tzinfo=UTC),
-            rearmed_plan_item_ids=set(),
+        blocked_family_quantities, blocked_family_entry_prices = (
+            _remaining_quantities_by_entry_family(
+                settings=app.state.settings,
+                db=session,
+                positions_by_symbol={"002380": position},
+                through=datetime(2026, 6, 8, 1, 11, tzinfo=UTC),
+                rearmed_plan_item_ids=set(),
+            )
         )
         assert blocked_family_quantities == {("002380", "", None): 0}
+        assert blocked_family_entry_prices == {}
 
     engine.dispose()
 

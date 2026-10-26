@@ -6659,7 +6659,7 @@ def test_stop_read_and_partial_rearm_share_domestic_family_inventory_scope(
         monitoring_service._rearm_stop_after_partial_take_profit(
             settings=settings,
             item=target,
-            position=_held_position(settings=settings, quantity=5),
+            family_average_entry_price=Decimal("100"),
             remaining_quantity=4,
             submitted_quantity=1,
             recorded_at=datetime(2026, 10, 26, 2, tzinfo=UTC),
@@ -6671,6 +6671,82 @@ def test_stop_read_and_partial_rearm_share_domestic_family_inventory_scope(
         assert short_krx.quantity_policy["quantity"] == 5
         assert signal_nxt.trigger_price == Decimal("101.0000")
         assert signal_nxt.quantity_policy["quantity"] == 4
+    engine.dispose()
+
+
+def test_partial_take_profit_rearm_does_not_use_ambiguous_family_cost(
+    tmp_path,
+) -> None:
+    settings = _settings(tmp_path, "partial-rearm-ambiguous-cost.db").model_copy(
+        update={"breakeven_stop_buffer_pct": Decimal("1")}
+    )
+    target = _family_item(
+        settings=settings,
+        item_id="ambiguous-cost-target",
+        index=2,
+        side="sell",
+        intent="target_sell",
+        lane="short-term-decider",
+        family="family-b",
+        trigger_price=Decimal("120"),
+    )
+    target.risk_context = {
+        **dict(target.risk_context or {}),
+        "exit_rule": {"kind": "partial_take_profit"},
+    }
+    stop = _family_item(
+        settings=settings,
+        item_id="ambiguous-cost-stop",
+        index=3,
+        side="sell",
+        intent="stop_sell",
+        lane="short-term-decider",
+        family="family-b",
+        trigger_price=Decimal("99"),
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=_adapter())
+    recorded_at = datetime.now(UTC) + timedelta(seconds=1)
+    with app.state.db_session_factory() as session:
+        _seed_two_family_inventory(
+            settings=settings,
+            session=session,
+            exit_items=[target, stop],
+        )
+        ambiguous_fill = session.scalar(
+            select(ExecutionFill)
+            .join(BrokerOrder, BrokerOrder.id == ExecutionFill.broker_order_pk)
+            .where(BrokerOrder.idempotency_key == "family-b-buy")
+        )
+        assert ambiguous_fill is not None
+        ambiguous_fill.payload = {"fill_time_precision": "observed_upper_bound"}
+        session.commit()
+        position = _held_position(settings=settings, quantity=10)
+        position.average_price = Decimal("105")
+        remaining_by_family, entry_prices_by_family = (
+            monitoring_service._remaining_quantities_by_entry_family(
+                settings=settings,
+                db=session,
+                positions_by_symbol={"005930": position},
+                through=recorded_at,
+                rearmed_plan_item_ids=set(),
+            )
+        )
+        assert entry_prices_by_family == {}
+
+        prior_quantity_policy = dict(stop.quantity_policy or {})
+        monitoring_service._reserve_and_rearm_sell_after_success(
+            settings=settings,
+            item=target,
+            remaining_quantities_by_symbol={"005930": 10},
+            submitted_quantity=1,
+            recorded_at=recorded_at,
+            remaining_quantities_by_family=remaining_by_family,
+            entry_prices_by_family=entry_prices_by_family,
+        )
+
+        assert stop.trigger_price == Decimal("99")
+        assert stop.quantity_policy == prior_quantity_policy
+        assert "breakeven_rearmed" not in stop.risk_context
     engine.dispose()
 
 

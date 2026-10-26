@@ -17876,19 +17876,46 @@ def test_monitoring_rearms_stop_to_breakeven_after_partial_take_profit() -> None
                     "trigger_price": "97000.00",
                     "risk_context": {"exchange": "KRX"},
                 },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "target_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 4},
+                    "trigger_price": "250000.00",
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "exit_rule": {
+                            "kind": "partial_take_profit",
+                            "stage": "first",
+                        },
+                    },
+                },
+                {
+                    "symbol": "005930",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "quantity_policy": {"kind": "shares", "quantity": 10},
+                    "trigger_price": "90000.00",
+                    "risk_context": {"exchange": "KRX"},
+                },
             ],
         },
     )
     assert plan_response.status_code == 201
-    target_item_id, stop_item_id = plan_response.json()["persisted_execution_item_ids"]
+    (
+        target_item_id,
+        stop_item_id,
+        other_target_item_id,
+        other_stop_item_id,
+    ) = plan_response.json()["persisted_execution_item_ids"]
 
     with app.state.db_session_factory() as session:
         session.add(
             ExecutionPosition(
                 mode="paper",
                 symbol="005930",
-                quantity=10,
-                average_price=Decimal("100000.0000"),
+                quantity=20,
+                average_price=Decimal("150000.0000"),
                 updated_from="reconciliation",
                 raw_payload={"source": "broker"},
             )
@@ -17901,6 +17928,28 @@ def test_monitoring_rearms_stop_to_breakeven_after_partial_take_profit() -> None
         quantity=10,
         entry_price=Decimal("100000"),
     )
+    other_entry_item_id = _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[other_target_item_id, other_stop_item_id],
+        quantity=10,
+        entry_price=Decimal("200000"),
+        decision_agent_name="short-term-decider",
+    )
+    with app.state.db_session_factory() as session:
+        other_entry_order = session.scalar(
+            select(BrokerOrder).where(
+                BrokerOrder.execution_plan_item_id == other_entry_item_id
+            )
+        )
+        assert other_entry_order is not None
+        other_entry_fill = session.scalar(
+            select(ExecutionFill).where(
+                ExecutionFill.broker_order_pk == other_entry_order.id
+            )
+        )
+        assert other_entry_fill is not None
+        other_entry_fill.filled_at = datetime.now(UTC) - timedelta(minutes=1)
+        session.commit()
 
     response = client.post(
         "/monitoring/evaluate",
@@ -17908,14 +17957,14 @@ def test_monitoring_rearms_stop_to_breakeven_after_partial_take_profit() -> None
             "actor": "ops",
             "source": "test",
             "reason": "first take profit should protect remainder",
-            "prices": [{"symbol": "005930", "price": "102600.00"}],
+            "prices": [{"symbol": "005930", "price": "220000.00"}],
         },
     )
 
     assert response.status_code == 200
     payload = response.json()
     assert payload["triggered_item_count"] == 1
-    assert payload["submitted_order_count"] == 1
+    assert payload["submitted_order_count"] == 1, payload
     submitted_item = next(
         item for item in payload["items"] if item["outcome"] == "submitted"
     )
@@ -17939,6 +17988,20 @@ def test_monitoring_rearms_stop_to_breakeven_after_partial_take_profit() -> None
             "stop_sell_rearmed_after_partial_take_profit"
         )
         assert stop_item.risk_context["last_monitoring_event"]["remaining_quantity"] == 6
+        assert stop_item.risk_context["breakeven_rearmed"]["average_price"] == (
+            "100000.0000"
+        )
+        assert stop_item.risk_context["breakeven_rearmed"][
+            "average_price_source"
+        ] == "exact_family_canonical_buy_fills"
+        other_stop_item = session.get(ExecutionPlanItem, other_stop_item_id)
+        assert other_stop_item is not None
+        assert other_stop_item.trigger_price == Decimal("195000.0000")
+        assert other_stop_item.quantity_policy == {
+            "kind": "shares",
+            "quantity": 10,
+        }
+        assert "breakeven_rearmed" not in other_stop_item.risk_context
 
     engine.dispose()
 

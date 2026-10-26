@@ -3007,7 +3007,10 @@ def _evaluate_monitoring_cycle(
         positions_by_symbol=positions_by_symbol,
         rearmed_plan_item_ids=rearmed_protective_stop_item_ids,
     )
-    remaining_quantities_by_family = _remaining_quantities_by_entry_family(
+    (
+        remaining_quantities_by_family,
+        entry_prices_by_family,
+    ) = _remaining_quantities_by_entry_family(
         settings=settings,
         db=db,
         positions_by_symbol=positions_by_symbol,
@@ -3951,15 +3954,11 @@ def _evaluate_monitoring_cycle(
                     _reserve_and_rearm_sell_after_success,
                     settings=settings,
                     item=action.item,
-                    position=_position_for_monitoring_item(
-                        settings=settings,
-                        item=action.item,
-                        positions_by_symbol=positions_by_symbol,
-                    ),
                     remaining_quantities_by_symbol=remaining_quantities_by_symbol,
                     submitted_quantity=quantity,
                     recorded_at=triggered_at,
                     remaining_quantities_by_family=remaining_quantities_by_family,
+                    entry_prices_by_family=entry_prices_by_family,
                 )
             else:
                 control_state = ensure_runtime_control_state(settings=settings, db=db)
@@ -15627,13 +15626,23 @@ def _remaining_quantities_by_entry_family(
     positions_by_symbol: dict[str, ExecutionPosition],
     through: datetime,
     rearmed_plan_item_ids: set[str],
-) -> dict[
-    tuple[
-        str,
-        str,
-        tuple[str, str, str, str] | None,
+) -> tuple[
+    dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        int,
     ],
-    int,
+    dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        Decimal,
+    ],
 ]:
     remaining: dict[
         tuple[
@@ -15642,6 +15651,14 @@ def _remaining_quantities_by_entry_family(
             tuple[str, str, str, str] | None,
         ],
         int,
+    ] = {}
+    entry_prices: dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        Decimal,
     ] = {}
     for symbol, position in positions_by_symbol.items():
         inventories, lineage_found = _post_entry_family_inventories(
@@ -15656,11 +15673,11 @@ def _remaining_quantities_by_entry_family(
             # family-owned exit contract. Only an exact family key is actionable.
             remaining[(symbol, "", None)] = 0
         for inventory in inventories:
-            remaining[
-                (symbol, inventory.family_key, inventory.route_key)
-            ] = inventory.remaining_quantity
+            key = (symbol, inventory.family_key, inventory.route_key)
+            remaining[key] = inventory.remaining_quantity
+            entry_prices[key] = inventory.average_entry_price
     if not remaining:
-        return remaining
+        return remaining, entry_prices
 
     where = [
         *_active_kis_order_filters(settings=settings),
@@ -15711,6 +15728,7 @@ def _remaining_quantities_by_entry_family(
             continue
         if order.quantity is None or order.quantity <= 0:
             remaining.pop(key, None)
+            entry_prices.pop(key, None)
             continue
         filled = sum(
             (
@@ -15725,6 +15743,7 @@ def _remaining_quantities_by_entry_family(
             continue
         if outstanding != outstanding.to_integral_value(rounding=ROUND_DOWN):
             remaining.pop(key, None)
+            entry_prices.pop(key, None)
             continue
         reserved = int(outstanding)
         updated = remaining[key] - reserved
@@ -15732,10 +15751,12 @@ def _remaining_quantities_by_entry_family(
             remaining[key] = updated
         else:
             remaining.pop(key, None)
+            entry_prices.pop(key, None)
     for symbol in indeterminate_symbols:
         for key in [key for key in remaining if key[0] == symbol and key[1]]:
             remaining.pop(key, None)
-    return remaining
+            entry_prices.pop(key, None)
+    return remaining, entry_prices
 
 
 def _sell_remaining_quantity(
@@ -15812,7 +15833,6 @@ def _reserve_and_rearm_sell_after_success(
     *,
     settings: Settings,
     item: ExecutionPlanItem,
-    position: ExecutionPosition | None,
     remaining_quantities_by_symbol: dict[str, int],
     submitted_quantity: int,
     recorded_at: datetime,
@@ -15823,6 +15843,15 @@ def _reserve_and_rearm_sell_after_success(
             tuple[str, str, str, str] | None,
         ],
         int,
+    ]
+    | None = None,
+    entry_prices_by_family: dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        Decimal,
     ]
     | None = None,
 ) -> None:
@@ -15837,11 +15866,27 @@ def _reserve_and_rearm_sell_after_success(
             item=item,
             quantity=submitted_quantity,
         )
+    family_route_key = _plan_item_family_route_inventory_key(item)
+    family_inventory_key = (
+        (item.symbol, family_route_key[0], family_route_key[1])
+        if family_route_key is not None
+        else None
+    )
     _rearm_stop_after_partial_take_profit(
         settings=settings,
         item=item,
-        position=position,
-        remaining_quantity=remaining_quantities_by_symbol.get(item.symbol),
+        family_average_entry_price=(
+            entry_prices_by_family.get(family_inventory_key)
+            if entry_prices_by_family is not None
+            and family_inventory_key is not None
+            else None
+        ),
+        remaining_quantity=(
+            remaining_quantities_by_family.get(family_inventory_key)
+            if remaining_quantities_by_family is not None
+            and family_inventory_key is not None
+            else None
+        ),
         submitted_quantity=submitted_quantity,
         recorded_at=recorded_at,
     )
@@ -16109,7 +16154,7 @@ def _rearm_stop_after_partial_take_profit(
     *,
     settings: Settings,
     item: ExecutionPlanItem,
-    position: ExecutionPosition | None,
+    family_average_entry_price: Decimal | None,
     remaining_quantity: int | None,
     submitted_quantity: int,
     recorded_at: datetime,
@@ -16119,11 +16164,15 @@ def _rearm_stop_after_partial_take_profit(
     exit_rule = _exit_rule(item)
     if exit_rule.get("kind") != "partial_take_profit":
         return
-    if position is None or position.average_price is None or position.average_price <= 0:
+    if (
+        family_average_entry_price is None
+        or not family_average_entry_price.is_finite()
+        or family_average_entry_price <= 0
+    ):
         return
 
     breakeven_stop = _breakeven_stop_price(
-        average_price=position.average_price,
+        average_price=family_average_entry_price,
         buffer_pct=settings.breakeven_stop_buffer_pct,
     )
     plan = item.plan
@@ -16165,7 +16214,8 @@ def _rearm_stop_after_partial_take_profit(
             "target_item_id": item.id,
             "submitted_take_profit_quantity": submitted_quantity,
             "remaining_quantity": remaining_quantity,
-            "average_price": _serialize_decimal(position.average_price),
+            "average_price": _serialize_decimal(family_average_entry_price),
+            "average_price_source": "exact_family_canonical_buy_fills",
             "breakeven_stop_price": _serialize_decimal(sibling.trigger_price),
             "buffer_pct": _serialize_decimal(settings.breakeven_stop_buffer_pct),
             "prior_trigger_price": _serialize_decimal(prior_trigger),
@@ -16183,7 +16233,8 @@ def _rearm_stop_after_partial_take_profit(
                 "remaining_quantity": remaining_quantity,
                 "prior_trigger_price": _serialize_decimal(prior_trigger),
                 "updated_trigger_price": _serialize_decimal(sibling.trigger_price),
-                "average_price": _serialize_decimal(position.average_price),
+                "average_price": _serialize_decimal(family_average_entry_price),
+                "average_price_source": "exact_family_canonical_buy_fills",
                 "buffer_pct": _serialize_decimal(settings.breakeven_stop_buffer_pct),
                 "recorded_at": recorded_at.isoformat(),
             },
