@@ -6488,6 +6488,167 @@ def test_sizing_account_context_deduplicates_partial_local_and_broker_order() ->
     engine.dispose()
 
 
+def test_sizing_account_context_excludes_only_proven_foreign_local_buy_scopes() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="account-a",
+    )
+    foreign_settings = settings.model_copy(
+        update={"execution_position_account_scope": "account-b"}
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    account_a = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    account_b = build_position_identity(
+        settings=foreign_settings,
+        provider="kis",
+        exchange="KRX",
+    )
+
+    def local_buy(
+        *,
+        order_id: str,
+        quantity: int,
+        broker_name: str,
+        execution_scope: dict[str, object] | None,
+        venue: str,
+        asset_class: str,
+    ) -> BrokerOrder:
+        return BrokerOrder(
+            id=order_id,
+            broker_name=broker_name,
+            mode="paper",
+            idempotency_key=order_id,
+            broker_order_id=order_id,
+            symbol="005930",
+            side="buy",
+            status="manual_review_required",
+            quantity=quantity,
+            limit_price=Decimal("100"),
+            venue=venue,
+            asset_class=asset_class,
+            request_metadata=(
+                {"execution_scope": execution_scope}
+                if execution_scope is not None
+                else {}
+            ),
+        )
+
+    with session_factory() as session:
+        session.add_all(
+            [
+                local_buy(
+                    order_id="account-a-kis-buy",
+                    quantity=1,
+                    broker_name="kis",
+                    execution_scope=execution_scope_payload(
+                        identity=account_a,
+                        venue="KRX",
+                        asset_class="stock",
+                    ),
+                    venue="KRX",
+                    asset_class="stock",
+                ),
+                local_buy(
+                    order_id="account-b-kis-buy",
+                    quantity=2,
+                    broker_name="kis",
+                    execution_scope=execution_scope_payload(
+                        identity=account_b,
+                        venue="KRX",
+                        asset_class="stock",
+                    ),
+                    venue="KRX",
+                    asset_class="stock",
+                ),
+                local_buy(
+                    order_id="account-a-alpaca-buy",
+                    quantity=3,
+                    broker_name="alpaca",
+                    execution_scope={
+                        "policy_version": 1,
+                        "provider": "alpaca",
+                        "account_scope": account_a.account_scope,
+                        "venue": "ALPACA",
+                        "asset_class": "crypto",
+                        "exchange": "ALPACA",
+                    },
+                    venue="ALPACA",
+                    asset_class="crypto",
+                ),
+                local_buy(
+                    order_id="account-b-alpaca-buy",
+                    quantity=4,
+                    broker_name="alpaca",
+                    execution_scope={
+                        "policy_version": 1,
+                        "provider": "alpaca",
+                        "account_scope": account_b.account_scope,
+                        "venue": "ALPACA",
+                        "asset_class": "crypto",
+                        "exchange": "ALPACA",
+                    },
+                    venue="ALPACA",
+                    asset_class="crypto",
+                ),
+                local_buy(
+                    order_id="unproven-scope-buy",
+                    quantity=5,
+                    broker_name="kis",
+                    execution_scope=None,
+                    venue="KRX",
+                    asset_class="stock",
+                ),
+                local_buy(
+                    order_id="malformed-foreign-scope-buy",
+                    quantity=6,
+                    broker_name="alpaca",
+                    execution_scope={
+                        "policy_version": 1,
+                        "provider": "alpaca",
+                        "account_scope": account_a.account_scope,
+                    },
+                    venue="ALPACA",
+                    asset_class="crypto",
+                ),
+            ]
+        )
+        session.commit()
+        account_context = _fresh_account_context(
+            execution_account_scope={
+                "provider": account_a.provider,
+                "account_scope": account_a.account_scope.upper(),
+            }
+        )
+
+        watch_sizing._enrich_account_context_with_decision_lanes(
+            settings=settings,
+            db=session,
+            account_context=account_context,
+            observed_at=datetime(2026, 10, 26, 0, 2, tzinfo=UTC),
+        )
+
+    assert {
+        order["broker_order_id"] for order in account_context["open_orders"]
+    } == {
+        "account-a-kis-buy",
+        "malformed-foreign-scope-buy",
+        "unproven-scope-buy",
+    }
+    assert watch_sizing._account_symbol_exposure_notional(
+        account_context=account_context,
+        symbol="005930",
+        fallback_price=Decimal("100"),
+    ) == Decimal("1200.0000")
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("symbol", "entry", "target", "upstream_stop", "expected_effective_stop"),
     [

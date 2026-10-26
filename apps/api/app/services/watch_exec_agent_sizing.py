@@ -2731,7 +2731,11 @@ def _enrich_account_context_with_decision_lanes(
     local_orders = [
         order
         for order in local_orders
-        if _local_order_remaining_quantity(order) != 0
+        if not _local_order_has_proven_foreign_execution_scope(
+            order=order,
+            account_context=account_context,
+        )
+        and _local_order_remaining_quantity(order) != 0
     ]
     local_by_broker_id = _unique_local_order_index(
         local_orders,
@@ -2881,6 +2885,36 @@ def _unique_local_order_index(
         for value, matches in candidates.items()
         if len(matches) == 1
     }
+
+
+def _local_order_has_proven_foreign_execution_scope(
+    *,
+    order: BrokerOrder,
+    account_context: dict[str, object],
+) -> bool:
+    account_scope = account_context.get("execution_account_scope")
+    if not isinstance(account_scope, dict):
+        return False
+    provider = str(account_scope.get("provider") or "").strip().lower()
+    opaque_scope = str(account_scope.get("account_scope") or "").strip().lower()
+    if (
+        not provider
+        or len(opaque_scope) != 24
+        or any(character not in "0123456789abcdef" for character in opaque_scope)
+    ):
+        return False
+
+    metadata = order.request_metadata
+    complete_scope = _complete_execution_scope_key(
+        metadata if isinstance(metadata, dict) else {}
+    )
+    route_scope = fifo_route_scope_from_order(order)
+    if complete_scope is None or route_scope is None:
+        return False
+    return (
+        route_scope.provider != provider
+        or route_scope.account_scope != opaque_scope
+    )
 
 
 def _unique_local_order_composite_index(
