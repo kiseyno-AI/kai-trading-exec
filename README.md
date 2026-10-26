@@ -132,6 +132,16 @@ These rules prioritize attributable execution truth over trade frequency. Agent
 scores can rank or reduce candidates, but cannot manufacture market evidence or
 relax deterministic capital, freshness, cost, and routing gates.
 
+Same-symbol signal and short-term entries are independent ownership lanes. Exec
+allows one active entry per normalized decision lane while sharing aggregate
+cash, open-buy reservations, account risk, and symbol-exposure limits across all
+lanes. Every target, stop, or max-holding sell is capped to canonical remaining
+fills in its exact entry family; unknown or ambiguous lineage fails closed and
+cannot consume another lane's shares. Signal entries do not inherit a forced
+max-holding exit when their policy is absent. Short-term entries retain early
+target/stop invalidation exits and use a maximum of three inclusive holding
+sessions, with the entry session counted as session one.
+
 Core delegation uses `GET/POST /v4/execution-plans` and
 `POST /v4/execution-plans/revocations`. Every v4 plan requires
 `metadata.dispatch_material_fingerprint`, a 64-character lowercase SHA-256 of
@@ -526,7 +536,7 @@ Short-term sizing is bounded by:
 - market breadth, sector weakness, and same-sector crowding
 - recent trade-outcome feedback and monthly capital-preservation settings
 
-Before sizing, duplicate active watches for the same provider/asset/symbol broker route are superseded in favor of the newest durable item. The bounded agent queue then prioritizes already-triggered candidates followed by expected return, conviction, confidence, liquidity, and data quality. An approval can enter monitoring-active state only when it has a positive target strictly above the conservative executable entry reference and a positive stop strictly below that reference. Every approved candidate immediately reserves its final normalized notional from the response-local cash snapshot, and the approved batch total is reserved again in the cycle snapshot before the next request. This prevents candidates in either the same response or later batches from spending the same account cash. Agent responses must match the supported version, plan, item, and symbol contract. Immediately before applying one, Exec locks and rebuilds the durable candidate plus its server-owned action envelope; any concurrent target, stop, route, status, or risk-context change invalidates the old response and leaves the candidate unsized for a fresh decision. The audit record stores both the raw agent choice and the final safety-normalized decision. OpenClaw receives the bounded payload through a one-shot CLI message file rather than agent file access, and the audit separates the configured model hint from provider/model metadata reported by the actual run.
+Before sizing, duplicate active watches for the same provider/asset/symbol broker route and normalized decision lane are superseded in favor of the newest durable item. The bounded agent queue then prioritizes already-triggered candidates followed by expected return, conviction, confidence, liquidity, and data quality. An approval can enter monitoring-active state only when it has a positive target strictly above the conservative executable entry reference and a positive stop strictly below that reference. Every approved candidate immediately reserves its final normalized notional from the response-local cash snapshot, and the approved batch total is reserved again in the cycle snapshot before the next request. This prevents candidates in either the same response or later batches from spending the same account cash. Agent responses must match the supported version, plan, item, and symbol contract. Immediately before applying one, Exec locks and rebuilds the durable candidate plus its server-owned action envelope; any concurrent target, stop, route, status, or risk-context change invalidates the old response and leaves the candidate unsized for a fresh decision. The audit record stores both the raw agent choice and the final safety-normalized decision. OpenClaw receives the bounded payload through a one-shot CLI message file rather than agent file access, and the audit separates the configured model hint from provider/model metadata reported by the actual run.
 
 `KAI_EXEC_EXEC_AGENT_MODEL` is both the explicit OpenClaw CLI model-routing
 override and the expected runtime identity. Its default is

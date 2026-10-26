@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -29,12 +30,22 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
 from app.main import create_app
-from app.models.runtime import BrokerOrder, ExecutionJob, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
+from app.models.runtime import (
+    BrokerOrder,
+    ExecutionFill,
+    ExecutionJob,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPosition,
+)
+from app.services import broker_orders as broker_orders_service
 from app.services import exec_agent as strict_exec_agent
 from app.services import execution_api as execution_api_service
 from app.services import execution_jobs as execution_jobs_service
 from app.services import monitoring as monitoring_service
 from app.services import short_term_exec_agent as legacy_exec_agent
+from app.services import trade_outcome_feedback as trade_outcome_feedback_service
+from app.services.artifact_integrity import attach_artifact_integrity
 from app.services.execution_account_route import bind_kis_account_route
 from app.services.position_identity import (
     build_position_identity,
@@ -215,6 +226,7 @@ def build_test_app(
     exec_agent_max_trade_risk_pct: Decimal = Decimal("0.015"),
     exec_agent_stop_loss_pct: Decimal = Decimal("0.10"),
     exec_agent_tactical_scalp_max_stop_pct: Decimal = Decimal("0.015"),
+    exec_agent_max_holding_trading_sessions: int = 2,
     vol_corr_sizing_enabled: bool = False,
 ):
     settings = Settings(
@@ -235,6 +247,9 @@ def build_test_app(
         exec_agent_max_daily_new_buy_notional=exec_agent_max_daily_new_buy_notional,
         exec_agent_stop_loss_pct=exec_agent_stop_loss_pct,
         exec_agent_tactical_scalp_max_stop_pct=exec_agent_tactical_scalp_max_stop_pct,
+        exec_agent_max_holding_trading_sessions=(
+            exec_agent_max_holding_trading_sessions
+        ),
         vol_corr_sizing_enabled=vol_corr_sizing_enabled,
     )
     engine = create_db_engine(settings)
@@ -405,6 +420,7 @@ def strict_exec_decision(
     max_total_budget: str | None = None,
     special_tactical_scalp: bool = False,
     target_profile: str | None = None,
+    allow_existing_holding: bool = False,
 ) -> dict[str, object]:
     decision_context = {"confirmation_signal": "momentum_continuation"}
     if context is not None:
@@ -418,6 +434,7 @@ def strict_exec_decision(
         "stop_price": stop_price,
         "risk_flags": ["momentum_continuation"],
         "special_tactical_scalp": special_tactical_scalp,
+        "allow_existing_holding": allow_existing_holding,
         "context": decision_context,
     }
     if target_profile is not None:
@@ -988,7 +1005,8 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
     assert items_by_intent["stop_sell"]["trigger_price"] == "47000.0000"
     assert items_by_intent["max_holding_close_sell"]["status"] == "max_holding_close_sell_monitoring"
     max_holding_context = items_by_intent["max_holding_close_sell"]["risk_context"]
-    assert max_holding_context["close_exit_date"] == "2026-05-15"
+    assert max_holding_context["max_holding_trading_sessions"] == 2
+    assert max_holding_context["close_exit_date"] == "2026-05-14"
     assert max_holding_context["close_exit_date_status"] == "weekday_provisional"
     assert max_holding_context["close_exit_date_source"] == "plan_market_date"
     assert max_holding_context["entry_market_date"] == "2026-05-13"
@@ -1038,6 +1056,121 @@ def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitor
         assert audit["account_snapshot"]["available_cash"] == "500000.0000"
 
     engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("configured_sessions", "policy", "expected_sessions", "expected_close_date"),
+    [
+        (1, None, 2, "2026-05-14"),
+        (9, None, 3, "2026-05-15"),
+        (2, False, 3, "2026-05-15"),
+        (2, {"enabled": False}, 3, "2026-05-15"),
+    ],
+)
+def test_short_term_prefill_max_holding_is_an_inclusive_two_to_three_session_cap(
+    configured_sessions: int,
+    policy: dict[str, object] | bool | None,
+    expected_sessions: int,
+    expected_close_date: str,
+) -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
+    app, engine = build_test_app(
+        adapter,
+        exec_agent_max_holding_trading_sessions=configured_sessions,
+    )
+    client = TestClient(app)
+    payload = short_term_plan_payload(
+        plan_id=f"prefill-max-holding-{configured_sessions}-{policy}",
+    )
+    if policy is not None:
+        items = payload["items"]
+        assert isinstance(items, list)
+        item = items[0]
+        assert isinstance(item, dict)
+        risk_context = item["risk_context"]
+        assert isinstance(risk_context, dict)
+        risk_context["max_holding_close_policy"] = policy
+        _bind_precomputed_exec_agent_decisions(payload)
+
+    response = client.post("/execution-plans", json=payload)
+
+    assert response.status_code == 201, response.text
+    persisted_items = client.get("/execution-plans").json()[0]["items"]
+    max_holding = next(
+        item
+        for item in persisted_items
+        if item["intent"] == "max_holding_close_sell"
+    )
+    context = max_holding["risk_context"]
+    assert context["max_holding_trading_sessions"] == expected_sessions
+    assert context["close_exit_date"] == expected_close_date
+    assert context["close_exit_policy"] == "market_on_or_after_close_exit_date"
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("configured_sessions", "policy", "expected_sessions"),
+    [
+        (1, None, 2),
+        (9, None, 3),
+        (2, {"enabled": True, "trading_sessions": 1}, 2),
+        (2, {"enabled": True, "trading_sessions": 9}, 3),
+        (2, False, 3),
+        (2, {"enabled": False}, 3),
+    ],
+)
+def test_short_term_postfill_max_holding_uses_the_same_two_to_three_session_cap(
+    configured_sessions: int,
+    policy: dict[str, object] | bool | None,
+    expected_sessions: int,
+) -> None:
+    risk_context: dict[str, object] = {"exchange": "KRX"}
+    if policy is not None:
+        risk_context["max_holding_close_policy"] = policy
+    entry_item = ExecutionPlanItem(
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        decision_agent_name="short-term-decider",
+        risk_context=risk_context,
+    )
+
+    assert monitoring_service._post_entry_max_holding_sessions(
+        settings=Settings(
+            exec_agent_max_holding_trading_sessions=configured_sessions,
+        ),
+        entry_item=entry_item,
+    ) == expected_sessions
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_sessions"),
+    [
+        (None, None),
+        (False, None),
+        ({"enabled": True, "trading_sessions": 1}, 1),
+    ],
+)
+def test_signal_postfill_max_holding_contract_is_unchanged(
+    policy: dict[str, object] | bool | None,
+    expected_sessions: int | None,
+) -> None:
+    risk_context: dict[str, object] = {"exchange": "KRX"}
+    if policy is not None:
+        risk_context["max_holding_close_policy"] = policy
+    entry_item = ExecutionPlanItem(
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        decision_agent_name="signal-decider",
+        risk_context=risk_context,
+    )
+
+    assert monitoring_service._post_entry_max_holding_sessions(
+        settings=Settings(exec_agent_max_holding_trading_sessions=1),
+        entry_item=entry_item,
+    ) == expected_sessions
 
 
 def test_prefill_monitor_keeps_missing_source_market_date_as_lineage_only() -> None:
@@ -1206,7 +1339,7 @@ def test_legacy_short_term_exec_agent_rejects_incomplete_broker_truth(
     engine.dispose()
 
 
-def test_short_term_exec_agent_approves_existing_holding_add_on_when_guardrails_pass() -> None:
+def test_short_term_exec_agent_rejects_existing_holding_without_exact_lane_lineage() -> None:
     adapter = StubBrokerAdapter(
         available_cash=Decimal("2000000"),
         holdings=[BrokerAccountHolding(symbol="005930", quantity=3)],
@@ -1221,26 +1354,26 @@ def test_short_term_exec_agent_approves_existing_holding_add_on_when_guardrails_
     response = client.post(
         "/execution-plans/preview",
         json=short_term_plan_payload(
-            exec_agent_decision=strict_exec_decision("0.82", max_budget="100000")
+            exec_agent_decision=strict_exec_decision(
+                "0.82",
+                max_budget="100000",
+                allow_existing_holding=True,
+            )
         ),
     )
 
     assert response.status_code == 200
     item = response.json()["items"][0]
     audit = item["risk_context"]["exec_agent_decision"]
-    assert item["status"] == "next_open_buy_scheduled"
-    assert item["quantity_policy"]["quantity"] == 2
-    assert audit["reason_code"] == "approved"
+    assert item["status"] == "exec_agent_rejected"
+    assert audit["reason_code"] == "holding_lane_attribution_incomplete"
     assert audit["existing_holding"] == 3
-    assert audit["existing_symbol_exposure"] == "150000.0000"
-    assert audit["exposure_after_trade"] == "250000.0000"
-    assert audit["max_symbol_exposure"] == "400000.0000"
     assert adapter.order_calls == []
 
     engine.dispose()
 
 
-def test_short_term_exec_agent_rejects_existing_holding_add_on_when_exposure_cap_exceeded() -> None:
+def test_short_term_exec_agent_checks_lineage_before_existing_holding_exposure() -> None:
     adapter = StubBrokerAdapter(
         available_cash=Decimal("500000"),
         holdings=[BrokerAccountHolding(symbol="005930", quantity=3)],
@@ -1259,10 +1392,8 @@ def test_short_term_exec_agent_rejects_existing_holding_add_on_when_exposure_cap
     item = client.get("/execution-plans").json()[0]["items"][0]
     audit = item["risk_context"]["exec_agent_decision"]
     assert item["status"] == "exec_agent_rejected"
-    assert audit["reason_code"] == "symbol_exposure_cap_exceeded"
+    assert audit["reason_code"] == "holding_lane_attribution_incomplete"
     assert audit["existing_holding"] == 3
-    assert audit["exposure_after_trade"] is None
-    assert audit["max_symbol_exposure"] == "100000.0000"
     assert adapter.order_calls == []
 
     engine.dispose()
@@ -1362,6 +1493,527 @@ def test_short_term_exec_agent_rejects_duplicate_open_buy_order() -> None:
     )
     assert adapter.order_calls == []
 
+    engine.dispose()
+
+
+def test_open_buy_duplicate_guard_allows_other_decision_lane_only() -> None:
+    item = ExecutionPlanItem(
+        id="short-candidate",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="pending",
+        decision_agent_name="short-term-decider",
+        source_plan_item_id="short-family-entry",
+    )
+    other_lane = BrokerAccountOpenOrder(
+        symbol="005930",
+        side="buy",
+        quantity=2,
+        remaining_quantity=2,
+        status="open",
+        broker_order_id="signal-open-order",
+        payload={"decision_agent_name": "signal-decider"},
+    )
+    same_lane = BrokerAccountOpenOrder(
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        remaining_quantity=1,
+        status="open",
+        broker_order_id="short-open-order",
+        payload={"decision_agent_name": " SHORT-TERM-DECIDER "},
+    )
+
+    assert strict_exec_agent._has_duplicate_open_buy_order(
+        item=item,
+        idempotency_key="candidate-idempotency",
+        open_orders=[other_lane],
+    ) is False
+    assert strict_exec_agent._has_duplicate_open_buy_order(
+        item=item,
+        idempotency_key="candidate-idempotency",
+        open_orders=[other_lane, same_lane],
+    ) is True
+
+
+def test_open_buy_duplicate_guard_scopes_shared_source_key_to_decision_lane() -> None:
+    item = ExecutionPlanItem(
+        id="short-shared-source-candidate",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="pending",
+        decision_agent_name="short-term-decider",
+        source_plan_item_id="shared-source-key",
+    )
+    other_lane = BrokerAccountOpenOrder(
+        symbol="005930",
+        side="buy",
+        quantity=2,
+        remaining_quantity=2,
+        status="open",
+        source_candidate_id="shared-source-key",
+        payload={"decision_agent_name": "signal-decider"},
+    )
+    same_lane = replace(
+        other_lane,
+        payload={"decision_agent_name": "short-term-decider"},
+    )
+
+    assert strict_exec_agent._has_duplicate_open_buy_order(
+        item=item,
+        idempotency_key="candidate-idempotency",
+        open_orders=[other_lane],
+    ) is False
+    assert strict_exec_agent._has_duplicate_open_buy_order(
+        item=item,
+        idempotency_key="candidate-idempotency",
+        open_orders=[same_lane],
+    ) is True
+
+
+def _legacy_lane_candidate() -> tuple[ExecutionPlan, ExecutionPlanItem]:
+    item = ExecutionPlanItem(
+        id="legacy-lane-candidate",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="pending",
+        decision_agent_name="short-term-decider",
+        source_plan_item_id="legacy-lane-source",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        risk_context={"confirmation_signal": "momentum_continuation"},
+    )
+    plan = ExecutionPlan(
+        external_plan_id="legacy-lane-plan",
+        market_date=date(2026, 5, 13),
+        mode="paper",
+        items=[item],
+    )
+    return plan, item
+
+
+def _legacy_lane_account(
+    *,
+    lane_quantities: dict[str, int],
+    attribution_complete: bool = True,
+    open_orders: list[BrokerAccountOpenOrder] | None = None,
+) -> strict_exec_agent._AccountContext:
+    account = strict_exec_agent._AccountContext(
+        available_cash=Decimal("10000"),
+        buying_power=Decimal("10000"),
+        observed_at=datetime.now(UTC),
+        snapshot_payload={"available": True},
+        holdings_by_symbol={"005930": 2},
+        open_orders=open_orders or [],
+        unresolved_buy_reserved_notional=Decimal("0"),
+        unresolved_buy_reservation_complete=True,
+        holding_quantities_by_decision_lane={"005930": lane_quantities},
+        holding_lane_attribution_complete_by_symbol={
+            "005930": attribution_complete,
+        },
+    )
+    return account
+
+
+def _legacy_lane_contract(
+    *,
+    allow_existing_holding: bool,
+) -> strict_exec_agent.ShortTermExecAgentContract:
+    return strict_exec_agent.ShortTermExecAgentContract(
+        action="approve",
+        confidence=Decimal("0.90"),
+        max_budget=Decimal("1000"),
+        reference_price=Decimal("100"),
+        target_price=Decimal("120"),
+        stop_price=Decimal("90"),
+        allow_existing_holding=allow_existing_holding,
+    )
+
+
+def test_legacy_next_open_sizing_keeps_other_lane_holding_independent() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        exec_agent_max_symbol_budget=Decimal("1000"),
+        exec_agent_max_total_budget=Decimal("5000"),
+        exec_agent_max_position_allocation_pct=Decimal("1"),
+        exec_agent_max_symbol_exposure_pct=Decimal("1"),
+        exec_agent_max_symbol_total_exposure_pct=Decimal("1"),
+        exec_agent_max_trade_risk_pct=Decimal("0.015"),
+        exec_agent_stop_loss_pct=Decimal("0.10"),
+    )
+    plan, item = _legacy_lane_candidate()
+    other_lane_account = _legacy_lane_account(
+        lane_quantities={"signal-decider": 2}
+    )
+
+    allowed = strict_exec_agent._decide_candidate(
+        settings=settings,
+        plan=plan,
+        item=item,
+        account_context=other_lane_account,
+        reserved_total_budget=Decimal("0"),
+        reserved_cash_budget=Decimal("0"),
+        reserved_daily_buy_notional=Decimal("0"),
+        reserved_symbol_notional=Decimal("0"),
+        reserved_entry_lanes=set(),
+        agent_contract_result=_legacy_lane_contract(
+            allow_existing_holding=True,
+        ),
+    )
+    explicit_false = strict_exec_agent._decide_candidate(
+        settings=settings,
+        plan=plan,
+        item=item,
+        account_context=other_lane_account,
+        reserved_total_budget=Decimal("0"),
+        reserved_cash_budget=Decimal("0"),
+        reserved_daily_buy_notional=Decimal("0"),
+        reserved_symbol_notional=Decimal("0"),
+        reserved_entry_lanes=set(),
+        agent_contract_result=_legacy_lane_contract(
+            allow_existing_holding=False,
+        ),
+    )
+    omitted = strict_exec_agent._decide_candidate(
+        settings=settings,
+        plan=plan,
+        item=item,
+        account_context=other_lane_account,
+        reserved_total_budget=Decimal("0"),
+        reserved_cash_budget=Decimal("0"),
+        reserved_daily_buy_notional=Decimal("0"),
+        reserved_symbol_notional=Decimal("0"),
+        reserved_entry_lanes=set(),
+        agent_contract_result=strict_exec_agent.ShortTermExecAgentContract(
+            action="approve",
+            confidence=Decimal("0.90"),
+            max_budget=Decimal("1000"),
+            reference_price=Decimal("100"),
+            target_price=Decimal("120"),
+            stop_price=Decimal("90"),
+        ),
+    )
+    same_lane = strict_exec_agent._decide_candidate(
+        settings=settings,
+        plan=plan,
+        item=item,
+        account_context=_legacy_lane_account(
+            lane_quantities={"short-term-decider": 2}
+        ),
+        reserved_total_budget=Decimal("0"),
+        reserved_cash_budget=Decimal("0"),
+        reserved_daily_buy_notional=Decimal("0"),
+        reserved_symbol_notional=Decimal("0"),
+        reserved_entry_lanes=set(),
+        agent_contract_result=_legacy_lane_contract(
+            allow_existing_holding=True,
+        ),
+    )
+    incomplete = strict_exec_agent._decide_candidate(
+        settings=settings,
+        plan=plan,
+        item=item,
+        account_context=_legacy_lane_account(
+            lane_quantities={},
+            attribution_complete=False,
+        ),
+        reserved_total_budget=Decimal("0"),
+        reserved_cash_budget=Decimal("0"),
+        reserved_daily_buy_notional=Decimal("0"),
+        reserved_symbol_notional=Decimal("0"),
+        reserved_entry_lanes=set(),
+        agent_contract_result=_legacy_lane_contract(
+            allow_existing_holding=True,
+        ),
+    )
+
+    assert allowed["action"] == "approve"
+    assert explicit_false["action"] == "approve"
+    assert omitted["action"] == "approve"
+    assert allowed["existing_symbol_exposure"] == "200.0000"
+    assert explicit_false["existing_symbol_exposure"] == "200.0000"
+    assert omitted["existing_symbol_exposure"] == "200.0000"
+    assert same_lane["reason_code"] == "existing_holding"
+    assert incomplete["reason_code"] == "holding_lane_attribution_incomplete"
+
+
+def test_legacy_next_open_sizing_counts_other_lane_open_order_remaining_exposure() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        exec_agent_max_symbol_budget=Decimal("1000"),
+        exec_agent_max_total_budget=Decimal("5000"),
+        exec_agent_max_position_allocation_pct=Decimal("1"),
+        exec_agent_max_symbol_exposure_pct=Decimal("1"),
+        exec_agent_max_symbol_total_exposure_pct=Decimal("1"),
+        exec_agent_max_trade_risk_pct=Decimal("0.015"),
+        exec_agent_stop_loss_pct=Decimal("0.10"),
+    )
+    plan, item = _legacy_lane_candidate()
+    account = _legacy_lane_account(
+        lane_quantities={"signal-decider": 2},
+        open_orders=[
+            BrokerAccountOpenOrder(
+                symbol="005930",
+                side="buy",
+                quantity=10,
+                remaining_quantity=3,
+                status="partially_filled",
+                limit_price=Decimal("100"),
+                payload={"decision_agent_name": "signal-decider"},
+            )
+        ],
+    )
+
+    decision = strict_exec_agent._decide_candidate(
+        settings=settings,
+        plan=plan,
+        item=item,
+        account_context=account,
+        reserved_total_budget=Decimal("0"),
+        reserved_cash_budget=Decimal("0"),
+        reserved_daily_buy_notional=Decimal("0"),
+        reserved_symbol_notional=Decimal("0"),
+        reserved_entry_lanes=set(),
+        agent_contract_result=_legacy_lane_contract(
+            allow_existing_holding=True,
+        ),
+    )
+
+    assert decision["action"] == "approve"
+    assert decision["existing_symbol_exposure"] == "500.0000"
+    assert decision["approved_notional"] == "500.0000"
+
+
+def test_local_partial_buy_order_exposes_only_unfilled_remaining_quantity() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_account_number="12345678",
+        account_drawdown_recovery_scope_secret="route-binding-secret",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        risk_context, quantity_policy = bind_kis_account_route(
+            settings=settings,
+            provider="kis",
+            risk_context={"exchange": "KRX"},
+            quantity_policy={"kind": "shares", "quantity": 10},
+        )
+        item = ExecutionPlanItem(
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="next_open_buy",
+            status="broker_order_submitted",
+            decision_agent_name="signal-decider",
+            source_plan_item_id="partial-local-family",
+            provider="kis",
+            venue="KRX",
+            asset_class="stock",
+            risk_context=risk_context,
+            quantity_policy=quantity_policy,
+        )
+        plan = ExecutionPlan(
+            external_plan_id="partial-local-plan",
+            source="test",
+            market_date=date(2026, 5, 13),
+            mode="paper",
+            items=[item],
+        )
+        session.add(plan)
+        session.flush()
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        )
+        order = BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            execution_plan_item_id=item.id,
+            idempotency_key="partial-local-order",
+            broker_order_id="partial-local-order",
+            symbol="005930",
+            side="buy",
+            status="partially_filled",
+            quantity=10,
+            limit_price=Decimal("100"),
+            venue="KRX",
+            asset_class="stock",
+            request_metadata={
+                "exchange": "KRX",
+                "execution_scope": execution_scope_payload(
+                    identity=identity,
+                    venue="KRX",
+                    asset_class="stock",
+                ),
+            },
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            ExecutionFill(
+                broker_order_pk=order.id,
+                broker_fill_id="partial-local-fill",
+                symbol="005930",
+                side="buy",
+                quantity=4,
+                price=Decimal("100"),
+                filled_at=datetime(2026, 5, 13, 0, 1, tzinfo=UTC),
+                payload={"fill_time_precision": "exact"},
+            )
+        )
+        session.commit()
+
+        loaded = strict_exec_agent._load_local_open_orders(
+            settings=settings,
+            db=session,
+            provider="kis",
+            exchange="KRX",
+            broker_account_id=None,
+        )
+
+    assert len(loaded) == 1
+    assert loaded[0].quantity == 10
+    assert loaded[0].remaining_quantity == 6
+    engine.dispose()
+
+
+def test_account_open_order_merge_counts_local_and_broker_copy_once() -> None:
+    local = BrokerAccountOpenOrder(
+        symbol="005930",
+        side="buy",
+        quantity=10,
+        remaining_quantity=6,
+        status="partially_filled",
+        broker_order_id="shared-broker-order",
+        idempotency_key="shared-idempotency",
+        source_candidate_id="shared-source",
+        limit_price=Decimal("100"),
+        payload={"decision_agent_name": "signal-decider"},
+    )
+    broker = BrokerAccountOpenOrder(
+        symbol="005930",
+        side="buy",
+        quantity=10,
+        remaining_quantity=5,
+        status="partially_filled",
+        broker_order_id="shared-broker-order",
+        limit_price=Decimal("101"),
+    )
+
+    merged = strict_exec_agent._merge_account_open_orders(
+        broker_orders=[broker],
+        local_orders=[local],
+    )
+
+    assert len(merged) == 1
+    assert merged[0].remaining_quantity == 5
+    assert merged[0].limit_price == Decimal("101")
+    assert merged[0].payload["decision_agent_name"] == "signal-decider"
+
+
+def test_legacy_holding_lane_attribution_uses_exact_family_fills() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_account_number="12345678",
+        account_drawdown_recovery_scope_secret="route-binding-secret",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        risk_context, quantity_policy = bind_kis_account_route(
+            settings=settings,
+            provider="kis",
+            risk_context={"exchange": "KRX"},
+            quantity_policy={"kind": "shares", "quantity": 2},
+        )
+        entry = ExecutionPlanItem(
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="filled",
+            decision_agent_name="signal-decider",
+            source_plan_item_id="exact-signal-family",
+            provider="kis",
+            venue="KRX",
+            asset_class="stock",
+            risk_context=risk_context,
+            quantity_policy=quantity_policy,
+        )
+        plan = ExecutionPlan(
+            external_plan_id="exact-lane-attribution-plan",
+            source="test",
+            market_date=date(2026, 10, 26),
+            mode="paper",
+            items=[entry],
+        )
+        session.add(plan)
+        session.flush()
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        )
+        order = BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            execution_plan_item_id=entry.id,
+            idempotency_key="exact-signal-family-order",
+            broker_order_id="exact-signal-family-order",
+            symbol="005930",
+            side="buy",
+            status="filled",
+            quantity=2,
+            limit_price=Decimal("100"),
+            venue="KRX",
+            asset_class="stock",
+            request_metadata={
+                "exchange": "KRX",
+                "execution_scope": execution_scope_payload(
+                    identity=identity,
+                    venue="KRX",
+                    asset_class="stock",
+                ),
+            },
+        )
+        session.add(order)
+        session.flush()
+        session.add(
+            ExecutionFill(
+                broker_order_pk=order.id,
+                broker_fill_id="exact-signal-family-fill",
+                symbol="005930",
+                side="buy",
+                quantity=2,
+                price=Decimal("100"),
+                filled_at=datetime(2026, 10, 26, 0, 1, tzinfo=UTC),
+                payload={"fill_time_precision": "exact"},
+            )
+        )
+        session.commit()
+
+        quantities, complete = strict_exec_agent._holding_lane_attribution(
+            settings=settings,
+            db=session,
+            holdings_by_symbol={"005930": 2},
+            observed_at=datetime(2026, 10, 26, 0, 2, tzinfo=UTC),
+        )
+
+    assert quantities == {"005930": {"signal-decider": 2}}
+    assert complete == {"005930": True}
     engine.dispose()
 
 
@@ -1626,6 +2278,277 @@ def test_openclaw_exec_agent_client_handoff_builds_context_and_sizes_without_pre
     engine.dispose()
 
 
+@pytest.mark.parametrize("signal_action", ("wait", "reject"))
+def test_openclaw_exec_agent_candidate_projection_excludes_cross_lane_alignment_authority(
+    signal_action: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = StubBrokerAdapter(available_cash=Decimal("800000"))
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",  # type: ignore[arg-type]
+        execution_position_account_scope="exec-agent-cross-lane-test",
+        kis_app_key="key",
+        kis_app_secret="secret",
+        kis_account_number="12345678",
+        exec_agent_enabled=True,
+        exec_agent_max_account_snapshot_age_seconds=86400,
+        exec_agent_max_symbol_budget=Decimal("500000"),
+        exec_agent_max_total_budget=Decimal("1000000"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    client = FakeExecAgentClient()
+    monkeypatch.setattr(
+        strict_exec_agent,
+        "load_latest_trade_outcome_feedback_snippet",
+        lambda *_, **__: {
+            "summary": {"aggregate_signal_loss": True},
+            "execution_authority": False,
+            "strategy_learning_by_lane": {
+                "signal-decider": {
+                    "schema_version": "strategy-lane-learning-v1",
+                    "status": "ready",
+                    "consumer_eligible": True,
+                    "execution_authority": True,
+                    "decision_lane": "signal-decider",
+                    "summary": {"lane": "signal-decider"},
+                    "lessons": [{"lesson": "signal-only-loss"}],
+                    "quality_gate": {
+                        "status": "ready",
+                        "consumer_eligible": True,
+                    },
+                },
+                "short-term-decider": {
+                    "schema_version": "strategy-lane-learning-v1",
+                    "status": "ready",
+                    "consumer_eligible": True,
+                    "execution_authority": True,
+                    "decision_lane": "short-term-decider",
+                    "summary": {"lane": "short-term-decider"},
+                    "lessons": [{"lesson": "short-term-own-loss"}],
+                    "quality_gate": {
+                        "status": "ready",
+                        "consumer_eligible": True,
+                    },
+                },
+            },
+            "operational_learning_by_lane": {
+                "signal-decider": {
+                    "schema_version": "strategy-lane-operational-learning-v1",
+                    "status": "ready",
+                    "consumer_eligible": True,
+                    "decision_lane": "signal-decider",
+                    "failure_count": 9,
+                },
+                "short-term-decider": {
+                    "schema_version": "strategy-lane-operational-learning-v1",
+                    "status": "ready",
+                    "consumer_eligible": True,
+                    "decision_lane": "short-term-decider",
+                    "failure_count": 1,
+                },
+            },
+        },
+    )
+    risk_context: dict[str, object] = {
+        "confirmation_signal": "momentum_continuation",
+        "decider_input": {
+            "score": 6.7,
+            "alignment_gate": {"signal_decider_action": signal_action},
+        },
+        "decider_output": {
+            "action": "watch",
+            "lane": "short-term-decider",
+            "signal_decider_crosscheck": {"action": signal_action},
+        },
+        "market_data": {
+            "spread_bps": "12",
+            "signal_decider_context": {"action": signal_action},
+        },
+        "signal_decider_alignment": f"{signal_action}_conflict_block",
+        "alignment_gate": {
+            "signal_decider_action": signal_action,
+            "signal_decider_context": {
+                "data_quality_warnings": ["signal alignment warning"]
+            },
+        },
+        "final_enforcement_decision": signal_action,
+        "requested_quantity": 7,
+        "final_quantity": 0,
+        "enforcement_source": "core_wait_conflict_alignment_gate",
+    }
+    quantity_policy: dict[str, object] = {
+        "sizing_hints": {"liquidity": "normal"},
+        "max_quantity": 9,
+        "requested_quantity": 7,
+        "final_quantity": 7,
+        "final_enforcement_decision": "report_only_block_candidate",
+    }
+    original_risk = deepcopy(risk_context)
+    original_policy = deepcopy(quantity_policy)
+    item = ExecutionPlanItem(
+        id=f"item-cross-lane-{signal_action}",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="pending",
+        decision_agent_name="short-term-decider",
+        source_plan_item_id=f"candidate-cross-lane-{signal_action}",
+        risk_context=risk_context,
+        quantity_policy=quantity_policy,
+    )
+    plan = ExecutionPlan(
+        id=f"plan-pk-cross-lane-{signal_action}",
+        external_plan_id=f"plan-cross-lane-{signal_action}",
+        source="kai-trading-core",
+        market_date=date(2026, 5, 13),
+        mode="live",
+        status="accepted",
+        items=[item],
+    )
+
+    with session_factory() as session:
+        result = strict_exec_agent.apply_short_term_exec_agent_decisions(
+            settings=settings,
+            db=session,
+            adapter=adapter,
+            plan=plan,
+            exec_agent_client=client,
+        )
+
+    assert result.approved_count == 1
+    assert len(client.requests) == 1
+    request = client.requests[0]
+    assert request.decider_output == {
+        "action": "watch",
+        "lane": "short-term-decider",
+    }
+    assert request.decider_input == {"score": 6.7}
+    assert request.market_data == {"spread_bps": "12"}
+    assert request.trade_outcome_feedback["summary"] == {
+        "lane": "short-term-decider"
+    }
+    assert request.trade_outcome_feedback["execution_authority"] is True
+    assert request.trade_outcome_feedback["execution_authority_scope"] == (
+        "exact_decision_lane_only"
+    )
+    assert request.trade_outcome_feedback["lessons"] == [
+        {"lesson": "short-term-own-loss"}
+    ]
+    assert request.trade_outcome_feedback["operational_learning_context"][
+        "failure_count"
+    ] == 1
+    assert "signal-only-loss" not in str(request.trade_outcome_feedback)
+    assert "aggregate_signal_loss" not in str(request.trade_outcome_feedback)
+    projected_risk = request.candidate_context["risk_context"]
+    projected_policy = request.candidate_context["quantity_policy"]
+    assert projected_risk["confirmation_signal"] == "momentum_continuation"
+    assert projected_policy == {
+        "sizing_hints": {"liquidity": "normal"},
+        "max_quantity": 9,
+    }
+    for forbidden_key in (
+        "signal_decider_alignment",
+        "alignment_gate",
+        "final_enforcement_decision",
+        "requested_quantity",
+        "final_quantity",
+        "enforcement_source",
+    ):
+        assert forbidden_key not in projected_risk
+    assert {
+        key: item.risk_context[key]
+        for key in original_risk
+    } == original_risk
+    assert quantity_policy == original_policy
+
+    clean_item = ExecutionPlanItem(
+        id=item.id,
+        plan_item_index=0,
+        symbol=item.symbol,
+        side="buy",
+        intent="next_open_buy",
+        status="pending",
+        decision_agent_name="short-term-decider",
+        source_plan_item_id=item.source_plan_item_id,
+        risk_context={
+            "confirmation_signal": "momentum_continuation",
+            "decider_input": {"score": 6.7},
+            "decider_output": {
+                "action": "watch",
+                "lane": "short-term-decider",
+            },
+            "market_data": {"spread_bps": "12"},
+        },
+        quantity_policy={
+            "sizing_hints": {"liquidity": "normal"},
+            "max_quantity": 9,
+        },
+    )
+    clean_plan = ExecutionPlan(
+        id=plan.id,
+        external_plan_id=plan.external_plan_id,
+        source=plan.source,
+        market_date=plan.market_date,
+        mode=plan.mode,
+        status=plan.status,
+        items=[clean_item],
+    )
+    baseline_candidate = strict_exec_agent._build_agent_candidate(
+        plan=clean_plan,
+        item=clean_item,
+        source_identity=strict_exec_agent.serialize_plan_item_source_identity(
+            clean_item
+        ),
+        valid_until=request.binding.valid_until,
+        request_context_digest=request.binding.request_context_digest,
+    )
+    assert baseline_candidate.candidate_context == request.candidate_context
+    assert baseline_candidate.binding.candidate_digest == (
+        request.binding.candidate_digest
+    )
+
+    engine.dispose()
+
+
+def test_exec_agent_candidate_projection_removes_alignment_sourced_legacy_max_quantity() -> None:
+    item = ExecutionPlanItem(
+        id="legacy-alignment-max-item",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        decision_agent_name="short-term-decider",
+        risk_context={"confirmation_signal": "momentum_continuation"},
+        quantity_policy={
+            "sizing_hints": {"liquidity": "normal"},
+            "max_quantity": 0,
+            "enforcement_source": "core_wait_conflict_alignment_gate",
+        },
+    )
+    plan = ExecutionPlan(
+        external_plan_id="legacy-alignment-max-plan",
+        market_date=date(2026, 5, 13),
+        items=[item],
+    )
+
+    candidate_context = strict_exec_agent._agent_candidate_context(
+        plan=plan,
+        item=item,
+    )
+
+    assert candidate_context["quantity_policy"] == {
+        "sizing_hints": {"liquidity": "normal"}
+    }
+    assert item.quantity_policy["max_quantity"] == 0
+    assert item.quantity_policy["enforcement_source"] == (
+        "core_wait_conflict_alignment_gate"
+    )
+
+
 def test_openclaw_exec_agent_batch_client_sees_all_candidates_and_allocates_different_budgets() -> None:
     adapter = StubBrokerAdapter(
         available_cash=Decimal("800000"),
@@ -1769,6 +2692,104 @@ def test_openclaw_exec_agent_batch_client_sees_all_candidates_and_allocates_diff
     assert [item.intent for item in plan.items].count("max_holding_close_sell") == 2
 
     engine.dispose()
+
+
+def test_exec_agent_account_projection_keeps_shared_exposure_without_other_lane_identity() -> None:
+    observed_at = datetime.now(UTC)
+    same_lane_order = BrokerAccountOpenOrder(
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        remaining_quantity=1,
+        status="open",
+        broker_order_id="same-lane-order",
+        idempotency_key="same-lane-idempotency",
+        limit_price=Decimal("100"),
+        payload={
+            "decision_agent_name": "short-term-decider",
+            "entry_family_key": "short-family",
+        },
+    )
+    other_lane_order = BrokerAccountOpenOrder(
+        symbol="005930",
+        side="buy",
+        quantity=2,
+        remaining_quantity=2,
+        status="open",
+        broker_order_id="signal-order",
+        idempotency_key="signal-idempotency",
+        limit_price=Decimal("110"),
+        payload={
+            "decision_agent_name": "signal-decider",
+            "entry_family_key": "signal-family",
+        },
+    )
+    item = ExecutionPlanItem(
+        id="lane-account-candidate",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        status="pending",
+        decision_agent_name="short-term-decider",
+        source_plan_item_id="short-family",
+    )
+    plan = ExecutionPlan(
+        external_plan_id="lane-account-plan",
+        market_date=date.today(),
+        items=[item],
+    )
+    serialized_orders = [
+        strict_exec_agent._serialize_open_order(order)
+        for order in (same_lane_order, other_lane_order)
+    ]
+    account_context = strict_exec_agent._AccountContext(
+        available_cash=Decimal("10000"),
+        buying_power=Decimal("10000"),
+        observed_at=observed_at,
+        snapshot_payload={
+            "available": True,
+            "observed_at": observed_at.isoformat(),
+            "available_cash": "10000.0000",
+            "open_orders": serialized_orders,
+        },
+        holdings_by_symbol={"005930": 3},
+        open_orders=[same_lane_order, other_lane_order],
+        unresolved_buy_reserved_notional=Decimal("320"),
+        unresolved_buy_reservation_complete=True,
+        holding_quantities_by_decision_lane={
+            "005930": {"short-term-decider": 1, "signal-decider": 2},
+        },
+        holding_lane_attribution_complete_by_symbol={"005930": True},
+    )
+
+    request = strict_exec_agent._build_batch_agent_request(
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        candidates=[item],
+        account_context=account_context,
+        request_started_at=observed_at,
+    )
+
+    assert request.portfolio["holdings_by_symbol"] == {"005930": 3}
+    assert request.portfolio["holding_quantities_by_decision_lane"] == {
+        "005930": {"short-term-decider": 1}
+    }
+    for projected_orders in (
+        request.account["open_orders"],
+        request.portfolio["open_orders"],
+    ):
+        assert len(projected_orders) == 2
+        assert projected_orders[0]["decision_agent_name"] == "short-term-decider"
+        assert projected_orders[0]["entry_family_key"] == "short-family"
+        assert projected_orders[1] == {
+            "symbol": "005930",
+            "side": "buy",
+            "quantity": 2,
+            "remaining_quantity": 2,
+            "status": "open",
+            "limit_price": "110.0000",
+        }
 
 
 def test_account_snapshot_drops_untrusted_broker_open_order_payload() -> None:
@@ -2019,6 +3040,70 @@ def test_account_context_uses_candidate_exchange_for_kis_us_local_truth() -> Non
     engine.dispose()
 
 
+def test_account_context_folds_mixed_kis_domestic_order_routes() -> None:
+    class RecordingAdapter(StubBrokerAdapter):
+        def __init__(self) -> None:
+            super().__init__(available_cash=Decimal("100000"))
+            self.snapshot_exchanges: list[str] = []
+
+        def get_account_snapshot(
+            self,
+            access_token: str,
+            *,
+            symbols: list[str] | None = None,
+            reference_prices: dict[str, Decimal] | None = None,
+            exchange: str = "KRX",
+        ) -> BrokerAccountSnapshot:
+            del symbols, reference_prices
+            assert access_token
+            self.snapshot_exchanges.append(exchange)
+            return self.snapshot
+
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="kis-key",
+        kis_app_secret="kis-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        account_drawdown_recovery_scope_secret=(
+            "domestic-candidate-route-secret-at-least-32-bytes"
+        ),
+    )
+    adapter = RecordingAdapter()
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    candidates = [
+        ExecutionPlanItem(
+            plan_item_index=index,
+            symbol=symbol,
+            side="buy",
+            intent="next_open_buy",
+            status="pending",
+            provider="kis",
+            venue=exchange,
+            asset_class="stock",
+            risk_context={"exchange": exchange},
+        )
+        for index, (symbol, exchange) in enumerate(
+            (("005930", "KRX"), ("000660", "NXT"))
+        )
+    ]
+
+    with Session(engine) as db:
+        context = strict_exec_agent._load_account_context(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            candidates=candidates,
+        )
+
+    assert adapter.snapshot_exchanges == ["KRX"]
+    assert context.available_cash == Decimal("100000")
+    assert context.snapshot_payload.get("available") is not False
+    engine.dispose()
+
+
 def test_openclaw_exec_agent_unavailable_fails_closed_when_contract_missing() -> None:
     adapter = StubBrokerAdapter(available_cash=Decimal("800000"))
     app, engine = build_test_app(adapter)
@@ -2075,19 +3160,80 @@ def test_max_holding_close_exit_is_monitored_across_days_and_submits_sell() -> N
 
     adapter.snapshot = BrokerAccountSnapshot(
         available_cash=Decimal("500000"),
-        observed_at=datetime(2026, 5, 18, 14, 45, tzinfo=UTC),
+        observed_at=datetime(2026, 5, 18, 5, 49, 30, tzinfo=UTC),
         source="stub:account_snapshot",
         holdings=[BrokerAccountHolding(symbol="005930", quantity=5)],
         open_orders=[],
     )
     with app.state.db_session_factory() as session:
+        entry_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.side == "buy",
+                ExecutionPlanItem.symbol == "005930",
+            )
+        )
+        assert entry_item is not None
+        identity = build_position_identity(
+            settings=app.state.settings,
+            provider="kis",
+            exchange="KRX",
+        )
+        family_identity = broker_orders_service._strategy_entry_family_identity(
+            entry_item
+        )
+        assert family_identity is not None
+        command_metadata = {
+            broker_orders_service.STRATEGY_ENTRY_FAMILY_METADATA_KEY: family_identity
+        }
         session.add(
             ExecutionPosition(
-                mode="live",
+                mode=app.state.settings.runtime_mode,
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
                 symbol="005930",
                 quantity=5,
                 average_price=Decimal("50000"),
                 updated_from="test",
+            )
+        )
+        entry_order = BrokerOrder(
+            plan_item=entry_item,
+            broker_name="kis",
+            mode=app.state.settings.runtime_mode,
+            idempotency_key="max-holding-entry-order",
+            broker_order_id="max-holding-entry-order",
+            symbol="005930",
+            side="buy",
+            status="filled",
+            quantity=5,
+            limit_price=Decimal("50000"),
+            venue="kis",
+            asset_class="stock",
+            submitted_at=datetime(2026, 5, 13, 0, 1, tzinfo=UTC),
+            request_metadata={
+                "exchange": "KRX",
+                "execution_scope": execution_scope_payload(
+                    identity=identity,
+                    venue="kis",
+                    asset_class="stock",
+                ),
+                "metadata": command_metadata,
+                "original_command": {"metadata": command_metadata},
+            },
+        )
+        session.add(entry_order)
+        session.flush()
+        session.add(
+            ExecutionFill(
+                broker_order_pk=entry_order.id,
+                broker_fill_id="max-holding-entry-fill",
+                symbol="005930",
+                side="buy",
+                quantity=5,
+                price=Decimal("50000"),
+                filled_at=datetime(2026, 5, 13, 0, 2, tzinfo=UTC),
+                payload={"fill_time_precision": "exact"},
             )
         )
         session.commit()
@@ -2393,6 +3539,7 @@ def test_exec_agent_binding_covers_route_account_portfolio_and_risk_caps() -> No
                 provider="kis",
                 asset_class="stock",
                 venue="KRX",
+                decision_agent_name="short-term-decider",
                 risk_context={
                     "execution_account_route": {
                         "version": "kis-account-route-v1",
@@ -2476,6 +3623,257 @@ def test_exec_agent_binding_covers_route_account_portfolio_and_risk_caps() -> No
     )
 
 
+def _exec_lane_feedback_fixture(label: str) -> dict[str, object]:
+    return {
+        "strategy_learning_by_lane": {
+            "short-term-decider": {
+                "schema_version": "strategy-lane-learning-v1",
+                "status": "ready",
+                "consumer_eligible": True,
+                "execution_authority": True,
+                "decision_lane": "short-term-decider",
+                "summary": {"label": label},
+                "lessons": [{"lesson": label}],
+                "quality_gate": {
+                    "status": "ready",
+                    "consumer_eligible": True,
+                },
+            }
+        },
+        "operational_learning_by_lane": {
+            "short-term-decider": {
+                "schema_version": "strategy-lane-operational-learning-v1",
+                "status": "ready",
+                "consumer_eligible": True,
+                "execution_authority": True,
+                "decision_lane": "short-term-decider",
+                "failure_count": 1,
+            }
+        },
+    }
+
+
+def test_legacy_single_candidate_fallback_reuses_bound_batch_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        exec_agent_max_account_snapshot_age_seconds=300,
+        exec_agent_watch_sizing_timeout_seconds=30,
+        execution_position_account_scope="legacy-feedback-test",
+    )
+    item = ExecutionPlanItem(
+        id="legacy-feedback-item",
+        source_plan_item_id="legacy-feedback-source",
+        symbol="005930",
+        side="buy",
+        intent="next_open_buy",
+        provider="kis",
+        asset_class="stock",
+        venue="KRX",
+        decision_agent_name="short-term-decider",
+        risk_context={"target_price": "57000", "stop_price": "47000"},
+    )
+    plan = ExecutionPlan(
+        external_plan_id="legacy-feedback-plan",
+        market_date=date(2026, 5, 13),
+        items=[item],
+    )
+    account = strict_exec_agent._AccountContext(
+        available_cash=Decimal("800000"),
+        buying_power=Decimal("800000"),
+        observed_at=datetime.now(UTC),
+        snapshot_payload={"available": True},
+        holdings_by_symbol={},
+        open_orders=[],
+        unresolved_buy_reserved_notional=Decimal("0"),
+        unresolved_buy_reservation_complete=True,
+        execution_identity=build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        ),
+    )
+    feedback_versions = iter(
+        (
+            _exec_lane_feedback_fixture("captured-a"),
+            _exec_lane_feedback_fixture("later-b"),
+        )
+    )
+    load_count = 0
+
+    def load_feedback(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal load_count
+        load_count += 1
+        return next(feedback_versions)
+
+    monkeypatch.setattr(
+        strict_exec_agent,
+        "load_latest_trade_outcome_feedback_snippet",
+        load_feedback,
+    )
+    batch_request = strict_exec_agent._build_batch_agent_request(
+        settings=settings,
+        plan=plan,
+        candidates=[item],
+        account_context=account,
+    )
+
+    class LegacyOnlyClient:
+        def __init__(self) -> None:
+            self.requests: list[strict_exec_agent.ExecAgentSizingRequest] = []
+
+        def size_candidate(
+            self,
+            request: strict_exec_agent.ExecAgentSizingRequest,
+        ) -> strict_exec_agent.ExecAgentSizingResponse:
+            self.requests.append(request)
+            return strict_exec_agent.ExecAgentSizingResponse(
+                action="reject",
+                confidence=Decimal("0.5"),
+                reason_code="test_reject",
+                binding=request.binding,
+            )
+
+    legacy_client = LegacyOnlyClient()
+    strict_exec_agent._call_batch_sizing_client(
+        client=legacy_client,
+        request=batch_request,
+        settings=settings,
+        plan=plan,
+        candidates=[item],
+        account_context=account,
+    )
+
+    assert load_count == 1
+    assert len(legacy_client.requests) == 1
+    legacy_request = legacy_client.requests[0]
+    assert legacy_request.trade_outcome_feedback["summary"] == {
+        "label": "captured-a"
+    }
+    assert legacy_request.binding == batch_request.candidates[0].binding
+    assert legacy_request.binding.request_context_digest == (
+        batch_request.candidates[0].binding.request_context_digest
+    )
+
+
+def test_direct_sizing_reads_wildcard_exchange_lane_feedback_artifact(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        runtime_mode="live",  # type: ignore[arg-type]
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        execution_position_account_scope="wildcard-feedback-test",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_max_age_seconds=3600,
+    )
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    lane_feedback = _exec_lane_feedback_fixture("wildcard-artifact")
+    execution_scope = {
+        "status": "single",
+        "provider": identity.provider,
+        "account_scope": identity.account_scope,
+        "exchange": None,
+    }
+    for by_lane_key in (
+        "strategy_learning_by_lane",
+        "operational_learning_by_lane",
+    ):
+        lane_feedback[by_lane_key]["short-term-decider"][
+            "execution_account_scope"
+        ] = execution_scope
+    payload = attach_artifact_integrity(
+        {
+            "version": trade_outcome_feedback_service.REPORT_VERSION,
+            "schema_version": trade_outcome_feedback_service.REPORT_VERSION,
+            "mode": "live",
+            "generated_at": datetime.now(UTC).isoformat(),
+            "execution_account_scope": execution_scope,
+            "quality_gate": {
+                "status": "ready",
+                "consumer_eligible": True,
+            },
+            "strategy_learning_by_lane": lane_feedback[
+                "strategy_learning_by_lane"
+            ],
+            "operational_learning_by_lane": lane_feedback[
+                "operational_learning_by_lane"
+            ],
+            "operational_learning_context": {
+                "schema_version": "operational-learning-context-v1",
+                "status": "ready",
+                "consumer_eligible": True,
+                "execution_authority": False,
+                "scope": execution_scope,
+                "allowed_effects": ["delay", "downsize", "reject"],
+                "prohibited_effects": ["approve", "increase_size"],
+            },
+            "prompt_snippet": {},
+        }
+    )
+    (tmp_path / "latest.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    account = strict_exec_agent._AccountContext(
+        available_cash=Decimal("800000"),
+        buying_power=Decimal("800000"),
+        observed_at=datetime.now(UTC),
+        snapshot_payload={"available": True},
+        holdings_by_symbol={},
+        open_orders=[],
+        unresolved_buy_reserved_notional=Decimal("0"),
+        unresolved_buy_reservation_complete=True,
+        execution_identity=identity,
+    )
+
+    loaded = strict_exec_agent._strategy_lane_trade_outcome_feedback(
+        settings=settings,
+        account_context=account,
+        decision_lane="short-term-decider",
+    )
+
+    if loaded["status"] != "ready":
+        pytest.fail(json.dumps(loaded, sort_keys=True))
+    assert loaded["summary"] == {"label": "wildcard-artifact"}
+
+
+def test_direct_sizing_never_loads_global_feedback_without_execution_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_global_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("unscoped global feedback must not be loaded")
+
+    monkeypatch.setattr(
+        strict_exec_agent,
+        "load_latest_trade_outcome_feedback_snippet",
+        forbidden_global_load,
+    )
+    account = strict_exec_agent._AccountContext(
+        available_cash=Decimal("800000"),
+        buying_power=Decimal("800000"),
+        observed_at=datetime.now(UTC),
+        snapshot_payload={"available": True},
+        holdings_by_symbol={},
+        open_orders=[],
+        unresolved_buy_reserved_notional=Decimal("0"),
+        unresolved_buy_reservation_complete=True,
+    )
+
+    loaded = strict_exec_agent._strategy_lane_trade_outcome_feedback(
+        settings=Settings(),
+        account_context=account,
+        decision_lane="short-term-decider",
+    )
+
+    assert loaded["status"] == "unavailable"
+    assert loaded["reason"] == "strategy_lane_learning_unavailable"
+
+
 @pytest.mark.parametrize("offset_seconds", [-301, 31])
 def test_sync_exec_agent_rejects_stale_or_future_account_snapshot(
     offset_seconds: int,
@@ -2501,6 +3899,7 @@ def test_sync_exec_agent_binding_cannot_extend_a_299_second_old_snapshot() -> No
         provider="kis",
         asset_class="stock",
         venue="KRX",
+        decision_agent_name="short-term-decider",
         risk_context={"target_price": "57000", "stop_price": "47000"},
     )
     plan = ExecutionPlan(

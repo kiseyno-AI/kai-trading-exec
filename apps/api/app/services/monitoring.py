@@ -51,8 +51,13 @@ from app.services.account_drawdown_recovery import snapshot_is_fresh_for_recover
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
 from app.services.fill_economics import effective_fill_quantity
-from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fill_idempotency import (
+    dedupe_execution_fills,
+    execution_fills_have_relevant_conflicting_identity,
+)
 from app.services.fifo_inventory import (
+    FifoRouteScope,
+    canonical_fifo_inventory_route_scope,
     fifo_route_scope_from_order,
     load_fifo_isolation_cursor,
     replay_open_long_fill_inventory,
@@ -63,7 +68,6 @@ from app.services.execution_account_route import (
     bind_kis_account_route,
     classify_kis_account_route,
     configured_kis_route_fingerprint,
-    execution_account_scope_binding_from_payloads,
     kis_account_route_binding_from_payloads,
     validate_kis_account_route,
 )
@@ -88,15 +92,19 @@ from app.services.reconciliation import (
 from app.services.broker_orders import (
     ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES,
     PLAN_ITEM_NONCLAIMABLE_STATUSES,
+    STRATEGY_ENTRY_FAMILY_METADATA_KEY,
     _current_buy_plan_item_state,
     _plan_item_state_changed_result,
+    _strategy_entry_family_identity,
     inspect_account_drawdown_recovery,
     place_broker_order,
 )
 from app.services.json_compaction import compact_json_object, json_payload_hash
 from app.services.plan_item_identity import (
+    plan_item_decision_agent_name,
     plan_item_entry_family_key,
-    select_plan_item_family_members,
+    plan_item_inventory_scope_key,
+    resolve_plan_item_entry_family_key,
     serialize_plan_item_source_identity,
 )
 from app.services.position_identity import (
@@ -174,6 +182,10 @@ class CoreMonitoringSymbolHandoff:
 
 
 SELL_MONITORED_INTENTS = frozenset({"target_sell", "stop_sell", "max_holding_close_sell"})
+SIGNAL_DECIDER_NAME = "signal-decider"
+SHORT_TERM_DECIDER_NAME = "short-term-decider"
+SHORT_TERM_MIN_HOLDING_SESSIONS = 2
+SHORT_TERM_MAX_HOLDING_SESSIONS = 3
 MONITORED_KIS_POSITION_EXCHANGES = tuple(
     sorted(KRX_EXCHANGES | {"AMEX", "NASD", "NYSE"})
 )
@@ -221,6 +233,8 @@ RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
         "sector_weakness_reject",
         "pre_submit_quote_stale",
         "trigger_time_liquidity_unavailable",
+        "entry_lane_attribution_unavailable",
+        "duplicate_open_buy_order",
     }
 )
 BLOCKED_WATCH_BUY_APPROVAL_REASONS = frozenset(
@@ -231,6 +245,7 @@ BLOCKED_WATCH_BUY_APPROVAL_REASONS = frozenset(
         "stale_trigger_reclaim_required",
         "late_entry_cutoff",
         "watch_buy_very_weak_liquidity",
+        "same_lane_existing_holding",
     }
 )
 PENDING_DISPATCH_MONITORING_STATUSES = (
@@ -347,6 +362,21 @@ class EntryMarketDateAnchor:
 
 
 @dataclass(frozen=True)
+class PostEntryFamilyInventory:
+    family_key: str
+    entry_family_key: str
+    decision_lane: str
+    route_key: tuple[str, str, str, str]
+    entry_order: BrokerOrder
+    entry_item: ExecutionPlanItem
+    filled_quantity: int
+    exited_quantity: int
+    remaining_quantity: int
+    average_entry_price: Decimal
+    first_buy_fill: ExecutionFill
+
+
+@dataclass(frozen=True)
 class PendingMonitoringAction:
     item: ExecutionPlanItem
     observed_price: Decimal | None
@@ -413,6 +443,10 @@ class ProtectiveStopCoverageIssue:
     position_quantity: int | None = None
     position_last_reconciled_at: datetime | None = None
     evidence: list[str] | None = None
+    entry_family_key: str | None = None
+    decision_lane: str | None = None
+    family_inventory_key: str | None = None
+    route_key: tuple[str, str, str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -426,6 +460,10 @@ class ProfitTargetCoverageIssue:
     latest_target_trigger_price: Decimal | None
     outcome: str
     reason: str | None = None
+    entry_family_key: str | None = None
+    decision_lane: str | None = None
+    family_inventory_key: str | None = None
+    route_key: tuple[str, str, str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -548,6 +586,47 @@ def materialize_monitoring_plan_items(
         item.status = _pending_configuration_status(item.intent)
 
 
+def _exact_sell_monitor_entry_family_key(
+    item: ExecutionPlanItem,
+    *,
+    db: Session,
+) -> tuple[str | None, str | None]:
+    return resolve_plan_item_entry_family_key(item, session=db)
+
+
+def _sell_replan_scope_may_overlap(
+    incumbent: ExecutionPlanItem,
+    replanned: ExecutionPlanItem,
+) -> bool:
+    if (
+        incumbent.source_plan_item_id != replanned.source_plan_item_id
+        or incumbent.symbol != replanned.symbol
+        or incumbent.intent != replanned.intent
+    ):
+        return False
+
+    incumbent_route = _sell_monitor_route_key(incumbent)
+    replanned_route = _sell_monitor_route_key(replanned)
+    if (
+        incumbent_route is not None
+        and replanned_route is not None
+        and incumbent_route != replanned_route
+    ):
+        return False
+
+    incumbent_lane = _normalized_decision_lane(
+        plan_item_decision_agent_name(incumbent)
+    )
+    replanned_lane = _normalized_decision_lane(
+        plan_item_decision_agent_name(replanned)
+    )
+    return not (
+        incumbent_lane is not None
+        and replanned_lane is not None
+        and incumbent_lane != replanned_lane
+    )
+
+
 def _update_existing_sell_monitors_from_replanned_items(
     *,
     plan: ExecutionPlan,
@@ -633,19 +712,54 @@ def _update_existing_sell_monitors_from_replanned_items(
         .execution_options(populate_existing=True)
     ).all()
     existing_by_source: dict[
-        tuple[str, str, str, tuple[str, str, str, str]],
+        tuple[str, str, str, str, str, tuple[str, str, str, str]],
         ExecutionPlanItem,
     ] = {}
     for existing in existing_items:
         if not existing.source_plan_item_id:
             continue
+        if existing.execution_plan_id == plan.id:
+            # The query can see the just-flushed plan. Replan reconciliation is
+            # only allowed to mutate a previously accepted incumbent.
+            continue
+        if not any(
+            _sell_replan_scope_may_overlap(existing, replanned)
+            for replanned in replanned_items
+        ):
+            # A reused Core source row in another authenticated account or
+            # decision lane is an independent monitor, not an ambiguous replan.
+            continue
+        family_key, family_identity_error = _exact_sell_monitor_entry_family_key(
+            existing,
+            db=db,
+        )
+        if family_key is None:
+            existing.status = "manual_review_required"
+            _record_monitoring_event(
+                item=existing,
+                event={
+                    "event": "replanned_sell_monitor_identity_inexact",
+                    "reason": (
+                        f"incumbent_{family_identity_error}"
+                        if family_identity_error is not None
+                        else "incumbent_entry_family_unavailable"
+                    ),
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                },
+            )
+            continue
         route_key = _sell_monitor_route_key(existing)
-        if route_key is None:
+        decision_lane = _normalized_decision_lane(
+            plan_item_decision_agent_name(existing)
+        )
+        if route_key is None or decision_lane is None:
             continue
         key = (
             existing.source_plan_item_id,
             existing.symbol,
             existing.intent,
+            family_key,
+            decision_lane,
             route_key,
         )
         current = existing_by_source.get(key)
@@ -655,14 +769,56 @@ def _update_existing_sell_monitors_from_replanned_items(
     for replanned in replanned_items:
         if not replanned.source_plan_item_id:
             continue
+        overlapping_incumbents = [
+            existing
+            for existing in existing_items
+            if existing.execution_plan_id != plan.id
+            and _sell_replan_scope_may_overlap(existing, replanned)
+        ]
+        replanned_route = _sell_monitor_route_key(replanned)
+        provider = (
+            replanned_route[0]
+            if replanned_route is not None
+            else str(replanned.provider or "kis").strip().lower()
+        )
+        if provider in {"korea-investment", "korea_investment"}:
+            provider = "kis"
+        if not overlapping_incumbents and provider != "kis":
+            # Non-KIS monitors are isolated by their authenticated account
+            # scope. With no prior row in that exact scope/lane there is
+            # nothing to update or deduplicate; ordinary materialization owns
+            # activation of the new independent monitor.
+            continue
+        family_key, family_identity_error = _exact_sell_monitor_entry_family_key(
+            replanned,
+            db=db,
+        )
+        if family_key is None:
+            replanned.status = "manual_review_required"
+            _record_monitoring_event(
+                item=replanned,
+                event={
+                    "event": "replanned_sell_monitor_identity_inexact",
+                    "reason": (
+                        family_identity_error or "entry_family_unavailable"
+                    ),
+                    "recorded_at": datetime.now(UTC).isoformat(),
+                },
+            )
+            continue
         route_key = _sell_monitor_route_key(replanned)
-        if route_key is None:
+        decision_lane = _normalized_decision_lane(
+            plan_item_decision_agent_name(replanned)
+        )
+        if route_key is None or decision_lane is None:
             continue
         existing = existing_by_source.get(
             (
                 replanned.source_plan_item_id,
                 replanned.symbol,
                 replanned.intent,
+                family_key,
+                decision_lane,
                 route_key,
             )
         )
@@ -1088,31 +1244,7 @@ def _sell_monitor_material(item: ExecutionPlanItem) -> tuple[object, ...]:
 def _sell_monitor_route_key(
     item: ExecutionPlanItem,
 ) -> tuple[str, str, str, str] | None:
-    provider = str(item.provider or "kis").strip().lower()
-    if provider in {"korea-investment", "korea_investment"}:
-        provider = "kis"
-    exchange = _plan_item_exchange(item)
-    asset_class = str(item.asset_class or "stock").strip().lower()
-    if provider != "kis":
-        binding = execution_account_scope_binding_from_payloads(
-            _loaded_risk_context(item, allow_file_backed_load=True),
-            item.quantity_policy,
-        )
-        if binding is None or binding.get("provider") != provider:
-            return None
-        return provider, exchange, asset_class, str(binding["account_scope"])
-    binding = kis_account_route_binding_from_payloads(
-        _loaded_risk_context(item, allow_file_backed_load=True),
-        item.quantity_policy,
-    )
-    if binding is None:
-        return None
-    return (
-        provider,
-        exchange,
-        asset_class,
-        binding["configured_route_fingerprint"],
-    )
+    return plan_item_inventory_scope_key(item)
 
 
 def evaluate_monitoring(
@@ -2009,7 +2141,6 @@ def _watch_buy_queue_priority_key(
         trigger_rank,
         liquidity_rank,
         reward_risk_rank,
-        _watch_buy_queue_alignment_rank(risk_context),
         oldest_evidence_age,
         _watch_buy_queue_warning_count(risk_context),
         -(turnover or Decimal("0")),
@@ -2357,42 +2488,9 @@ def _strict_queue_evidence_datetime(value: object) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _watch_buy_queue_alignment_rank(risk_context: dict[str, object]) -> int:
-    gate = risk_context.get("alignment_gate")
-    gate = gate if isinstance(gate, dict) else {}
-    values = [
-        risk_context.get("signal_decider_alignment"),
-        risk_context.get("alignment_gate_action"),
-        gate.get("signal_decider_alignment"),
-        gate.get("alignment_gate_action"),
-        gate.get("signal_decider_action"),
-    ]
-    normalized = " ".join(
-        str(value).strip().lower()
-        for value in values
-        if isinstance(value, str) and value.strip()
-    )
-    if any(marker in normalized for marker in ("conflict", "block", "reject", "wait")):
-        return 2
-    if any(marker in normalized for marker in ("buy_aligned", "aligned_buy", "confirm", "support")):
-        return 0
-    return 1
-
-
 def _watch_buy_queue_warning_count(risk_context: dict[str, object]) -> int:
     warnings = risk_context.get("data_quality_warnings")
-    count = len(warnings) if isinstance(warnings, list) else 0
-    gate = risk_context.get("alignment_gate")
-    if isinstance(gate, dict):
-        signal_context = gate.get("signal_decider_context")
-        nested = (
-            signal_context.get("data_quality_warnings")
-            if isinstance(signal_context, dict)
-            else None
-        )
-        if isinstance(nested, list):
-            count += len(nested)
-    return count
+    return len(warnings) if isinstance(warnings, list) else 0
 
 
 def _load_core_monitoring_symbol_handoff(
@@ -2909,6 +3007,16 @@ def _evaluate_monitoring_cycle(
         positions_by_symbol=positions_by_symbol,
         rearmed_plan_item_ids=rearmed_protective_stop_item_ids,
     )
+    (
+        remaining_quantities_by_family,
+        entry_prices_by_family,
+    ) = _remaining_quantities_by_entry_family(
+        settings=settings,
+        db=db,
+        positions_by_symbol=positions_by_symbol,
+        through=triggered_at,
+        rearmed_plan_item_ids=rearmed_protective_stop_item_ids,
+    )
     primary_triggered_symbols = _primary_triggered_sell_symbols(
         settings=settings,
         items=items,
@@ -3248,6 +3356,31 @@ def _evaluate_monitoring_cycle(
                 waiting_result["state_transition"] = "sell_monitor_rearmed"
                 waiting_result["previous_status"] = previous_status
             result_by_item_id[item.id] = waiting_result
+            continue
+
+        sell_retry_blocked_until = _sell_dispatch_retry_blocked_until(
+            settings=settings,
+            item=item,
+        )
+        if (
+            sell_retry_blocked_until is not None
+            and triggered_at < sell_retry_blocked_until
+        ):
+            triggered_item_count += 1
+            triggered_symbols.add(item.symbol)
+            blocked_item_count += 1
+            result_by_item_id[item.id] = _monitoring_result_payload(
+                item=item,
+                observed_price=observed_price,
+                outcome="blocked",
+                block_reason="retry_cooldown",
+                message=(
+                    "sell monitor retry cooldown is active after a retryable "
+                    "pre-broker rejection"
+                ),
+                trigger_reason=trigger_reason,
+                trigger_metadata=trigger_metadata,
+            )
             continue
 
         if _is_watch_buy_item(item) and observed_price is not None:
@@ -3676,11 +3809,50 @@ def _evaluate_monitoring_cycle(
                     recorded_at=triggered_at,
                 )
         else:
+            sell_remaining_quantity = _sell_remaining_quantity(
+                item=action.item,
+                remaining_quantities_by_symbol=remaining_quantities_by_symbol,
+                remaining_quantities_by_family=remaining_quantities_by_family,
+            )
             quantity = _resolve_sell_quantity(
                 item=action.item,
-                remaining_quantity=remaining_quantities_by_symbol.get(action.item.symbol),
+                remaining_quantity=sell_remaining_quantity,
             )
             if quantity is None:
+                entry_family_key = plan_item_entry_family_key(action.item)
+                decision_lane = _normalized_decision_lane(
+                    plan_item_decision_agent_name(action.item)
+                )
+                if (entry_family_key is None) != (decision_lane is None):
+                    prior_status = action.item.status
+                    action.item.status = "manual_review_required"
+                    blocked_item_count += 1
+                    _record_monitoring_event(
+                        item=action.item,
+                        event={
+                            "event": "sell_monitor_manual_review",
+                            "reason": "partial_entry_family_identity",
+                            "prior_status": prior_status,
+                            "entry_family_key": entry_family_key,
+                            "decision_lane": decision_lane,
+                            "recorded_at": triggered_at.isoformat(),
+                        },
+                    )
+                    result_by_item_id[action.item.id] = (
+                        _monitoring_result_payload(
+                            item=action.item,
+                            observed_price=action.observed_price,
+                            outcome="blocked",
+                            block_reason="strategy_family_lineage_unavailable",
+                            message=(
+                                "sell monitor has only a partial strategy-family "
+                                "identity and requires manual review"
+                            ),
+                        )
+                    )
+                    if symbol_actions:
+                        pending_symbols.append(symbol)
+                    continue
                 reconciliation_error = _latest_reconciliation_error_for_symbol(
                     settings=settings,
                     db=db,
@@ -3754,7 +3926,7 @@ def _evaluate_monitoring_cycle(
                     quote_freshness_at=quote_freshness_at,
                     cycle_started=cycle_started,
                     intended_quantity=quantity,
-                    remaining_quantity=remaining_quantities_by_symbol.get(action.item.symbol),
+                    remaining_quantity=sell_remaining_quantity,
                 )
                 if agent_result.refreshed_price is not None:
                     action = _action_with_refreshed_price(
@@ -3782,14 +3954,11 @@ def _evaluate_monitoring_cycle(
                     _reserve_and_rearm_sell_after_success,
                     settings=settings,
                     item=action.item,
-                    position=_position_for_monitoring_item(
-                        settings=settings,
-                        item=action.item,
-                        positions_by_symbol=positions_by_symbol,
-                    ),
                     remaining_quantities_by_symbol=remaining_quantities_by_symbol,
                     submitted_quantity=quantity,
                     recorded_at=triggered_at,
+                    remaining_quantities_by_family=remaining_quantities_by_family,
+                    entry_prices_by_family=entry_prices_by_family,
                 )
             else:
                 control_state = ensure_runtime_control_state(settings=settings, db=db)
@@ -4056,6 +4225,35 @@ def _evaluate_monitoring_cycle(
                             "recorded_at": triggered_at.isoformat(),
                         },
                     )
+                elif (
+                    not is_watch_buy
+                    and not preserve_current_plan_status
+                    and action.item.status in SELL_TRIGGERED_BLOCKED_STATUSES
+                    and _sell_placement_block_is_retryable(placement.payload)
+                ):
+                    retry_after_at = placement.payload.get("retry_after_at")
+                    if _parse_event_datetime(retry_after_at) is None:
+                        retry_after_at = (
+                            triggered_at
+                            + timedelta(
+                                seconds=(
+                                    settings.monitoring_watch_buy_retry_cooldown_seconds
+                                )
+                            )
+                        ).isoformat()
+                    _record_monitoring_event(
+                        item=action.item,
+                        event={
+                            "event": "sell_monitor_dispatch_deferred",
+                            "reason": placement.payload.get("block_reason"),
+                            "message": placement.payload.get("message"),
+                            "retry_after_at": retry_after_at,
+                            "observed_price": _serialize_decimal(
+                                action.observed_price
+                            ),
+                            "recorded_at": triggered_at.isoformat(),
+                        },
+                    )
                 db.commit()
                 result_by_item_id[action.item.id] = _monitoring_result_payload(
                     item=action.item,
@@ -4099,6 +4297,13 @@ def _evaluate_monitoring_cycle(
                                     remaining_quantities_by_symbol
                                 ),
                                 symbol=action.item.symbol,
+                                quantity=duplicate_quantity,
+                            )
+                            _reserve_family_quantity(
+                                remaining_quantities_by_family=(
+                                    remaining_quantities_by_family
+                                ),
+                                item=action.item,
                                 quantity=duplicate_quantity,
                             )
                 result_by_item_id[action.item.id] = _monitoring_result_payload(
@@ -4639,7 +4844,9 @@ def supersede_duplicate_active_watch_buys(
                 ExecutionPlanItem.quantity_policy,
                 ExecutionPlanItem.source_market_date,
                 ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
                 ExecutionPlanItem.asset_class,
+                ExecutionPlanItem.decision_agent_name,
             ),
             selectinload(ExecutionPlanItem.plan).load_only(
                 ExecutionPlan.id,
@@ -4669,7 +4876,7 @@ def supersede_duplicate_active_watch_buys(
         for item in candidates
     )
     ordered = sorted(eligible_candidates, key=_active_watch_recency_key, reverse=True)
-    canonical_by_route: dict[tuple[str, str, str, str], ExecutionPlanItem] = {}
+    canonical_by_route: dict[tuple[str, str, str, str, str], ExecutionPlanItem] = {}
     superseded: list[tuple[ExecutionPlanItem, ExecutionPlanItem]] = []
     for item in ordered:
         route_key = _active_watch_route_key(item)
@@ -4696,7 +4903,9 @@ def supersede_duplicate_active_watch_buys(
     return quarantined_count + len(superseded)
 
 
-def _active_watch_route_key(item: ExecutionPlanItem) -> tuple[str, str, str, str]:
+def _active_watch_route_key(
+    item: ExecutionPlanItem,
+) -> tuple[str, str, str, str, str]:
     symbol = str(item.symbol or "").strip().upper()
     is_krx_equity = _is_krx_equity_symbol(symbol)
     provider = str(item.provider or ("kis" if is_krx_equity else "unknown")).strip().lower()
@@ -4712,10 +4921,13 @@ def _active_watch_route_key(item: ExecutionPlanItem) -> tuple[str, str, str, str
     except ValueError:
         asset_class = str(raw_asset_class).strip().lower()
     exchange = _plan_item_exchange(item)
-    # A single account must never carry two simultaneous new-buy authorities
-    # for the same market instrument. Entry-family identity still scopes
-    # protective exits, but it must not allow duplicate BUYs to race each other.
-    return provider, asset_class, exchange, symbol
+    decision_agent_name = str(
+        plan_item_decision_agent_name(item) or "unknown"
+    ).strip().casefold()
+    # Each decision lane owns at most one simultaneous new-buy authority for a
+    # route and symbol. Distinct lanes may intentionally build independent
+    # entry families in the same symbol.
+    return provider, asset_class, exchange, symbol, decision_agent_name
 
 
 def _active_watch_recency_key(
@@ -5719,9 +5931,16 @@ def _locked_effective_protective_stop_price(
         .execution_options(populate_existing=True)
         .with_for_update()
     ).all()
-    stop_items = select_plan_item_family_members(
-        anchor=item,
-        candidates=stop_items,
+    family_route_key = _plan_item_family_route_inventory_key(item)
+    stop_items = (
+        [
+            stop_item
+            for stop_item in stop_items
+            if _plan_item_family_route_inventory_key(stop_item)
+            == family_route_key
+        ]
+        if family_route_key is not None
+        else []
     )
     candidates = [
         stop_item.trigger_price
@@ -6709,7 +6928,8 @@ def _update_sibling_trigger_price(
     trigger_price: Decimal,
 ) -> None:
     plan = item.plan
-    if plan is None:
+    family_route_key = _plan_item_family_route_inventory_key(item)
+    if plan is None or family_route_key is None:
         return
     candidates = [
         sibling
@@ -6717,11 +6937,10 @@ def _update_sibling_trigger_price(
         if sibling.symbol == item.symbol
         and sibling.intent == intent
         and sibling.status not in NON_MONITORABLE_PLAN_ITEM_STATUSES
+        and _plan_item_family_route_inventory_key(sibling)
+        == family_route_key
     ]
-    for sibling in select_plan_item_family_members(
-        anchor=item,
-        candidates=candidates,
-    ):
+    for sibling in candidates:
         sibling.trigger_price = trigger_price
 
 
@@ -7040,14 +7259,23 @@ def _load_monitored_items(
             current_market_date=resolved_market_date,
             effective_at=resolved_effective_at if use_effective_at else None,
         )
+    decision_lane_expression = func.lower(
+        func.trim(
+            func.coalesce(ExecutionPlanItem.decision_agent_name, "unknown")
+        )
+    )
     latest_plan_candidates = (
         select(
             ExecutionPlanItem.symbol.label("symbol"),
+            decision_lane_expression.label("decision_lane"),
             ExecutionPlan.id.label("plan_id"),
             ExecutionPlan.accepted_at.label("accepted_at"),
             func.row_number()
             .over(
-                partition_by=ExecutionPlanItem.symbol,
+                partition_by=(
+                    ExecutionPlanItem.symbol,
+                    decision_lane_expression,
+                ),
                 order_by=(
                     ExecutionPlan.market_date.desc(),
                     ExecutionPlan.requested_at.desc().nullslast(),
@@ -7065,20 +7293,34 @@ def _load_monitored_items(
         )
         .subquery()
     )
-    # Bound the working set by distinct symbol, and only evaluate the latest
-    # monitorable plan for each symbol so stale prior-day target/stop rows do
-    # not submit duplicate exits after a newer plan supersedes them.
-    selected_symbol_plans = (
+    # Bound the working set by distinct symbol, while retaining the latest
+    # monitorable plan independently for each decision lane. Signal and
+    # short-term ownership can coexist for one symbol; stale plans within the
+    # same lane remain superseded.
+    selected_symbols = (
+        select(latest_plan_candidates.c.symbol)
+        .where(latest_plan_candidates.c.symbol_rank == 1)
+        .group_by(latest_plan_candidates.c.symbol)
+        .order_by(
+            func.min(latest_plan_candidates.c.accepted_at).asc(),
+            latest_plan_candidates.c.symbol.asc(),
+        )
+        .limit(settings.monitoring_max_symbols_per_cycle)
+    )
+    selected_lane_plans = (
         select(
             latest_plan_candidates.c.symbol,
+            latest_plan_candidates.c.decision_lane,
             latest_plan_candidates.c.plan_id,
         )
-        .where(latest_plan_candidates.c.symbol_rank == 1)
+        .where(
+            latest_plan_candidates.c.symbol_rank == 1,
+            latest_plan_candidates.c.symbol.in_(selected_symbols),
+        )
         .order_by(
             latest_plan_candidates.c.accepted_at.asc(),
             latest_plan_candidates.c.plan_id.asc(),
         )
-        .limit(settings.monitoring_max_symbols_per_cycle)
     )
     selected_items = db.scalars(
         select(ExecutionPlanItem)
@@ -7086,7 +7328,11 @@ def _load_monitored_items(
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             monitored_item_filter,
-            tuple_(ExecutionPlanItem.symbol, ExecutionPlanItem.execution_plan_id).in_(selected_symbol_plans),
+            tuple_(
+                ExecutionPlanItem.symbol,
+                decision_lane_expression,
+                ExecutionPlanItem.execution_plan_id,
+            ).in_(selected_lane_plans),
         )
         .options(
             load_only(
@@ -7198,7 +7444,7 @@ def _canonicalize_loaded_active_watch_buys(
         recorded_at=datetime.now(UTC),
     )
     items = _canonicalize_loaded_sell_monitors(items)
-    canonical_by_route: dict[tuple[str, str, str, str], ExecutionPlanItem] = {}
+    canonical_by_route: dict[tuple[str, str, str, str, str], ExecutionPlanItem] = {}
     for item in items:
         if (
             item.side != "buy"
@@ -7228,21 +7474,28 @@ def _canonicalize_loaded_sell_monitors(
     items: list[ExecutionPlanItem],
 ) -> list[ExecutionPlanItem]:
     canonical_plan_by_authority: dict[
-        tuple[str, str, str, tuple[str, str, str, str]],
+        tuple[str, str, str, str, tuple[str, str, str, str]],
         ExecutionPlanItem,
     ] = {}
     for item in items:
         if item.side != "sell" or item.intent not in SELL_MONITORED_INTENTS:
             continue
         family_key = plan_item_entry_family_key(item)
-        if family_key is None and item.source_plan_item_id:
-            family_key = f"source:{item.source_plan_item_id}"
         route_key = _sell_monitor_route_key(item)
-        if family_key is None or route_key is None:
+        decision_lane = _normalized_decision_lane(
+            plan_item_decision_agent_name(item)
+        )
+        if family_key is None or decision_lane is None or route_key is None:
             # Unlinked legacy protection is intentionally retained; symbol-only
             # deduplication cannot prove that two exits protect the same entry.
             continue
-        authority_key = (item.symbol, item.intent, family_key, route_key)
+        authority_key = (
+            item.symbol,
+            item.intent,
+            family_key,
+            decision_lane,
+            route_key,
+        )
         current = canonical_plan_by_authority.get(authority_key)
         if current is None or _sell_item_is_preferred_authority(item, current):
             canonical_plan_by_authority[authority_key] = item
@@ -7253,13 +7506,20 @@ def _canonicalize_loaded_sell_monitors(
             retained.append(item)
             continue
         family_key = plan_item_entry_family_key(item)
-        if family_key is None and item.source_plan_item_id:
-            family_key = f"source:{item.source_plan_item_id}"
         route_key = _sell_monitor_route_key(item)
-        if family_key is None or route_key is None:
+        decision_lane = _normalized_decision_lane(
+            plan_item_decision_agent_name(item)
+        )
+        if family_key is None or decision_lane is None or route_key is None:
             retained.append(item)
             continue
-        authority_key = (item.symbol, item.intent, family_key, route_key)
+        authority_key = (
+            item.symbol,
+            item.intent,
+            family_key,
+            decision_lane,
+            route_key,
+        )
         canonical = canonical_plan_by_authority.get(authority_key)
         if canonical is None or item.execution_plan_id == canonical.execution_plan_id:
             retained.append(item)
@@ -7473,21 +7733,35 @@ def _prepare_due_max_holding_items(
                 )
             continue
 
-        candidates_by_family: dict[str, list[ExecutionPlanItem]] = {}
+        candidates_by_family: dict[
+            tuple[str, tuple[str, str, str, str]],
+            list[ExecutionPlanItem],
+        ] = {}
         unresolved_candidates: list[ExecutionPlanItem] = []
         for item in candidates:
-            family_key = plan_item_entry_family_key(item)
-            if family_key is None:
+            family_route_key = _plan_item_family_route_inventory_key(item)
+            if family_route_key is None:
                 unresolved_candidates.append(item)
             else:
-                candidates_by_family.setdefault(family_key, []).append(item)
+                candidates_by_family.setdefault(family_route_key, []).append(item)
 
         if unresolved_candidates:
             if len(candidates) == 1:
                 # Preserve the single-entry legacy contract. There is no
                 # competing family that could make the symbol fallback unsafe.
                 item = unresolved_candidates[0]
-                candidates_by_family[f"legacy-single:{item.id}"] = [item]
+                route_key = _sell_monitor_route_key(item)
+                if route_key is None:
+                    _record_max_holding_state_event(
+                        db=db,
+                        item=item,
+                        event="max_holding_close_blocked",
+                        reason="missing_exact_route_identity",
+                        triggered_at=triggered_at,
+                        position=position,
+                    )
+                else:
+                    candidates_by_family[(f"legacy-single:{item.id}", route_key)] = [item]
             else:
                 # Never guess which same-symbol entry an unlinked close owns.
                 # Keep its durable status intact and leave a manual-review
@@ -7668,17 +7942,29 @@ def _append_held_active_sell_monitor_reconciliations(
     if not requested_symbols:
         return selected_items
     selected_sell_replacements: dict[
-        tuple[str, str, str], ExecutionPlanItem
+        tuple[
+            str,
+            str,
+            str,
+            tuple[str, str, str, str],
+        ],
+        ExecutionPlanItem,
     ] = {}
     for item in selected_items:
         if item.side != "sell" or item.intent not in SELL_MONITORED_INTENTS:
             continue
-        family_key = plan_item_entry_family_key(item)
-        if family_key is None:
+        family_key = _plan_item_family_inventory_key(item)
+        route_key = _sell_monitor_route_key(item)
+        if family_key is None or route_key is None:
             # An unlinked legacy monitor cannot prove that it replaces any
             # other same-symbol protection row.
             continue
-        replacement_key = (item.symbol, item.intent, family_key)
+        replacement_key = (
+            item.symbol,
+            item.intent,
+            family_key,
+            route_key,
+        )
         current = selected_sell_replacements.get(replacement_key)
         if current is None or _sell_item_is_preferred_authority(item, current):
             selected_sell_replacements[replacement_key] = item
@@ -7711,6 +7997,11 @@ def _append_held_active_sell_monitor_reconciliations(
                 ExecutionPlanItem.status,
                 ExecutionPlanItem.quantity_policy,
                 ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.decision_agent_name,
+                ExecutionPlanItem.decision_snapshot_id,
+                ExecutionPlanItem.decision_run_id,
+                ExecutionPlanItem.source_plan_item_id,
+                ExecutionPlanItem.source_market_date,
                 ExecutionPlanItem.provider,
                 ExecutionPlanItem.venue,
                 ExecutionPlanItem.asset_class,
@@ -7752,10 +8043,13 @@ def _append_held_active_sell_monitor_reconciliations(
     for item in active_items:
         if item.id in selected_item_ids:
             continue
-        family_key = plan_item_entry_family_key(item)
+        family_key = _plan_item_family_inventory_key(item)
+        route_key = _sell_monitor_route_key(item)
         replacement = (
-            selected_sell_replacements.get((item.symbol, item.intent, family_key))
-            if family_key is not None
+            selected_sell_replacements.get(
+                (item.symbol, item.intent, family_key, route_key)
+            )
+            if family_key is not None and route_key is not None
             else None
         )
         if replacement is not None and _sell_item_is_strictly_newer(
@@ -7780,7 +8074,10 @@ def _append_held_active_sell_monitor_reconciliations(
         append_items.append(item)
 
     reconciled_items = [*selected_items, *append_items]
-    active_sell_items_by_route: dict[tuple[str, str], list[ExecutionPlanItem]] = {}
+    active_sell_items_by_route: dict[
+        tuple[str, str, tuple[str, str, str, str] | None],
+        list[ExecutionPlanItem],
+    ] = {}
     for item in reconciled_items:
         if (
             item.side == "sell"
@@ -7788,14 +8085,14 @@ def _append_held_active_sell_monitor_reconciliations(
             and item.status in ACTIVE_SELL_MONITORING_STATUSES
         ):
             active_sell_items_by_route.setdefault(
-                (item.symbol, item.intent), []
+                (item.symbol, item.intent, _sell_monitor_route_key(item)), []
             ).append(item)
     recorded_at = datetime.now(UTC)
     for route_items in active_sell_items_by_route.values():
         unresolved = [
             item
             for item in route_items
-            if plan_item_entry_family_key(item) is None
+            if _plan_item_family_inventory_key(item) is None
         ]
         if not unresolved or len(route_items) == 1:
             continue
@@ -7862,14 +8159,19 @@ def _append_held_stop_sell_fallbacks(
         return selected_items
 
     selected_stops_by_symbol: dict[str, list[ExecutionPlanItem]] = {}
-    selected_families_by_symbol: dict[str, set[str]] = {}
+    selected_family_scopes_by_symbol: dict[
+        str, set[tuple[str, tuple[str, str, str, str]]]
+    ] = {}
     for item in selected_items:
         if item.side != "sell" or item.intent != "stop_sell":
             continue
         selected_stops_by_symbol.setdefault(item.symbol, []).append(item)
-        family_key = plan_item_entry_family_key(item)
-        if family_key is not None:
-            selected_families_by_symbol.setdefault(item.symbol, set()).add(family_key)
+        family_key = _plan_item_family_inventory_key(item)
+        route_key = _sell_monitor_route_key(item)
+        if family_key is not None and route_key is not None:
+            selected_family_scopes_by_symbol.setdefault(item.symbol, set()).add(
+                (family_key, route_key)
+            )
 
     selected_item_ids = {item.id for item in selected_items}
     candidates = db.scalars(
@@ -7907,6 +8209,11 @@ def _append_held_stop_sell_fallbacks(
                 ExecutionPlanItem.status,
                 ExecutionPlanItem.quantity_policy,
                 ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.decision_agent_name,
+                ExecutionPlanItem.decision_snapshot_id,
+                ExecutionPlanItem.decision_run_id,
+                ExecutionPlanItem.source_plan_item_id,
+                ExecutionPlanItem.source_market_date,
                 ExecutionPlanItem.provider,
                 ExecutionPlanItem.venue,
                 ExecutionPlanItem.asset_class,
@@ -7943,7 +8250,10 @@ def _append_held_stop_sell_fallbacks(
         positions_by_symbol=positions_by_symbol,
         recorded_at=datetime.now(UTC),
     )
-    fallback_by_family: dict[tuple[str, str], ExecutionPlanItem] = {}
+    fallback_by_family: dict[
+        tuple[str, str, tuple[str, str, str, str]],
+        ExecutionPlanItem,
+    ] = {}
     ambiguous_candidates_by_symbol: dict[str, list[ExecutionPlanItem]] = {}
     for item in candidates:
         if item.id in selected_item_ids:
@@ -7957,13 +8267,16 @@ def _append_held_stop_sell_fallbacks(
             )
         ):
             continue
-        family_key = plan_item_entry_family_key(item)
-        if family_key is None:
+        family_key = _plan_item_family_inventory_key(item)
+        route_key = _sell_monitor_route_key(item)
+        if family_key is None or route_key is None:
             ambiguous_candidates_by_symbol.setdefault(item.symbol, []).append(item)
             continue
-        if family_key in selected_families_by_symbol.get(item.symbol, set()):
+        if (family_key, route_key) in selected_family_scopes_by_symbol.get(
+            item.symbol, set()
+        ):
             continue
-        fallback_key = (item.symbol, family_key)
+        fallback_key = (item.symbol, family_key, route_key)
         current_fallback = fallback_by_family.get(fallback_key)
         if current_fallback is None or _sell_item_is_preferred_authority(
             item,
@@ -7977,7 +8290,11 @@ def _append_held_stop_sell_fallbacks(
         selected_stops = selected_stops_by_symbol.get(symbol, [])
         explicit_fallbacks = [
             item
-            for (candidate_symbol, _family_key), item in fallback_by_family.items()
+            for (
+                candidate_symbol,
+                _family_key,
+                _route_key,
+            ), item in fallback_by_family.items()
             if candidate_symbol == symbol
         ]
         if not selected_stops and not explicit_fallbacks and len(ambiguous_candidates) == 1:
@@ -8086,6 +8403,66 @@ def _reactivate_retryable_protective_stops(
         )
         rearmed_item_ids.add(item.id)
     return rearmed_item_ids
+
+
+def _coverage_family_inventories(
+    *,
+    settings: Settings,
+    db: Session,
+    positions: dict[str, ExecutionPosition],
+    through: datetime,
+) -> tuple[
+    dict[
+        str,
+        dict[
+            tuple[str, tuple[str, str, str, str]],
+            PostEntryFamilyInventory,
+        ],
+    ],
+    set[str],
+]:
+    inventories_by_symbol: dict[
+        str,
+        dict[
+            tuple[str, tuple[str, str, str, str]],
+            PostEntryFamilyInventory,
+        ],
+    ] = {}
+    indeterminate_symbols: set[str] = set()
+    for symbol, position in positions.items():
+        inventories, lineage_found = _post_entry_family_inventories(
+            settings=settings,
+            db=db,
+            symbol=symbol,
+            position_quantity=position.quantity,
+            through=through,
+        )
+        if inventories:
+            inventories_by_symbol[symbol] = {
+                (inventory.family_key, inventory.route_key): inventory
+                for inventory in inventories
+            }
+        elif lineage_found:
+            indeterminate_symbols.add(symbol)
+    return inventories_by_symbol, indeterminate_symbols
+
+
+def _items_for_family_coverage(
+    *,
+    items: list[ExecutionPlanItem],
+    family_inventory_key: str | None,
+    route_key: tuple[str, str, str, str] | None,
+) -> list[ExecutionPlanItem]:
+    if family_inventory_key is None and route_key is None:
+        return items
+    if family_inventory_key is None or route_key is None:
+        return []
+    return [
+        item
+        for item in items
+        if _plan_item_family_inventory_key(item) == family_inventory_key
+        and _sell_monitor_route_key(item) == route_key
+    ]
 
 
 def _repair_unprotected_stop_coverage(
@@ -8203,24 +8580,54 @@ def _repair_unprotected_stop_coverage(
                 )
         items_by_symbol.setdefault(item.symbol, []).append(item)
 
+    family_inventories_by_symbol, indeterminate_family_symbols = (
+        _coverage_family_inventories(
+            settings=settings,
+            db=db,
+            positions=positions,
+            through=triggered_at,
+        )
+    )
+
     repaired_count = 0
     issues = _protective_stop_coverage_issues(
         positions=positions,
         items_by_symbol=items_by_symbol,
-        repaired_symbols=set(),
+        family_inventories_by_symbol=family_inventories_by_symbol,
+        indeterminate_family_symbols=indeterminate_family_symbols,
+        repaired_family_scopes=set(),
     )
     for issue in issues:
         if issue.outcome != "unprotected_position":
             continue
-        latest_item = _latest_rearmable_stop_item(items_by_symbol.get(issue.symbol, []))
+        family_items = _items_for_family_coverage(
+            items=items_by_symbol.get(issue.symbol, []),
+            family_inventory_key=issue.family_inventory_key,
+            route_key=issue.route_key,
+        )
+        latest_item = _latest_rearmable_stop_item(family_items)
         if latest_item is None or latest_item.trigger_price is None:
             continue
         prior_status = latest_item.status
         prior_quantity_policy = latest_item.quantity_policy
-        held_quantity = positions[issue.symbol].quantity
+        held_quantity = issue.held_quantity
+        if held_quantity is None or issue.missing_quantity is None:
+            continue
         rearm_quantity = issue.missing_quantity
         repair_trigger_price = latest_item.trigger_price
-        average_price = positions[issue.symbol].average_price
+        family_inventory = family_inventories_by_symbol.get(
+            issue.symbol, {}
+        ).get(
+            (issue.family_inventory_key, issue.route_key)
+            if issue.family_inventory_key is not None
+            and issue.route_key is not None
+            else ("", ("", "", "", ""))
+        )
+        average_price = (
+            family_inventory.average_entry_price
+            if family_inventory is not None
+            else positions[issue.symbol].average_price
+        )
         if (
             repair_trigger_price is not None
             and average_price is not None
@@ -8303,10 +8710,19 @@ def _repair_unprotected_stop_coverage(
         issues = _protective_stop_coverage_issues(
             positions=positions,
             items_by_symbol=items_by_symbol,
-            repaired_symbols={
-                issue.symbol
+            family_inventories_by_symbol=family_inventories_by_symbol,
+            indeterminate_family_symbols=indeterminate_family_symbols,
+            repaired_family_scopes={
+                (issue.symbol, issue.family_inventory_key, issue.route_key)
                 for issue in issues
-                if _latest_rearmable_stop_item(items_by_symbol.get(issue.symbol, [])) is not None
+                if _latest_rearmable_stop_item(
+                    _items_for_family_coverage(
+                        items=items_by_symbol.get(issue.symbol, []),
+                        family_inventory_key=issue.family_inventory_key,
+                        route_key=issue.route_key,
+                    )
+                )
+                is not None
             },
         )
     issues.extend(
@@ -8325,40 +8741,132 @@ def _protective_stop_coverage_issues(
     *,
     positions: dict[str, ExecutionPosition],
     items_by_symbol: dict[str, list[ExecutionPlanItem]],
-    repaired_symbols: set[str],
+    family_inventories_by_symbol: dict[
+        str,
+        dict[
+            tuple[str, tuple[str, str, str, str]],
+            PostEntryFamilyInventory,
+        ],
+    ],
+    indeterminate_family_symbols: set[str],
+    repaired_family_scopes: set[
+        tuple[
+            str,
+            str | None,
+            tuple[str, str, str, str] | None,
+        ]
+    ],
 ) -> list[ProtectiveStopCoverageIssue]:
     issues: list[ProtectiveStopCoverageIssue] = []
     for symbol in sorted(positions):
-        held_quantity = positions[symbol].quantity
         items = items_by_symbol.get(symbol, [])
-        coverage_items = _current_stop_generation_items(items)
-        active_quantity = sum(
-            quantity
-            for item in coverage_items
-            if item.status in PROTECTIVE_STOP_COVERAGE_STATUSES
-            for quantity in [_shares_quantity(item.quantity_policy)]
-            if quantity is not None
-        )
-        if active_quantity >= held_quantity:
-            continue
-        latest_item = _latest_stop_item(items)
-        missing_quantity = held_quantity - active_quantity
-        issues.append(
-            ProtectiveStopCoverageIssue(
-                symbol=symbol,
-                held_quantity=held_quantity,
-                active_stop_quantity=active_quantity,
-                missing_quantity=missing_quantity,
-                latest_stop_item_id=latest_item.id if latest_item is not None else None,
-                latest_stop_status=latest_item.status if latest_item is not None else None,
-                latest_stop_trigger_price=latest_item.trigger_price if latest_item is not None else None,
-                outcome=(
-                    "rearmed"
-                    if symbol in repaired_symbols and latest_item is not None and latest_item.trigger_price is not None
-                    else "unprotected_position"
-                ),
+        held_quantity = positions[symbol].quantity
+        if symbol in indeterminate_family_symbols:
+            latest_item = _latest_stop_item(items)
+            issues.append(
+                ProtectiveStopCoverageIssue(
+                    symbol=symbol,
+                    held_quantity=held_quantity,
+                    active_stop_quantity=0,
+                    missing_quantity=held_quantity,
+                    latest_stop_item_id=(
+                        latest_item.id if latest_item is not None else None
+                    ),
+                    latest_stop_status=(
+                        latest_item.status if latest_item is not None else None
+                    ),
+                    latest_stop_trigger_price=(
+                        latest_item.trigger_price
+                        if latest_item is not None
+                        else None
+                    ),
+                    outcome="strategy_family_lineage_indeterminate",
+                    reason="position_inventory_family_lineage_does_not_reconcile",
+                )
             )
-        )
+            continue
+        family_inventories = family_inventories_by_symbol.get(symbol)
+        coverage_scopes: list[
+            tuple[
+                str | None,
+                int,
+                str | None,
+                str | None,
+                tuple[str, str, str, str] | None,
+            ]
+        ]
+        if family_inventories:
+            coverage_scopes = [
+                (
+                    inventory.family_key,
+                    inventory.remaining_quantity,
+                    inventory.entry_family_key,
+                    inventory.decision_lane,
+                    inventory.route_key,
+                )
+                for inventory in family_inventories.values()
+            ]
+        else:
+            coverage_scopes = [(None, held_quantity, None, None, None)]
+        for (
+            family_inventory_key,
+            family_held_quantity,
+            entry_family_key,
+            decision_lane,
+            route_key,
+        ) in sorted(coverage_scopes, key=lambda scope: scope[0] or ""):
+            family_items = _items_for_family_coverage(
+                items=items,
+                family_inventory_key=family_inventory_key,
+                route_key=route_key,
+            )
+            coverage_items = _current_stop_generation_items(family_items)
+            active_quantity = sum(
+                quantity
+                for item in coverage_items
+                if item.status in PROTECTIVE_STOP_COVERAGE_STATUSES
+                for quantity in [_shares_quantity(item.quantity_policy)]
+                if quantity is not None
+            )
+            if active_quantity >= family_held_quantity:
+                continue
+            latest_item = _latest_stop_item(family_items)
+            missing_quantity = family_held_quantity - active_quantity
+            issues.append(
+                ProtectiveStopCoverageIssue(
+                    symbol=symbol,
+                    held_quantity=family_held_quantity,
+                    active_stop_quantity=active_quantity,
+                    missing_quantity=missing_quantity,
+                    latest_stop_item_id=(
+                        latest_item.id if latest_item is not None else None
+                    ),
+                    latest_stop_status=(
+                        latest_item.status if latest_item is not None else None
+                    ),
+                    latest_stop_trigger_price=(
+                        latest_item.trigger_price
+                        if latest_item is not None
+                        else None
+                    ),
+                    outcome=(
+                        "rearmed"
+                        if (
+                            symbol,
+                            family_inventory_key,
+                            route_key,
+                        )
+                        in repaired_family_scopes
+                        and latest_item is not None
+                        and latest_item.trigger_price is not None
+                        else "unprotected_position"
+                    ),
+                    entry_family_key=entry_family_key,
+                    decision_lane=decision_lane,
+                    family_inventory_key=family_inventory_key,
+                    route_key=route_key,
+                )
+            )
     return issues
 
 
@@ -8460,7 +8968,7 @@ def _position_truth_evidence_by_symbol(
         if exchange is None:
             continue
         symbol = str(order.symbol)
-        route = (symbol, exchange)
+        route = (symbol, _kis_position_identity_exchange(exchange))
         if order.status in {"submitted", "open", "partially_filled"}:
             order_evidence_by_route.setdefault(route, set()).add(
                 f"broker_order:{order.side}:{order.status}"
@@ -8547,9 +9055,10 @@ def _position_truth_evidence_by_symbol(
         exchange = _plan_item_exchange(item)
         if exchange not in MONITORED_KIS_POSITION_EXCHANGES:
             continue
-        sell_evidence_by_route.setdefault((str(item.symbol), exchange), set()).add(
-            f"sell_monitor:{item.status}"
-        )
+        inventory_exchange = _kis_position_identity_exchange(exchange)
+        sell_evidence_by_route.setdefault(
+            (str(item.symbol), inventory_exchange), set()
+        ).add(f"sell_monitor:{item.status}")
     sell_routes_by_symbol: dict[str, set[str]] = {}
     for symbol, exchange in sell_evidence_by_route:
         sell_routes_by_symbol.setdefault(symbol, set()).add(exchange)
@@ -8677,12 +9186,22 @@ def _unexited_buy_routes_from_fills(
         # Incomplete canonical history must never be interpreted as proof that
         # a route is flat. Preserve protection for every affected fill route.
         for fill in fills:
-            route_scope = fifo_route_scope_from_order(fill.broker_order)
+            exact_route_scope = fifo_route_scope_from_order(fill.broker_order)
+            route_scope = (
+                canonical_fifo_inventory_route_scope(exact_route_scope)
+                if exact_route_scope is not None
+                else None
+            )
             symbol = str(fill.symbol or "").strip().upper()
             if route_scope is not None and route_scope.provider == "kis" and symbol:
                 open_routes.add((symbol, route_scope.exchange))
     for order in uncertain_buy_orders:
-        route_scope = fifo_route_scope_from_order(order)
+        exact_route_scope = fifo_route_scope_from_order(order)
+        route_scope = (
+            canonical_fifo_inventory_route_scope(exact_route_scope)
+            if exact_route_scope is not None
+            else None
+        )
         symbol = str(order.symbol or "").strip().upper()
         if route_scope is not None and route_scope.provider == "kis" and symbol:
             open_routes.add((symbol, route_scope.exchange))
@@ -8800,7 +9319,13 @@ def _profit_target_coverage_issues(
                 ExecutionPlanItem.quantity_policy,
                 ExecutionPlanItem.trigger_price,
                 ExecutionPlanItem.risk_context,
+                ExecutionPlanItem.decision_agent_name,
+                ExecutionPlanItem.decision_snapshot_id,
+                ExecutionPlanItem.decision_run_id,
+                ExecutionPlanItem.source_plan_item_id,
+                ExecutionPlanItem.source_market_date,
                 ExecutionPlanItem.provider,
+                ExecutionPlanItem.venue,
                 ExecutionPlanItem.asset_class,
             )
         )
@@ -8833,48 +9358,143 @@ def _profit_target_coverage_issues(
     for item in target_items:
         items_by_symbol.setdefault(item.symbol, []).append(item)
 
+    family_inventories_by_symbol, indeterminate_family_symbols = (
+        _coverage_family_inventories(
+            settings=settings,
+            db=db,
+            positions=positions,
+            through=resolved_evaluated_at,
+        )
+    )
+
     issues: list[ProfitTargetCoverageIssue] = []
     for symbol in sorted(positions):
         held_quantity = positions[symbol].quantity
         items = items_by_symbol.get(symbol, [])
-        active_quantity = sum(
-            quantity
-            for item in items
-            if item.status in PROFIT_TARGET_COVERAGE_STATUSES
-            for quantity in [_coverage_quantity(item.quantity_policy, held_quantity=held_quantity)]
-            if quantity is not None
-        )
-        if active_quantity >= held_quantity:
-            continue
-        latest_item = _latest_target_item(items)
-        entry_order = _latest_filled_buy_order(
-            settings=settings,
-            db=db,
-            symbol=symbol,
-            position=positions[symbol],
-        )
-        entry_target_price = (
-            _watch_buy_target_price(entry_order.plan_item)
-            if entry_order is not None and entry_order.plan_item is not None
-            else None
-        )
-        if latest_item is None and entry_target_price is None:
-            continue
-        issues.append(
-            ProfitTargetCoverageIssue(
-                symbol=symbol,
-                held_quantity=held_quantity,
-                active_target_quantity=active_quantity,
-                missing_quantity=held_quantity - active_quantity,
-                latest_target_item_id=latest_item.id if latest_item is not None else None,
-                latest_target_status=latest_item.status if latest_item is not None else None,
-                latest_target_trigger_price=(
-                    latest_item.trigger_price if latest_item is not None else entry_target_price
-                ),
-                outcome="missing_profit_target_coverage",
-                reason="active_target_sell_coverage_below_held_quantity",
+        if symbol in indeterminate_family_symbols:
+            latest_item = _latest_target_item(items)
+            issues.append(
+                ProfitTargetCoverageIssue(
+                    symbol=symbol,
+                    held_quantity=held_quantity,
+                    active_target_quantity=0,
+                    missing_quantity=held_quantity,
+                    latest_target_item_id=(
+                        latest_item.id if latest_item is not None else None
+                    ),
+                    latest_target_status=(
+                        latest_item.status if latest_item is not None else None
+                    ),
+                    latest_target_trigger_price=(
+                        latest_item.trigger_price
+                        if latest_item is not None
+                        else None
+                    ),
+                    outcome="strategy_family_lineage_indeterminate",
+                    reason="position_inventory_family_lineage_does_not_reconcile",
+                )
             )
-        )
+            continue
+        family_inventories = family_inventories_by_symbol.get(symbol)
+        if family_inventories:
+            coverage_scopes: list[
+                tuple[
+                    str | None,
+                    int,
+                    str | None,
+                    str | None,
+                    tuple[str, str, str, str] | None,
+                    ExecutionPlanItem | None,
+                ]
+            ] = [
+                (
+                    inventory.family_key,
+                    inventory.remaining_quantity,
+                    inventory.entry_family_key,
+                    inventory.decision_lane,
+                    inventory.route_key,
+                    inventory.entry_item,
+                )
+                for inventory in family_inventories.values()
+            ]
+        else:
+            coverage_scopes = [(None, held_quantity, None, None, None, None)]
+        for (
+            family_inventory_key,
+            family_held_quantity,
+            entry_family_key,
+            decision_lane,
+            route_key,
+            entry_item,
+        ) in sorted(coverage_scopes, key=lambda scope: scope[0] or ""):
+            family_items = _items_for_family_coverage(
+                items=items,
+                family_inventory_key=family_inventory_key,
+                route_key=route_key,
+            )
+            active_quantity = sum(
+                quantity
+                for item in family_items
+                if item.status in PROFIT_TARGET_COVERAGE_STATUSES
+                for quantity in [
+                    _coverage_quantity(
+                        item.quantity_policy,
+                        held_quantity=family_held_quantity,
+                    )
+                ]
+                if quantity is not None
+            )
+            if active_quantity >= family_held_quantity:
+                continue
+            latest_item = _latest_target_item(family_items)
+            if entry_item is not None:
+                entry_target_price = _watch_buy_target_price(entry_item)
+            else:
+                entry_order = _latest_filled_buy_order(
+                    settings=settings,
+                    db=db,
+                    symbol=symbol,
+                    position=positions[symbol],
+                )
+                entry_target_price = (
+                    _watch_buy_target_price(entry_order.plan_item)
+                    if entry_order is not None
+                    and entry_order.plan_item is not None
+                    else None
+                )
+            if (
+                family_inventory_key is None
+                and latest_item is None
+                and entry_target_price is None
+            ):
+                continue
+            issues.append(
+                ProfitTargetCoverageIssue(
+                    symbol=symbol,
+                    held_quantity=family_held_quantity,
+                    active_target_quantity=active_quantity,
+                    missing_quantity=(
+                        family_held_quantity - active_quantity
+                    ),
+                    latest_target_item_id=(
+                        latest_item.id if latest_item is not None else None
+                    ),
+                    latest_target_status=(
+                        latest_item.status if latest_item is not None else None
+                    ),
+                    latest_target_trigger_price=(
+                        latest_item.trigger_price
+                        if latest_item is not None
+                        else entry_target_price
+                    ),
+                    outcome="missing_profit_target_coverage",
+                    reason="active_target_sell_coverage_below_held_quantity",
+                    entry_family_key=entry_family_key,
+                    decision_lane=decision_lane,
+                    family_inventory_key=family_inventory_key,
+                    route_key=route_key,
+                )
+            )
     return issues
 
 
@@ -8985,6 +9605,13 @@ def _protective_stop_coverage_payload(
         for warning in actionability_warnings
         if warning.symbol not in degraded_symbols
     ]
+    missing_quantities: dict[str, int] = {}
+    for issue in degraded:
+        if issue.missing_quantity is None:
+            continue
+        missing_quantities[issue.symbol] = (
+            missing_quantities.get(issue.symbol, 0) + issue.missing_quantity
+        )
     serialized_issues = [
         {
             "symbol": issue.symbol,
@@ -8999,6 +9626,8 @@ def _protective_stop_coverage_payload(
             "position_quantity": issue.position_quantity,
             "position_last_reconciled_at": _serialize_datetime(issue.position_last_reconciled_at),
             "evidence": issue.evidence or [],
+            "entry_family_key": issue.entry_family_key,
+            "decision_lane": issue.decision_lane,
         }
         for issue in issues
     ]
@@ -9011,11 +9640,7 @@ def _protective_stop_coverage_payload(
         "affected_symbols": affected_symbols[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
         "affected_symbols_count": len(affected_symbols),
         "affected_symbols_truncated": len(affected_symbols) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
-        "missing_quantities": {
-            issue.symbol: issue.missing_quantity
-            for issue in degraded
-            if issue.missing_quantity is not None
-        },
+        "missing_quantities": missing_quantities,
         "issues": serialized_issues[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
         "issues_count": len(serialized_issues),
         "issues_truncated": len(serialized_issues) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
@@ -9151,6 +9776,11 @@ def _profit_target_coverage_payload(
     issues: list[ProfitTargetCoverageIssue],
 ) -> dict[str, object]:
     affected_symbols = [issue.symbol for issue in issues]
+    missing_quantities: dict[str, int] = {}
+    for issue in issues:
+        missing_quantities[issue.symbol] = (
+            missing_quantities.get(issue.symbol, 0) + issue.missing_quantity
+        )
     serialized_issues = [
         {
             "symbol": issue.symbol,
@@ -9162,6 +9792,8 @@ def _profit_target_coverage_payload(
             "latest_target_trigger_price": _serialize_decimal(issue.latest_target_trigger_price),
             "outcome": issue.outcome,
             "reason": issue.reason,
+            "entry_family_key": issue.entry_family_key,
+            "decision_lane": issue.decision_lane,
         }
         for issue in issues
     ]
@@ -9171,10 +9803,7 @@ def _profit_target_coverage_payload(
         "affected_symbols": affected_symbols[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
         "affected_symbols_count": len(affected_symbols),
         "affected_symbols_truncated": len(affected_symbols) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
-        "missing_quantities": {
-            issue.symbol: issue.missing_quantity
-            for issue in issues
-        },
+        "missing_quantities": missing_quantities,
         "issues": serialized_issues[:MAX_PROTECTIVE_STOP_COVERAGE_DETAILS],
         "issues_count": len(serialized_issues),
         "issues_truncated": len(serialized_issues) > MAX_PROTECTIVE_STOP_COVERAGE_DETAILS,
@@ -9202,6 +9831,40 @@ def _watch_buy_retry_blocked_until(
         return None
     return recorded_at + timedelta(
         seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+    )
+
+
+def _sell_dispatch_retry_blocked_until(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+) -> datetime | None:
+    if item.status not in SELL_TRIGGERED_BLOCKED_STATUSES:
+        return None
+    event = _latest_monitoring_event(item)
+    if event is None or event.get("event") != "sell_monitor_dispatch_deferred":
+        return None
+    retry_after_at = _parse_event_datetime(event.get("retry_after_at"))
+    if retry_after_at is not None:
+        return retry_after_at
+    recorded_at = _parse_event_datetime(event.get("recorded_at"))
+    if recorded_at is None:
+        return None
+    return recorded_at + timedelta(
+        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+    )
+
+
+def _sell_placement_block_is_retryable(payload: dict[str, object]) -> bool:
+    if (
+        payload.get("manual_review_required") is True
+        or payload.get("permanent_rejection") is True
+    ):
+        return False
+    order = payload.get("order")
+    return bool(
+        isinstance(order, dict)
+        and order.get("last_error_retryable") is True
     )
 
 
@@ -9313,15 +9976,42 @@ def _is_same_cycle_cloned_stop_repair(
     item: ExecutionPlanItem,
     triggered_at: datetime,
 ) -> bool:
-    event = _latest_monitoring_event(item)
-    if event is None:
-        return False
-    if event.get("event") != "unprotected_position_stop_rearmed":
-        return False
-    if event.get("cloned_repair_item") is not True:
-        return False
-    recorded_at = _parse_event_datetime(event.get("recorded_at"))
-    return recorded_at == triggered_at
+    return (
+        _same_cycle_cloned_stop_repair_event(
+            item=item,
+            triggered_at=triggered_at,
+        )
+        is not None
+    )
+
+
+def _same_cycle_cloned_stop_repair_event(
+    *,
+    item: ExecutionPlanItem,
+    triggered_at: datetime,
+) -> dict[str, object] | None:
+    """Find the repair marker even when a later same-cycle audit replaced it."""
+
+    risk_context = _loaded_risk_context(item)
+    if not isinstance(risk_context, dict):
+        return None
+    candidates: list[dict[str, object]] = []
+    latest = risk_context.get("last_monitoring_event")
+    if isinstance(latest, dict):
+        candidates.append(latest)
+    events = risk_context.get("monitoring_events")
+    if isinstance(events, list):
+        candidates.extend(
+            event for event in reversed(events) if isinstance(event, dict)
+        )
+    for event in candidates:
+        if (
+            event.get("event") == "unprotected_position_stop_rearmed"
+            and event.get("cloned_repair_item") is True
+            and _parse_event_datetime(event.get("recorded_at")) == triggered_at
+        ):
+            return event
+    return None
 
 
 def _prefer_same_cycle_cloned_stop_repairs(
@@ -9329,19 +10019,33 @@ def _prefer_same_cycle_cloned_stop_repairs(
     items: list[ExecutionPlanItem],
     triggered_at: datetime,
 ) -> list[ExecutionPlanItem]:
-    repairs_by_symbol = {
-        item.symbol: item
+    repairs_by_family_scope = {
+        (item.symbol, family_route_key): item
         for item in items
-        if _is_same_cycle_cloned_stop_repair(item=item, triggered_at=triggered_at)
+        for family_route_key in [_plan_item_family_route_inventory_key(item)]
+        if family_route_key is not None
+        and _is_same_cycle_cloned_stop_repair(
+            item=item,
+            triggered_at=triggered_at,
+        )
     }
-    if not repairs_by_symbol:
+    if not repairs_by_family_scope:
         return items
 
     def keep_existing_stop(item: ExecutionPlanItem) -> bool:
-        repair_item = repairs_by_symbol.get(item.symbol)
+        family_route_key = _plan_item_family_route_inventory_key(item)
+        if family_route_key is None:
+            return True
+        repair_item = repairs_by_family_scope.get((item.symbol, family_route_key))
         if repair_item is None or item.intent != "stop_sell":
             return True
-        repair_event = _latest_monitoring_event(repair_item) or {}
+        repair_event = (
+            _same_cycle_cloned_stop_repair_event(
+                item=repair_item,
+                triggered_at=triggered_at,
+            )
+            or {}
+        )
         active_stop_quantity = int(repair_event.get("active_stop_quantity") or 0)
         if _protective_stop_reserves_quantity(item):
             return True
@@ -9607,21 +10311,37 @@ def _position_exit_quantity_policy_filter():
 
 
 def _has_unexited_buy_order_filter(*, settings: Settings):
-    scope_exchange = BrokerOrder.request_metadata["execution_scope"][
-        "exchange"
-    ].as_string()
+    order_scope = BrokerOrder.request_metadata["execution_scope"]
+    scope_exchange = order_scope["exchange"].as_string()
+    scope_asset_class = func.lower(order_scope["asset_class"].as_string())
     item_exchange = func.upper(
         func.coalesce(
             ExecutionPlanItem.risk_context["exchange"].as_string(),
             "KRX",
         )
     )
+    item_asset_class = func.lower(
+        func.coalesce(
+            ExecutionPlanItem.risk_context["asset_class"].as_string(),
+            "stock",
+        )
+    )
+    domestic_inventory_exchange_matches = and_(
+        scope_exchange.in_(tuple(sorted(KRX_EXCHANGES))),
+        item_exchange.in_(tuple(sorted(KRX_EXCHANGES))),
+        scope_asset_class.in_(tuple(sorted(KRX_ASSET_CLASS_ALIASES))),
+        item_asset_class.in_(tuple(sorted(KRX_ASSET_CLASS_ALIASES))),
+    )
+    inventory_exchange_matches = or_(
+        scope_exchange == item_exchange,
+        domestic_inventory_exchange_matches,
+    )
     latest_buy_order_at = (
         select(func.max(BrokerOrder.created_at))
         .where(
             *_active_kis_order_filters(settings=settings),
             BrokerOrder.symbol == ExecutionPlanItem.symbol,
-            scope_exchange == item_exchange,
+            inventory_exchange_matches,
             BrokerOrder.side == "buy",
             BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
         )
@@ -9633,7 +10353,7 @@ def _has_unexited_buy_order_filter(*, settings: Settings):
         .where(
             *_active_kis_order_filters(settings=settings),
             BrokerOrder.symbol == ExecutionPlanItem.symbol,
-            scope_exchange == item_exchange,
+            inventory_exchange_matches,
             BrokerOrder.side == "sell",
             BrokerOrder.status.in_(("submitted", "open", "partially_filled", "filled")),
         )
@@ -9750,6 +10470,303 @@ def _load_positions_by_symbol(
     }
 
 
+def _family_generation_has_opposing_fill_ambiguity(
+    fills: list[ExecutionFill],
+) -> bool:
+    fills_by_timestamp: dict[datetime, list[ExecutionFill]] = {}
+    for fill in fills:
+        fills_by_timestamp.setdefault(
+            _normalize_utc(fill.filled_at),
+            [],
+        ).append(fill)
+    for bucket in fills_by_timestamp.values():
+        sides = {
+            str(fill.side or "").strip().lower()
+            for fill in bucket
+        }
+        if len(sides) <= 1:
+            # Family totals and weighted entry prices are commutative for
+            # concurrent same-side fills, so no FIFO ordering is needed.
+            continue
+        sequences: list[int] = []
+        for fill in bucket:
+            payload = fill.payload if isinstance(fill.payload, dict) else {}
+            raw_sequence = payload.get("broker_fill_sequence")
+            if raw_sequence is None:
+                raw_sequence = payload.get("fill_sequence")
+            if isinstance(raw_sequence, bool):
+                return True
+            try:
+                sequence = int(str(raw_sequence).strip())
+            except (TypeError, ValueError):
+                return True
+            if sequence < 0 or str(sequence) != str(raw_sequence).strip():
+                return True
+            sequences.append(sequence)
+        if len(set(sequences)) != len(sequences):
+            return True
+    return False
+
+
+def _plan_item_family_inventory_key(item: ExecutionPlanItem) -> str | None:
+    family_key = plan_item_entry_family_key(item)
+    if family_key is None:
+        return None
+    decision_lane = _normalized_decision_lane(
+        plan_item_decision_agent_name(item)
+    )
+    if decision_lane is None:
+        return None
+    return f"{len(family_key)}:{family_key}:agent:{decision_lane}"
+
+
+def _plan_item_family_route_inventory_key(
+    item: ExecutionPlanItem,
+) -> tuple[str, tuple[str, str, str, str]] | None:
+    family_key = _plan_item_family_inventory_key(item)
+    route_key = _sell_monitor_route_key(item)
+    if family_key is None or route_key is None:
+        return None
+    return family_key, route_key
+
+
+def _post_entry_family_inventories(
+    *,
+    settings: Settings,
+    db: Session,
+    symbol: str,
+    position_quantity: int,
+    through: datetime,
+) -> tuple[list[PostEntryFamilyInventory], bool]:
+    """Return fill-proven inventory owned by each exact entry family.
+
+    The boolean reports whether family-linked buy fills existed.  Callers use
+    it to avoid falling back to a symbol-wide position when lineage exists but
+    is incomplete or inconsistent with broker position truth.
+    """
+
+    raw_fills = db.scalars(
+        select(ExecutionFill)
+        .join(BrokerOrder, BrokerOrder.id == ExecutionFill.broker_order_pk)
+        .where(
+            *_active_kis_order_filters(settings=settings),
+            ExecutionFill.symbol == symbol,
+            ExecutionFill.filled_at <= _normalize_utc(through),
+        )
+        .options(
+            selectinload(ExecutionFill.broker_order)
+            .selectinload(BrokerOrder.plan_item)
+            .selectinload(ExecutionPlanItem.plan)
+        )
+        .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+    ).all()
+    isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=settings.runtime_mode,
+        through=_normalize_utc(through),
+    )
+    normalized_through = _normalize_utc(through)
+
+    def is_current_generation_fill(fill: ExecutionFill) -> bool:
+        exact_route_scope = fifo_route_scope_from_order(fill.broker_order)
+        route_scope = (
+            canonical_fifo_inventory_route_scope(exact_route_scope)
+            if exact_route_scope is not None
+            else None
+        )
+        boundary = (
+            isolation_cursor.latest_boundary_through(
+                route_scope=route_scope,
+                symbol=symbol,
+                observed_at=normalized_through,
+            )
+            if route_scope is not None
+            else None
+        )
+        return boundary is None or _normalize_utc(fill.filled_at) > boundary
+
+    if execution_fills_have_relevant_conflicting_identity(
+        list(raw_fills),
+        is_relevant=is_current_generation_fill,
+    ):
+        return [], True
+    fills = dedupe_execution_fills(raw_fills)
+    fills_by_route: dict[FifoRouteScope, list[ExecutionFill]] = {}
+    for fill in fills:
+        exact_route_scope = fifo_route_scope_from_order(fill.broker_order)
+        route_scope = (
+            canonical_fifo_inventory_route_scope(exact_route_scope)
+            if exact_route_scope is not None
+            else None
+        )
+        if route_scope is not None:
+            fills_by_route.setdefault(route_scope, []).append(fill)
+    current_fills_by_route: dict[FifoRouteScope, list[ExecutionFill]] = {}
+    open_quantities_by_route: dict[FifoRouteScope, Decimal] = {}
+    for route_scope, route_fills in fills_by_route.items():
+        boundary = isolation_cursor.latest_boundary_through(
+            route_scope=route_scope,
+            symbol=symbol,
+            observed_at=normalized_through,
+        )
+        current_fills = [
+            fill
+            for fill in route_fills
+            if boundary is None or _normalize_utc(fill.filled_at) > boundary
+        ]
+        if not current_fills:
+            continue
+        current_fills_by_route[route_scope] = current_fills
+        net_quantity = Decimal("0")
+        for fill in current_fills:
+            quantity = effective_fill_quantity(fill)
+            side = str(fill.side or "").strip().lower()
+            if not quantity.is_finite() or quantity <= 0 or side not in {"buy", "sell"}:
+                net_quantity = Decimal("NaN")
+                break
+            net_quantity += quantity if side == "buy" else -quantity
+        if net_quantity.is_finite() and net_quantity > 0:
+            open_quantities_by_route[route_scope] = net_quantity
+
+    active_routes = [
+        route_scope
+        for route_scope, quantity in open_quantities_by_route.items()
+        if quantity == Decimal(position_quantity)
+    ]
+    active_route_scope = active_routes[0] if len(active_routes) == 1 else None
+    current_generation_fills = (
+        current_fills_by_route.get(active_route_scope, [])
+        if active_route_scope is not None
+        else []
+    )
+    scope_quality_available = False
+    if active_route_scope is not None:
+        scope_quality_available = isolation_cursor.apply_through(
+            route_scope=active_route_scope,
+            symbol=symbol,
+            observed_at=normalized_through,
+            lots=[],
+        )
+    current_generation_is_authoritative = (
+        len(active_routes) == 1
+        and len(open_quantities_by_route) == 1
+        and bool(current_generation_fills)
+        and scope_quality_available
+        and all(
+            isinstance(fill.payload, dict)
+            and fill.payload.get("fill_time_precision") == "exact"
+            for fill in current_generation_fills
+        )
+        and not _family_generation_has_opposing_fill_ambiguity(
+            current_generation_fills
+        )
+    )
+
+    buys: dict[str, dict[str, object]] = {}
+    exits: dict[str, Decimal] = {}
+    family_linked_buy_fill_found = False
+    current_generation_lineage_indeterminate = False
+    for fill in current_generation_fills:
+        order = fill.broker_order
+        item = order.plan_item if order is not None else None
+        if (
+            item is None
+            or item.plan is None
+            or item.plan.mode != settings.runtime_mode
+            or str(order.symbol or "").strip().upper() != symbol
+        ):
+            current_generation_lineage_indeterminate = True
+            continue
+        entry_family_key = plan_item_entry_family_key(item)
+        decision_lane = _normalized_decision_lane(
+            plan_item_decision_agent_name(item)
+        )
+        family_key = _plan_item_family_inventory_key(item)
+        route_key = _sell_monitor_route_key(item)
+        if (
+            family_key is None
+            or entry_family_key is None
+            or decision_lane is None
+            or route_key is None
+        ):
+            current_generation_lineage_indeterminate = True
+            continue
+        side = str(fill.side or "").strip().lower()
+        quantity = effective_fill_quantity(fill)
+        if not quantity.is_finite() or quantity <= 0:
+            continue
+        if side == "buy" and item.side == "buy":
+            family_linked_buy_fill_found = True
+            state = buys.setdefault(
+                family_key,
+                {
+                    "quantity": Decimal("0"),
+                    "notional": Decimal("0"),
+                    "entry_order": order,
+                    "entry_item": item,
+                    "first_buy_fill": fill,
+                    "entry_family_key": entry_family_key,
+                    "decision_lane": decision_lane,
+                    "route_key": route_key,
+                },
+            )
+            state["quantity"] = Decimal(state["quantity"]) + quantity
+            state["notional"] = Decimal(state["notional"]) + (
+                quantity * Decimal(fill.price)
+            )
+            continue
+        if side == "sell" and item.side == "sell":
+            exits[family_key] = exits.get(family_key, Decimal("0")) + quantity
+
+    if not current_generation_is_authoritative or current_generation_lineage_indeterminate:
+        return [], family_linked_buy_fill_found or bool(current_generation_fills) or bool(fills)
+    if any(family_key not in buys for family_key in exits):
+        return [], family_linked_buy_fill_found
+
+    inventories: list[PostEntryFamilyInventory] = []
+    for family_key, state in buys.items():
+        filled = Decimal(state["quantity"])
+        exited = exits.get(family_key, Decimal("0"))
+        if exited > filled:
+            return [], family_linked_buy_fill_found
+        remaining = filled - exited
+        if remaining <= 0:
+            continue
+        integral_remaining = remaining.to_integral_value(rounding=ROUND_DOWN)
+        integral_filled = filled.to_integral_value(rounding=ROUND_DOWN)
+        integral_exited = exited.to_integral_value(rounding=ROUND_DOWN)
+        if (
+            integral_remaining != remaining
+            or integral_filled != filled
+            or integral_exited != exited
+        ):
+            return [], family_linked_buy_fill_found
+        inventories.append(
+            PostEntryFamilyInventory(
+                family_key=family_key,
+                entry_family_key=str(state["entry_family_key"]),
+                decision_lane=str(state["decision_lane"]),
+                route_key=state["route_key"],  # type: ignore[arg-type]
+                entry_order=state["entry_order"],  # type: ignore[arg-type]
+                entry_item=state["entry_item"],  # type: ignore[arg-type]
+                filled_quantity=int(integral_filled),
+                exited_quantity=int(integral_exited),
+                remaining_quantity=int(integral_remaining),
+                average_entry_price=(
+                    Decimal(state["notional"]) / filled
+                ).quantize(Decimal("0.0001"), rounding=ROUND_DOWN),
+                first_buy_fill=state["first_buy_fill"],  # type: ignore[arg-type]
+            )
+        )
+    if sum(inventory.remaining_quantity for inventory in inventories) != position_quantity:
+        # Missing or unlinked lineage means ownership cannot be allocated
+        # without guessing. Never let one family absorb any broker residual.
+        return [], family_linked_buy_fill_found
+    return sorted(inventories, key=lambda inventory: inventory.family_key), (
+        family_linked_buy_fill_found
+    )
+
+
 def _maintain_post_entry_exit_monitors(
     *,
     settings: Settings,
@@ -9771,127 +10788,177 @@ def _maintain_post_entry_exit_monitors(
     for symbol, position in positions_by_symbol.items():
         if position.quantity <= 0:
             continue
-        entry_order = _latest_filled_buy_order(
+        family_inventories, family_lineage_found = _post_entry_family_inventories(
             settings=settings,
             db=db,
             symbol=symbol,
-            position=position,
+            position_quantity=position.quantity,
+            through=triggered_at,
         )
-        if entry_order is None or entry_order.plan_item is None:
-            existing_maintenance_count, requires_review = _ensure_existing_position_default_exit_monitors(
+        entry_slices: list[
+            tuple[BrokerOrder, ExecutionPlanItem, int, Decimal, ExecutionFill | None]
+        ] = [
+            (
+                inventory.entry_order,
+                inventory.entry_item,
+                inventory.remaining_quantity,
+                inventory.average_entry_price,
+                inventory.first_buy_fill,
+            )
+            for inventory in family_inventories
+        ]
+        if not entry_slices:
+            if family_lineage_found:
+                # Exact family ownership exists but does not reconcile to the
+                # broker aggregate. A symbol-wide repair would transfer one
+                # lane's shares to another lane, so fail closed.
+                continue
+            entry_order = _latest_filled_buy_order(
                 settings=settings,
                 db=db,
+                symbol=symbol,
                 position=position,
-                observed_price=prices.get(symbol),
-                triggered_at=triggered_at,
-                quote_unavailable_is_durable=(
-                    symbol in (durably_unquoteable_symbols or set())
-                ),
             )
-            maintenance_count += existing_maintenance_count
-            if requires_review:
-                review_count += 1
-            continue
-        entry_item = entry_order.plan_item
-        if entry_item.plan is None:
-            continue
-        entry_price = position.average_price or entry_order.limit_price
-        if entry_price is None or entry_price <= 0:
-            continue
+            if entry_order is None or entry_order.plan_item is None:
+                existing_maintenance_count, requires_review = _ensure_existing_position_default_exit_monitors(
+                    settings=settings,
+                    db=db,
+                    position=position,
+                    observed_price=prices.get(symbol),
+                    triggered_at=triggered_at,
+                    quote_unavailable_is_durable=(
+                        symbol in (durably_unquoteable_symbols or set())
+                    ),
+                )
+                maintenance_count += existing_maintenance_count
+                if requires_review:
+                    review_count += 1
+                continue
+            entry_price = position.average_price or entry_order.limit_price
+            if entry_price is None or entry_price <= 0:
+                continue
+            entry_slices = [
+                (
+                    entry_order,
+                    entry_order.plan_item,
+                    position.quantity,
+                    entry_price,
+                    _current_open_inventory_entry_fill(
+                        settings=settings,
+                        db=db,
+                        symbol=symbol,
+                        entry_order=entry_order,
+                        position_quantity=position.quantity,
+                        through=triggered_at,
+                    ),
+                )
+            ]
 
         observed_price = _observed_price_for_side(
             price=prices.get(symbol),
             side="sell",
             runtime_mode=settings.runtime_mode,
         )
-        inventory_entry_fill = _current_open_inventory_entry_fill(
-            settings=settings,
-            db=db,
-            symbol=symbol,
-            entry_order=entry_order,
-            position_quantity=position.quantity,
-            through=triggered_at,
-        )
-        entry_anchor = _entry_market_date(
-            entry_item=entry_item,
-            entry_order=entry_order,
-            inventory_entry_fill=inventory_entry_fill,
-            fallback_at=triggered_at,
-        )
-        holding_age = _holding_session_age_from_date(
-            entry_market_date=entry_anchor.market_date,
-            triggered_at=triggered_at,
-            exchange=_plan_item_exchange(entry_item),
-            krx_trading_day=resolved_krx_trading_day,
-            entry_market_date_status=entry_anchor.status,
-            max_sessions=max(
-                2,
-                settings.exec_agent_max_holding_trading_sessions,
-            ),
-        )
-        initial_stop = _post_entry_initial_stop_price(
-            settings=settings,
-            entry_item=entry_item,
-            entry_price=entry_price,
-        )
-        stop_item, stop_maintenance_count = _ensure_post_entry_stop_monitor(
-            db=db,
-            entry_item=entry_item,
-            quantity=position.quantity,
-            stop_price=initial_stop,
-            entry_price=entry_price,
-            entry_market_date=entry_anchor.market_date,
-            entry_market_date_source=entry_anchor.source,
-            entry_market_date_status=entry_anchor.status,
-            entry_market_date_precision=entry_anchor.precision,
-            triggered_at=triggered_at,
-        )
-        maintenance_count += stop_maintenance_count
-        _, target_maintenance_count = _ensure_post_entry_target_monitor(
-            settings=settings,
-            db=db,
-            entry_item=entry_item,
-            quantity=position.quantity,
-            entry_price=entry_price,
-            entry_market_date=entry_anchor.market_date,
-            entry_market_date_source=entry_anchor.source,
-            entry_market_date_status=entry_anchor.status,
-            entry_market_date_precision=entry_anchor.precision,
-            triggered_at=triggered_at,
-        )
-        maintenance_count += target_maintenance_count
-        _, max_holding_maintenance_count = _ensure_post_entry_max_holding_monitor(
-            db=db,
-            entry_item=entry_item,
-            quantity=position.quantity,
-            entry_market_date=entry_anchor.market_date,
-            entry_market_date_source=entry_anchor.source,
-            entry_market_date_status=entry_anchor.status,
-            entry_market_date_precision=entry_anchor.precision,
-            triggered_at=triggered_at,
-            max_holding_sessions=settings.exec_agent_max_holding_trading_sessions,
-            krx_trading_day=resolved_krx_trading_day,
-        )
-        maintenance_count += max_holding_maintenance_count
+        for (
+            entry_order,
+            entry_item,
+            family_quantity,
+            entry_price,
+            inventory_entry_fill,
+        ) in entry_slices:
+            if entry_item.plan is None or family_quantity <= 0 or entry_price <= 0:
+                continue
+            entry_anchor = _entry_market_date(
+                entry_item=entry_item,
+                entry_order=entry_order,
+                inventory_entry_fill=inventory_entry_fill,
+                fallback_at=triggered_at,
+            )
+            max_holding_sessions = _post_entry_max_holding_sessions(
+                settings=settings,
+                entry_item=entry_item,
+            )
+            holding_age = _holding_session_age_from_date(
+                entry_market_date=entry_anchor.market_date,
+                triggered_at=triggered_at,
+                exchange=_plan_item_exchange(entry_item),
+                krx_trading_day=resolved_krx_trading_day,
+                entry_market_date_status=entry_anchor.status,
+                max_sessions=max(2, max_holding_sessions or 2),
+            )
+            initial_stop = _post_entry_initial_stop_price(
+                settings=settings,
+                entry_item=entry_item,
+                entry_price=entry_price,
+            )
+            stop_item, stop_maintenance_count = _ensure_post_entry_stop_monitor(
+                db=db,
+                entry_item=entry_item,
+                quantity=family_quantity,
+                stop_price=initial_stop,
+                entry_price=entry_price,
+                entry_market_date=entry_anchor.market_date,
+                entry_market_date_source=entry_anchor.source,
+                entry_market_date_status=entry_anchor.status,
+                entry_market_date_precision=entry_anchor.precision,
+                triggered_at=triggered_at,
+            )
+            maintenance_count += stop_maintenance_count
+            _, target_maintenance_count = _ensure_post_entry_target_monitor(
+                settings=settings,
+                db=db,
+                entry_item=entry_item,
+                quantity=family_quantity,
+                entry_price=entry_price,
+                entry_market_date=entry_anchor.market_date,
+                entry_market_date_source=entry_anchor.source,
+                entry_market_date_status=entry_anchor.status,
+                entry_market_date_precision=entry_anchor.precision,
+                triggered_at=triggered_at,
+            )
+            maintenance_count += target_maintenance_count
+            if max_holding_sessions is not None:
+                _, max_holding_maintenance_count = _ensure_post_entry_max_holding_monitor(
+                    db=db,
+                    entry_item=entry_item,
+                    quantity=family_quantity,
+                    entry_market_date=entry_anchor.market_date,
+                    entry_market_date_source=entry_anchor.source,
+                    entry_market_date_status=entry_anchor.status,
+                    entry_market_date_precision=entry_anchor.precision,
+                    triggered_at=triggered_at,
+                    max_holding_sessions=max_holding_sessions,
+                    krx_trading_day=resolved_krx_trading_day,
+                )
+                maintenance_count += max_holding_maintenance_count
+            else:
+                maintenance_count += (
+                    _reconcile_disabled_post_entry_max_holding_monitors(
+                        db=db,
+                        entry_item=entry_item,
+                        triggered_at=triggered_at,
+                    )
+                )
 
-        review = _post_entry_review_state(
-            settings=settings,
-            entry_price=entry_price,
-            observed_price=observed_price,
-            holding_session=holding_age.sessions,
-            holding_session_status=holding_age.status,
-            holding_session_source=holding_age.source,
-            holding_session_count_capped_at=holding_age.capped_at,
-            stop_price=stop_item.trigger_price,
-            triggered_at=triggered_at,
-        )
-        maintenance_count += _apply_post_entry_review_state(
-            item=stop_item,
-            review=review,
-            triggered_at=triggered_at,
-        )
-        if review["requires_review"] is True:
-            review_count += 1
+            review = _post_entry_review_state(
+                settings=settings,
+                entry_price=entry_price,
+                observed_price=observed_price,
+                holding_session=holding_age.sessions,
+                holding_session_status=holding_age.status,
+                holding_session_source=holding_age.source,
+                holding_session_count_capped_at=holding_age.capped_at,
+                stop_price=stop_item.trigger_price,
+                triggered_at=triggered_at,
+                max_holding_sessions=max_holding_sessions,
+            )
+            maintenance_count += _apply_post_entry_review_state(
+                item=stop_item,
+                review=review,
+                triggered_at=triggered_at,
+            )
+            if review["requires_review"] is True:
+                review_count += 1
 
     return maintenance_count, review_count
 
@@ -10650,7 +11717,12 @@ def _current_open_inventory_entry_fill(
     holding-period anchor.
     """
 
-    route_scope = fifo_route_scope_from_order(entry_order)
+    exact_route_scope = fifo_route_scope_from_order(entry_order)
+    route_scope = (
+        canonical_fifo_inventory_route_scope(exact_route_scope)
+        if exact_route_scope is not None
+        else None
+    )
     normalized_symbol = str(symbol or "").strip().upper()
     if route_scope is None or not normalized_symbol:
         return None
@@ -10924,6 +11996,207 @@ def _post_entry_initial_stop_price(
     )
 
 
+def _post_entry_max_holding_sessions(
+    *,
+    settings: Settings,
+    entry_item: ExecutionPlanItem,
+) -> int | None:
+    risk_context = _loaded_risk_context(entry_item)
+    policy = risk_context.get("max_holding_close_policy")
+    decision_lane = _normalized_decision_lane(
+        plan_item_decision_agent_name(entry_item)
+    )
+    configured_default = settings.exec_agent_max_holding_trading_sessions
+    if decision_lane == SIGNAL_DECIDER_NAME:
+        lane_default: int | None = None
+    elif decision_lane == SHORT_TERM_DECIDER_NAME:
+        lane_default = max(
+            SHORT_TERM_MIN_HOLDING_SESSIONS,
+            min(configured_default, SHORT_TERM_MAX_HOLDING_SESSIONS),
+        )
+    else:
+        lane_default = configured_default
+    if policy is None:
+        return lane_default
+    if policy is False:
+        # The short-term lane contract is a hard maximum, not a caller-tunable
+        # preference. It may exit earlier, but it may never disable or extend
+        # the three-inclusive-session cap. Signal holdings remain unbounded
+        # when their policy explicitly disables a time exit.
+        return (
+            SHORT_TERM_MAX_HOLDING_SESSIONS
+            if decision_lane == SHORT_TERM_DECIDER_NAME
+            else None
+        )
+    if not isinstance(policy, dict):
+        return lane_default
+    if policy.get("enabled") is False:
+        return (
+            SHORT_TERM_MAX_HOLDING_SESSIONS
+            if decision_lane == SHORT_TERM_DECIDER_NAME
+            else None
+        )
+    for key in (
+        "trading_sessions",
+        "max_holding_trading_sessions",
+        "sessions",
+    ):
+        sessions = _parse_positive_int(policy.get(key))
+        if sessions is not None:
+            if decision_lane == SHORT_TERM_DECIDER_NAME:
+                return max(
+                    SHORT_TERM_MIN_HOLDING_SESSIONS,
+                    min(sessions, SHORT_TERM_MAX_HOLDING_SESSIONS),
+                )
+            return sessions
+    return lane_default
+
+
+def _reconcile_disabled_post_entry_max_holding_monitors(
+    *,
+    db: Session,
+    entry_item: ExecutionPlanItem,
+    triggered_at: datetime,
+) -> int:
+    """Disable only the exact entry family's obsolete time-based exits.
+
+    A broker-committed exit is never silently canceled. Its plan item is
+    quarantined for manual review while broker truth remains untouched.
+    """
+
+    family_route_key = _plan_item_family_route_inventory_key(entry_item)
+    if family_route_key is None:
+        return 0
+    family_key, route_key = family_route_key
+    candidates = db.scalars(
+        select(ExecutionPlanItem)
+        .where(
+            ExecutionPlanItem.execution_plan_id
+            == entry_item.execution_plan_id,
+            ExecutionPlanItem.symbol == entry_item.symbol,
+            ExecutionPlanItem.side == "sell",
+            ExecutionPlanItem.intent == "max_holding_close_sell",
+        )
+        .order_by(
+            ExecutionPlanItem.plan_item_index.asc(),
+            ExecutionPlanItem.id.asc(),
+        )
+    ).all()
+    active_plan_statuses = ACTIVE_SELL_MONITORING_STATUSES | frozenset(
+        {
+            "broker_order_submission_pending",
+            "broker_order_submitted",
+            "broker_order_open",
+            "broker_order_partially_filled",
+            "broker_order_retry_pending",
+            "cancel_pending",
+            "manual_review_required",
+        }
+    )
+    broker_committed_plan_statuses = frozenset(
+        {
+            "broker_order_submission_pending",
+            "broker_order_submitted",
+            "broker_order_open",
+            "broker_order_partially_filled",
+            "broker_order_retry_pending",
+            "cancel_pending",
+            "manual_review_required",
+        }
+    )
+    maintenance_count = 0
+    for item in candidates:
+        if (
+            item.status not in active_plan_statuses
+            or _plan_item_family_route_inventory_key(item)
+            != family_route_key
+        ):
+            continue
+        has_capital_reserving_order = db.scalar(
+            select(BrokerOrder.id).where(
+                BrokerOrder.execution_plan_item_id == item.id,
+                BrokerOrder.status.in_(
+                    tuple(CAPITAL_RESERVING_ORDER_STATUSES)
+                ),
+            )
+        ) is not None
+        prior_status = item.status
+        requires_manual_review = (
+            has_capital_reserving_order
+            or prior_status in broker_committed_plan_statuses
+        )
+        next_status = (
+            "manual_review_required"
+            if requires_manual_review
+            else "superseded"
+        )
+        event_name = (
+            "max_holding_close_policy_disabled_manual_review"
+            if requires_manual_review
+            else "max_holding_close_policy_disabled"
+        )
+        previous_event = _loaded_risk_context(item).get(
+            "last_monitoring_event"
+        )
+        if (
+            item.status == next_status
+            and isinstance(previous_event, dict)
+            and previous_event.get("event") == event_name
+        ):
+            continue
+        item.status = next_status
+        _record_monitoring_event(
+            item=item,
+            event={
+                "event": event_name,
+                "reason": (
+                    "active_broker_order_requires_manual_review"
+                    if requires_manual_review
+                    else "entry_max_holding_policy_disabled"
+                ),
+                "prior_status": prior_status,
+                "entry_family_key": family_key,
+                "route_key": list(route_key),
+                "recorded_at": _normalize_utc(triggered_at).isoformat(),
+            },
+        )
+        maintenance_count += 1
+    return maintenance_count
+
+
+def _sync_post_entry_share_quantity(
+    *,
+    item: ExecutionPlanItem,
+    quantity: int,
+) -> bool:
+    current = item.quantity_policy
+    if not _quantity_policy_supported(current):
+        updated: dict[str, object] = {"kind": "shares", "quantity": quantity}
+    elif _quantity_policy_requires_position_exit(current):
+        updated = {
+            "kind": "shares",
+            "quantity": quantity,
+            "source": "post_entry_position_sync",
+        }
+    elif current.get("kind") == "shares":
+        current_quantity = _parse_positive_int(current.get("quantity"))
+        if current_quantity is not None and current_quantity <= quantity:
+            # A smaller fixed monitor can represent a deliberate partial-exit
+            # rearm. Family maintenance may cap it downward, but must never
+            # expand it back to the full family inventory.
+            return False
+        updated = dict(current)
+        updated["quantity"] = quantity
+    else:
+        # Percentage exits are already evaluated against family remaining at
+        # trigger time, so preserve their configured fraction.
+        return False
+    if updated == current:
+        return False
+    item.quantity_policy = updated
+    return True
+
+
 def _ensure_post_entry_stop_monitor(
     *,
     db: Session,
@@ -11053,16 +12326,7 @@ def _ensure_post_entry_stop_monitor(
         entry_market_date_precision=entry_market_date_precision,
     )
     existing.risk_context = risk_context
-    if not _quantity_policy_supported(existing.quantity_policy):
-        existing.quantity_policy = {"kind": "shares", "quantity": quantity}
-        maintenance_count += 1
-    elif _quantity_policy_requires_position_exit(existing.quantity_policy):
-        existing.quantity_policy = {
-            **dict(existing.quantity_policy or {}),
-            "kind": "shares",
-            "quantity": quantity,
-            "source": "post_entry_position_sync",
-        }
+    if _sync_post_entry_share_quantity(item=existing, quantity=quantity):
         maintenance_count += 1
     if (
         existing.status in SELL_PENDING_CONFIG_STATUSES
@@ -11183,16 +12447,7 @@ def _ensure_post_entry_target_monitor(
                 "recorded_at": triggered_at.isoformat(),
             },
         )
-    if not _quantity_policy_supported(existing.quantity_policy):
-        existing.quantity_policy = {"kind": "shares", "quantity": quantity}
-        maintenance_count += 1
-    elif _quantity_policy_requires_position_exit(existing.quantity_policy):
-        existing.quantity_policy = {
-            **dict(existing.quantity_policy or {}),
-            "kind": "shares",
-            "quantity": quantity,
-            "source": "post_entry_position_sync",
-        }
+    if _sync_post_entry_share_quantity(item=existing, quantity=quantity):
         maintenance_count += 1
     if (
         existing.status in SELL_PENDING_CONFIG_STATUSES
@@ -11246,6 +12501,9 @@ def _nonretryable_sibling_monitor_suppresses_recreation(
     plan = entry_item.plan
     if plan is None:
         return False
+    entry_scope = _plan_item_family_route_inventory_key(entry_item)
+    if entry_scope is None:
+        return False
     expected_source = _derived_source_plan_item_id(entry_item, "post-entry-target")
     for sibling in plan.items:
         if (
@@ -11254,6 +12512,7 @@ def _nonretryable_sibling_monitor_suppresses_recreation(
             or sibling.intent != intent
             or sibling.source_plan_item_id != expected_source
             or sibling.trigger_price != trigger_price
+            or _plan_item_family_route_inventory_key(sibling) != entry_scope
         ):
             continue
         if any(order.last_error_retryable is False for order in sibling.broker_orders):
@@ -11282,10 +12541,14 @@ def _ensure_post_entry_max_holding_monitor(
         intent="max_holding_close_sell",
     )
     exchange = _plan_item_exchange(entry_item)
+    # Holding-session age includes the entry session as session one. Advance
+    # only the remaining sessions so the deadline uses the same inclusive
+    # contract (for example, a 3-session hold closes on session three).
+    deadline_advance_sessions = max(0, max_holding_sessions - 1)
     if exchange in KRX_EXCHANGES:
         calendar_deadline = resolve_krx_session_deadline(
             entry_date=entry_market_date,
-            sessions=max_holding_sessions,
+            sessions=deadline_advance_sessions,
             is_trading_day=krx_trading_day,
         )
         calendar_resolution_status = calendar_deadline.status
@@ -11304,7 +12567,7 @@ def _ensure_post_entry_max_holding_monitor(
     else:
         weekday_close_date = add_weekday_sessions(
             entry_market_date,
-            max_holding_sessions,
+            deadline_advance_sessions,
         )
         assert weekday_close_date is not None
         deadline = TradingSessionDeadline(
@@ -11540,7 +12803,8 @@ def _active_sibling_monitor(
     intent: str,
 ) -> ExecutionPlanItem | None:
     plan = entry_item.plan
-    if plan is None:
+    family_route_key = _plan_item_family_route_inventory_key(entry_item)
+    if plan is None or family_route_key is None:
         return None
     candidates = [
         sibling
@@ -11549,13 +12813,11 @@ def _active_sibling_monitor(
         and sibling.side == "sell"
         and sibling.intent == intent
         and sibling.status not in NON_MONITORABLE_PLAN_ITEM_STATUSES
+        and _plan_item_family_route_inventory_key(sibling)
+        == family_route_key
     ]
-    selected = select_plan_item_family_members(
-        anchor=entry_item,
-        candidates=candidates,
-    )
-    if selected:
-        return selected[0]
+    if candidates:
+        return candidates[0]
     session = sa_inspect(entry_item).session
     if session is None:
         return None
@@ -11573,10 +12835,12 @@ def _active_sibling_monitor(
             ExecutionPlanItem.id.asc(),
         )
     ).all()
-    selected = select_plan_item_family_members(
-        anchor=entry_item,
-        candidates=persisted_candidates,
-    )
+    selected = [
+        candidate
+        for candidate in persisted_candidates
+        if _plan_item_family_route_inventory_key(candidate)
+        == family_route_key
+    ]
     return selected[0] if selected else None
 
 
@@ -11669,6 +12933,7 @@ def _post_entry_review_state(
     holding_session_count_capped_at: int | None,
     stop_price: Decimal | None,
     triggered_at: datetime,
+    max_holding_sessions: int | None,
 ) -> dict[str, object]:
     current_pnl_pct = (
         _profit_pct(current_price=observed_price, average_price=entry_price)
@@ -11686,13 +12951,21 @@ def _post_entry_review_state(
         risk_threshold_pct = settings.exec_agent_stop_loss_pct * Decimal("100")
         if adverse_pct >= risk_threshold_pct:
             reasons.append("gap_down_breached_risk_threshold")
-        if holding_session >= 2 and observed_price <= entry_price:
+        if (
+            max_holding_sessions is not None
+            and holding_session >= 2
+            and observed_price <= entry_price
+        ):
             reasons.append("next_day_no_progress")
             tightened_stop = max(
                 stop_price or Decimal("0"),
                 (entry_price * Decimal("0.99")).quantize(Decimal("0.0001"), rounding=ROUND_DOWN),
             )
-        if holding_session >= settings.exec_agent_max_holding_trading_sessions and observed_price <= entry_price:
+        if (
+            max_holding_sessions is not None
+            and holding_session >= max_holding_sessions
+            and observed_price <= entry_price
+        ):
             reasons.append("max_holding_without_progress")
     return {
         "requires_review": bool(reasons),
@@ -12662,9 +13935,7 @@ def _resolve_sell_quantity(
         if quantity is None:
             return None
         if quantity > remaining_quantity:
-            if item.intent in {"stop_sell", "max_holding_close_sell"}:
-                return remaining_quantity
-            return None
+            return remaining_quantity
         return quantity
     if kind == "percent":
         fraction = _parse_fraction(quantity_policy.get("fraction"))
@@ -12825,10 +14096,15 @@ def _resolve_watch_buy_order(
         )
 
     available_cash = _minimum_decimal(snapshot.available_cash, snapshot.buying_power)
-    existing_exposure = entry_price * Decimal(
-        _snapshot_symbol_quantity(snapshot=snapshot, symbol=item.symbol)
-        + _local_position_quantity(settings=settings, db=db, item=item)
+    existing_exposure, pre_submit_guard = _watch_buy_pre_submit_lane_guard(
+        settings=settings,
+        db=db,
+        item=item,
+        snapshot=snapshot,
+        reference_price=entry_price,
     )
+    if pre_submit_guard is not None:
+        return pre_submit_guard
     effective_stop = effective_stop_price(
         settings=settings,
         entry_price=entry_price,
@@ -13932,6 +15208,234 @@ def _snapshot_symbol_quantity(*, snapshot: BrokerAccountSnapshot, symbol: str) -
     return sum(position.quantity for position in positions if position.symbol == symbol and position.quantity > 0)
 
 
+def _normalized_decision_lane(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().casefold()
+
+
+def _watch_buy_pre_submit_lane_guard(
+    *,
+    settings: Settings,
+    db: Session,
+    item: ExecutionPlanItem,
+    snapshot: BrokerAccountSnapshot,
+    reference_price: Decimal,
+) -> tuple[Decimal, WatchBuyOrderApproval | None]:
+    """Recheck lane duplication and aggregate exposure at broker-submit time."""
+
+    candidate_lane = _normalized_decision_lane(
+        plan_item_decision_agent_name(item)
+    )
+    snapshot_quantity = _snapshot_symbol_quantity(
+        snapshot=snapshot,
+        symbol=item.symbol,
+    )
+    local_quantity = _local_position_quantity(
+        settings=settings,
+        db=db,
+        item=item,
+    )
+    # Snapshot and ExecutionPosition are two observations of the same broker
+    # holding, not additive inventories.
+    aggregate_holding_quantity = max(snapshot_quantity, local_quantity)
+    if aggregate_holding_quantity > 0:
+        inventories, lineage_found = _post_entry_family_inventories(
+            settings=settings,
+            db=db,
+            symbol=item.symbol,
+            position_quantity=aggregate_holding_quantity,
+            through=datetime.now(UTC),
+        )
+        if (
+            candidate_lane is None
+            or not lineage_found
+            or not inventories
+            or sum(row.remaining_quantity for row in inventories)
+            != aggregate_holding_quantity
+        ):
+            return Decimal("0"), WatchBuyOrderApproval(
+                quantity=None,
+                reason="entry_lane_attribution_unavailable",
+                message=(
+                    "existing symbol inventory lacks exact decision-lane ownership"
+                ),
+                details={
+                    "aggregate_holding_quantity": aggregate_holding_quantity,
+                },
+            )
+        for inventory in inventories:
+            inventory_lane = _normalized_decision_lane(
+                plan_item_decision_agent_name(inventory.entry_item)
+            )
+            if inventory_lane is None:
+                return Decimal("0"), WatchBuyOrderApproval(
+                    quantity=None,
+                    reason="entry_lane_attribution_unavailable",
+                    message=(
+                        "existing symbol inventory lacks exact decision-lane ownership"
+                    ),
+                )
+            if inventory_lane == candidate_lane:
+                return Decimal("0"), WatchBuyOrderApproval(
+                    quantity=None,
+                    reason="same_lane_existing_holding",
+                    message="the same decision lane already owns this symbol",
+                    details={
+                        "same_lane_quantity": inventory.remaining_quantity,
+                    },
+                )
+
+    candidate_orders = db.scalars(
+        select(BrokerOrder)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.broker_name == "kis",
+            BrokerOrder.symbol == item.symbol,
+            BrokerOrder.side == "buy",
+            BrokerOrder.status.in_(tuple(CAPITAL_RESERVING_ORDER_STATUSES)),
+        )
+        .options(
+            selectinload(BrokerOrder.plan_item),
+            selectinload(BrokerOrder.fills),
+        )
+    ).all()
+    local_orders: list[BrokerAccountOpenOrder] = []
+    for order in candidate_orders:
+        scope_status, _exchange = _kis_order_scope_classification(
+            settings=settings,
+            order=order,
+        )
+        if scope_status == "foreign":
+            continue
+        filled = sum(
+            (
+                effective_fill_quantity(fill)
+                for fill in dedupe_execution_fills(list(order.fills))
+                if str(fill.side or "").strip().lower() == "buy"
+            ),
+            Decimal("0"),
+        )
+        ordered = Decimal(order.quantity or 0)
+        outstanding = max(Decimal("0"), ordered - filled)
+        if outstanding <= 0:
+            continue
+        integral_outstanding = outstanding.to_integral_value(rounding=ROUND_DOWN)
+        if integral_outstanding != outstanding:
+            outstanding_quantity = order.quantity or 0
+        else:
+            outstanding_quantity = int(integral_outstanding)
+        source_identity = (
+            serialize_plan_item_source_identity(order.plan_item)
+            if order.plan_item is not None
+            else {}
+        )
+        local_orders.append(
+            BrokerAccountOpenOrder(
+                symbol=order.symbol,
+                side=order.side,
+                quantity=outstanding_quantity,
+                remaining_quantity=outstanding_quantity,
+                status=order.status,
+                broker_order_id=order.broker_order_id,
+                idempotency_key=order.idempotency_key,
+                source_candidate_id=source_identity.get("source_plan_item_id"),
+                limit_price=order.limit_price,
+                payload={
+                    "decision_agent_name": (
+                        plan_item_decision_agent_name(order.plan_item)
+                        if order.plan_item is not None and scope_status == "active"
+                        else None
+                    ),
+                    "broker_order_pk": order.id,
+                    "scope_status": scope_status,
+                },
+            )
+        )
+
+    represented_snapshot_indexes: set[int] = set()
+    for local_order in local_orders:
+        for index, snapshot_order in enumerate(snapshot.open_orders):
+            if _broker_open_orders_share_identity(local_order, snapshot_order):
+                represented_snapshot_indexes.add(index)
+    combined_orders = [
+        *local_orders,
+        *(
+            order
+            for index, order in enumerate(snapshot.open_orders)
+            if index not in represented_snapshot_indexes
+        ),
+    ]
+    candidate_idempotency_key = _monitoring_order_idempotency_key(
+        item=item,
+        is_watch_buy=True,
+        retry_source_order_pk=None,
+    )
+    if any(
+        order.idempotency_key == candidate_idempotency_key
+        for order in combined_orders
+    ):
+        # An exact replay is safe to pass to the durable broker-order
+        # idempotency boundary. Do not relabel an existing unknown/manual-
+        # review outcome as a fresh lane-duplicate rejection.
+        return (
+            Decimal(aggregate_holding_quantity) * reference_price
+        ).quantize(Decimal("0.0001"), rounding=ROUND_DOWN), None
+    from app.services.exec_agent import _has_duplicate_open_buy_order
+
+    if _has_duplicate_open_buy_order(
+        item=item,
+        idempotency_key=candidate_idempotency_key,
+        open_orders=combined_orders,
+    ):
+        return Decimal("0"), WatchBuyOrderApproval(
+            quantity=None,
+            reason="duplicate_open_buy_order",
+            message="the same decision lane already has an open buy order",
+        )
+
+    open_buy_notional = Decimal("0")
+    for order in combined_orders:
+        if order.symbol != item.symbol or str(order.side or "").lower() != "buy":
+            continue
+        quantity = order.remaining_quantity or order.quantity
+        if quantity is None or quantity <= 0:
+            continue
+        price = max(
+            reference_price,
+            order.limit_price or Decimal("0"),
+        )
+        open_buy_notional += Decimal(quantity) * price
+    exposure = (
+        Decimal(aggregate_holding_quantity) * reference_price
+        + open_buy_notional
+    ).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    return exposure, None
+
+
+def _broker_open_orders_share_identity(
+    left: BrokerAccountOpenOrder,
+    right: BrokerAccountOpenOrder,
+) -> bool:
+    left_payload = left.payload if isinstance(left.payload, dict) else {}
+    right_payload = right.payload if isinstance(right.payload, dict) else {}
+    left_lane = _normalized_decision_lane(left_payload.get("decision_agent_name"))
+    right_lane = _normalized_decision_lane(right_payload.get("decision_agent_name"))
+    return bool(
+        (left.broker_order_id and left.broker_order_id == right.broker_order_id)
+        or (
+            left.idempotency_key
+            and left.idempotency_key == right.idempotency_key
+        )
+        or (
+            left.source_candidate_id
+            and left.source_candidate_id == right.source_candidate_id
+            and left_lane is not None
+            and left_lane == right_lane
+        )
+    )
+
+
 def _local_position_quantity(
     *,
     settings: Settings,
@@ -14115,25 +15619,274 @@ def _reserve_remaining_quantity(
     remaining_quantities_by_symbol.pop(symbol, None)
 
 
+def _remaining_quantities_by_entry_family(
+    *,
+    settings: Settings,
+    db: Session,
+    positions_by_symbol: dict[str, ExecutionPosition],
+    through: datetime,
+    rearmed_plan_item_ids: set[str],
+) -> tuple[
+    dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        int,
+    ],
+    dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        Decimal,
+    ],
+]:
+    remaining: dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        int,
+    ] = {}
+    entry_prices: dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        Decimal,
+    ] = {}
+    for symbol, position in positions_by_symbol.items():
+        inventories, lineage_found = _post_entry_family_inventories(
+            settings=settings,
+            db=db,
+            symbol=symbol,
+            position_quantity=position.quantity,
+            through=through,
+        )
+        if lineage_found or inventories:
+            # The empty-family sentinel records that this symbol is under the
+            # family-owned exit contract. Only an exact family key is actionable.
+            remaining[(symbol, "", None)] = 0
+        for inventory in inventories:
+            key = (symbol, inventory.family_key, inventory.route_key)
+            remaining[key] = inventory.remaining_quantity
+            entry_prices[key] = inventory.average_entry_price
+    if not remaining:
+        return remaining, entry_prices
+
+    where = [
+        *_active_kis_order_filters(settings=settings),
+        BrokerOrder.side == "sell",
+        BrokerOrder.symbol.in_(sorted(positions_by_symbol)),
+        BrokerOrder.status.in_(tuple(CAPITAL_RESERVING_ORDER_STATUSES)),
+    ]
+    if rearmed_plan_item_ids:
+        where.append(
+            or_(
+                BrokerOrder.execution_plan_item_id.is_(None),
+                BrokerOrder.execution_plan_item_id.not_in(rearmed_plan_item_ids),
+                BrokerOrder.status != "retry_pending",
+            )
+        )
+    orders = db.scalars(
+        select(BrokerOrder)
+        .where(*where)
+        .options(
+            selectinload(BrokerOrder.plan_item),
+            selectinload(BrokerOrder.fills),
+        )
+    ).all()
+    indeterminate_symbols: set[str] = set()
+    for order in orders:
+        if not _active_kis_order_matches_position(
+            settings=settings,
+            order=order,
+            position=positions_by_symbol.get(order.symbol),
+        ):
+            continue
+        item = order.plan_item
+        family_route_key = (
+            _plan_item_family_route_inventory_key(item)
+            if item is not None
+            else None
+        )
+        key = (
+            (order.symbol, family_route_key[0], family_route_key[1])
+            if family_route_key is not None
+            else None
+        )
+        if key is None or key not in remaining:
+            # An outstanding exit with unknown ownership can consume either
+            # lane's shares. Block every family for the symbol until its
+            # lineage is reconciled rather than allowing an oversell race.
+            indeterminate_symbols.add(order.symbol)
+            continue
+        if order.quantity is None or order.quantity <= 0:
+            remaining.pop(key, None)
+            entry_prices.pop(key, None)
+            continue
+        filled = sum(
+            (
+                effective_fill_quantity(fill)
+                for fill in dedupe_execution_fills(list(order.fills))
+                if str(fill.side or "").strip().lower() == "sell"
+            ),
+            Decimal("0"),
+        )
+        outstanding = max(Decimal("0"), Decimal(order.quantity) - filled)
+        if outstanding <= 0:
+            continue
+        if outstanding != outstanding.to_integral_value(rounding=ROUND_DOWN):
+            remaining.pop(key, None)
+            entry_prices.pop(key, None)
+            continue
+        reserved = int(outstanding)
+        updated = remaining[key] - reserved
+        if updated > 0:
+            remaining[key] = updated
+        else:
+            remaining.pop(key, None)
+            entry_prices.pop(key, None)
+    for symbol in indeterminate_symbols:
+        for key in [key for key in remaining if key[0] == symbol and key[1]]:
+            remaining.pop(key, None)
+            entry_prices.pop(key, None)
+    return remaining, entry_prices
+
+
+def _sell_remaining_quantity(
+    *,
+    item: ExecutionPlanItem,
+    remaining_quantities_by_symbol: dict[str, int],
+    remaining_quantities_by_family: dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        int,
+    ],
+) -> int | None:
+    symbol_remaining = remaining_quantities_by_symbol.get(item.symbol)
+    entry_family_key = plan_item_entry_family_key(item)
+    decision_lane = _normalized_decision_lane(
+        plan_item_decision_agent_name(item)
+    )
+    family_key = _plan_item_family_inventory_key(item)
+    family_route_key = _plan_item_family_route_inventory_key(item)
+    if family_key is None:
+        if entry_family_key is not None or decision_lane is not None:
+            # A partially identified exit must never borrow a symbol-wide
+            # position from another strategy family or decision lane.
+            return None
+        # Preserve single-family legacy positions only while no canonical
+        # family lineage exists. As soon as a family ledger exists, unknown
+        # ownership fails closed.
+        if (item.symbol, "", None) not in remaining_quantities_by_family:
+            return symbol_remaining
+        return None
+    if family_route_key is None:
+        return None
+    family_remaining = remaining_quantities_by_family.get(
+        (item.symbol, family_route_key[0], family_route_key[1])
+    )
+    if family_remaining is None:
+        return None
+    if symbol_remaining is None:
+        return None
+    return min(symbol_remaining, family_remaining)
+
+
+def _reserve_family_quantity(
+    *,
+    remaining_quantities_by_family: dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        int,
+    ],
+    item: ExecutionPlanItem,
+    quantity: int,
+) -> None:
+    family_route_key = _plan_item_family_route_inventory_key(item)
+    if family_route_key is None:
+        return
+    key = (item.symbol, family_route_key[0], family_route_key[1])
+    remaining = remaining_quantities_by_family.get(key)
+    if remaining is None or quantity <= 0:
+        return
+    updated = remaining - quantity
+    if updated > 0:
+        remaining_quantities_by_family[key] = updated
+    else:
+        remaining_quantities_by_family.pop(key, None)
+
+
 def _reserve_and_rearm_sell_after_success(
     *,
     settings: Settings,
     item: ExecutionPlanItem,
-    position: ExecutionPosition | None,
     remaining_quantities_by_symbol: dict[str, int],
     submitted_quantity: int,
     recorded_at: datetime,
+    remaining_quantities_by_family: dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        int,
+    ]
+    | None = None,
+    entry_prices_by_family: dict[
+        tuple[
+            str,
+            str,
+            tuple[str, str, str, str] | None,
+        ],
+        Decimal,
+    ]
+    | None = None,
 ) -> None:
     _reserve_remaining_quantity(
         remaining_quantities_by_symbol=remaining_quantities_by_symbol,
         symbol=item.symbol,
         quantity=submitted_quantity,
     )
+    if remaining_quantities_by_family is not None:
+        _reserve_family_quantity(
+            remaining_quantities_by_family=remaining_quantities_by_family,
+            item=item,
+            quantity=submitted_quantity,
+        )
+    family_route_key = _plan_item_family_route_inventory_key(item)
+    family_inventory_key = (
+        (item.symbol, family_route_key[0], family_route_key[1])
+        if family_route_key is not None
+        else None
+    )
     _rearm_stop_after_partial_take_profit(
         settings=settings,
         item=item,
-        position=position,
-        remaining_quantity=remaining_quantities_by_symbol.get(item.symbol),
+        family_average_entry_price=(
+            entry_prices_by_family.get(family_inventory_key)
+            if entry_prices_by_family is not None
+            and family_inventory_key is not None
+            else None
+        ),
+        remaining_quantity=(
+            remaining_quantities_by_family.get(family_inventory_key)
+            if remaining_quantities_by_family is not None
+            and family_inventory_key is not None
+            else None
+        ),
         submitted_quantity=submitted_quantity,
         recorded_at=recorded_at,
     )
@@ -14401,7 +16154,7 @@ def _rearm_stop_after_partial_take_profit(
     *,
     settings: Settings,
     item: ExecutionPlanItem,
-    position: ExecutionPosition | None,
+    family_average_entry_price: Decimal | None,
     remaining_quantity: int | None,
     submitted_quantity: int,
     recorded_at: datetime,
@@ -14411,15 +16164,22 @@ def _rearm_stop_after_partial_take_profit(
     exit_rule = _exit_rule(item)
     if exit_rule.get("kind") != "partial_take_profit":
         return
-    if position is None or position.average_price is None or position.average_price <= 0:
+    if (
+        family_average_entry_price is None
+        or not family_average_entry_price.is_finite()
+        or family_average_entry_price <= 0
+    ):
         return
 
     breakeven_stop = _breakeven_stop_price(
-        average_price=position.average_price,
+        average_price=family_average_entry_price,
         buffer_pct=settings.breakeven_stop_buffer_pct,
     )
     plan = item.plan
     if plan is None:
+        return
+    family_route_key = _plan_item_family_route_inventory_key(item)
+    if family_route_key is None:
         return
 
     stop_candidates = [
@@ -14428,11 +16188,10 @@ def _rearm_stop_after_partial_take_profit(
         if sibling.symbol == item.symbol
         and sibling.intent == "stop_sell"
         and sibling.status not in NON_MONITORABLE_PLAN_ITEM_STATUSES
+        and _plan_item_family_route_inventory_key(sibling)
+        == family_route_key
     ]
-    for sibling in select_plan_item_family_members(
-        anchor=item,
-        candidates=stop_candidates,
-    ):
+    for sibling in stop_candidates:
 
         prior_trigger = sibling.trigger_price
         prior_quantity_policy = sibling.quantity_policy
@@ -14455,7 +16214,8 @@ def _rearm_stop_after_partial_take_profit(
             "target_item_id": item.id,
             "submitted_take_profit_quantity": submitted_quantity,
             "remaining_quantity": remaining_quantity,
-            "average_price": _serialize_decimal(position.average_price),
+            "average_price": _serialize_decimal(family_average_entry_price),
+            "average_price_source": "exact_family_canonical_buy_fills",
             "breakeven_stop_price": _serialize_decimal(sibling.trigger_price),
             "buffer_pct": _serialize_decimal(settings.breakeven_stop_buffer_pct),
             "prior_trigger_price": _serialize_decimal(prior_trigger),
@@ -14473,7 +16233,8 @@ def _rearm_stop_after_partial_take_profit(
                 "remaining_quantity": remaining_quantity,
                 "prior_trigger_price": _serialize_decimal(prior_trigger),
                 "updated_trigger_price": _serialize_decimal(sibling.trigger_price),
-                "average_price": _serialize_decimal(position.average_price),
+                "average_price": _serialize_decimal(family_average_entry_price),
+                "average_price_source": "exact_family_canonical_buy_fills",
                 "buffer_pct": _serialize_decimal(settings.breakeven_stop_buffer_pct),
                 "recorded_at": recorded_at.isoformat(),
             },
@@ -14514,12 +16275,16 @@ def _plan_item_status_from_order_payload(order_payload: object) -> str | None:
 
 
 def _placement_preserves_current_plan_status(payload: dict[str, object]) -> bool:
-    return payload.get("block_reason") in {
-        "execution_plan_item_state_changed",
-        "account_drawdown_recovery_candidate_ineligible",
-        "account_drawdown_recovery_lineage_invalid",
-        "account_drawdown_recovery_state_changed",
-    }
+    return bool(
+        payload.get("preserve_plan_item_status") is True
+        or payload.get("manual_review_required") is True
+        or payload.get("block_reason") in {
+            "execution_plan_item_state_changed",
+            "account_drawdown_recovery_candidate_ineligible",
+            "account_drawdown_recovery_lineage_invalid",
+            "account_drawdown_recovery_state_changed",
+        }
+    )
 
 
 def _parse_positive_int(value: object) -> int | None:
@@ -14639,24 +16404,9 @@ def _watch_buy_high_risk_gate_rejection(
         sources.append(live_market_context)
     sources.extend(_item_payload_sources(item))
     payload = {"sources": sources}
-    signal_action = (_recursive_text_feature(payload, {"action"}, parent_key="signal_decider_crosscheck") or "").lower()
-    tactical_action = (
-        _recursive_text_feature(payload, {"tactical_action"})
-        or _recursive_text_feature(payload, {"handoff_intent"})
-        or ""
-    ).lower()
-    if signal_action == "reject":
-        return _watch_buy_gate_rejection(
-            reason="signal_decider_reject_veto",
-            message="same-day signal-decider rejected this setup",
-            details={"signal_decider_action": signal_action, "tactical_action": tactical_action},
-        )
-    if signal_action == "wait" and tactical_action in {"scalp_buy_candidate", "tactical_buy"}:
-        return _watch_buy_gate_rejection(
-            reason="signal_decider_wait_blocks_tactical_buy",
-            message="same-day signal-decider is wait, so tactical buy requires a stricter watch setup",
-            details={"signal_decider_action": signal_action, "tactical_action": tactical_action},
-        )
+    # Cross-lane decider context remains durable audit evidence, but it is not
+    # execution authority.  Signal and short-term lanes own independent watch
+    # decisions, so one lane's WAIT/REJECT must not hard-veto the other lane.
 
     atr_pct = _recursive_decimal_feature(payload, {"atr_pct_14", "atr_pct", "atr14_pct", "atr_percent"})
     ret20 = _recursive_decimal_feature(payload, {"ret20", "ret_20d", "return_20d", "pct_change_20d"})
@@ -15687,6 +17437,9 @@ def _monitoring_order_metadata(
         "order_purpose": "protective_stop" if item.intent == "stop_sell" else item.intent,
         "route_now": triggered_at.isoformat(),
     }
+    strategy_family_identity = _strategy_entry_family_identity(item)
+    if strategy_family_identity is not None:
+        metadata[STRATEGY_ENTRY_FAMILY_METADATA_KEY] = strategy_family_identity
     if item.side == "sell":
         metadata["deterministic_sell_quantity_cap"] = (
             deterministic_sell_quantity_cap

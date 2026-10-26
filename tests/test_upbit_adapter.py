@@ -159,6 +159,165 @@ def test_upbit_paper_buys_reserve_configured_total_budget_across_symbols() -> No
     engine.dispose()
 
 
+def test_upbit_paper_budget_fails_closed_on_unknown_quote_fill_reservation() -> None:
+    for case, filled_quote_notional in (
+        ("missing", None),
+        ("overdraw", Decimal("60000")),
+    ):
+        app, engine = build_test_app(
+            Settings(
+                database_url="sqlite:///:memory:",
+                runtime_mode="paper",
+                automation_enabled=True,
+                exec_agent_max_symbol_budget=Decimal("60000"),
+                exec_agent_max_total_budget=Decimal("75000"),
+            )
+        )
+        client = TestClient(app)
+        resume_runtime(client)
+
+        first = client.post(
+            "/orders",
+            json={
+                "idempotency_key": f"upbit-unknown-fill-first-{case}",
+                "provider": "upbit",
+                "asset_class": "crypto",
+                "venue": "upbit",
+                "symbol": "KRW-BTC",
+                "side": "buy",
+                "order_type": "market",
+                "time_in_force": "day",
+                "exchange": "UPBIT",
+                "quote_notional": "50000",
+                "price_precision": 0,
+            },
+        )
+        assert first.status_code == 201
+        with create_session_factory(engine)() as session:
+            order = session.query(BrokerOrder).filter_by(
+                idempotency_key=f"upbit-unknown-fill-first-{case}"
+            ).one()
+            session.add(
+                ExecutionFill(
+                    broker_order_pk=order.id,
+                    broker_fill_id=f"upbit-unknown-fill-{case}",
+                    symbol="KRW-BTC",
+                    side="buy",
+                    quantity=1,
+                    quote_notional=filled_quote_notional,
+                    price=Decimal("60000"),
+                    filled_at=datetime.now(UTC),
+                )
+            )
+            session.commit()
+
+        second = client.post(
+            "/orders",
+            json={
+                "idempotency_key": f"upbit-unknown-fill-second-{case}",
+                "provider": "upbit",
+                "asset_class": "crypto",
+                "venue": "upbit",
+                "symbol": "KRW-ETH",
+                "side": "buy",
+                "order_type": "market",
+                "time_in_force": "day",
+                "exchange": "UPBIT",
+                "quote_notional": "50000",
+                "price_precision": 0,
+            },
+        )
+
+        assert second.status_code == 409
+        assert second.json()["block_reason"] == "account_drawdown_snapshot_unavailable"
+        with create_session_factory(engine)() as session:
+            assert session.query(BrokerOrder).filter_by(status="submitted").count() == 1
+        engine.dispose()
+
+
+def test_upbit_paper_budget_dedupes_exact_partial_quote_fills() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            automation_enabled=True,
+            exec_agent_max_symbol_budget=Decimal("60000"),
+            exec_agent_max_total_budget=Decimal("75000"),
+        )
+    )
+    client = TestClient(app)
+    resume_runtime(client)
+    first = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "upbit-deduped-fill-first",
+            "provider": "upbit",
+            "asset_class": "crypto",
+            "venue": "upbit",
+            "symbol": "KRW-BTC",
+            "side": "buy",
+            "order_type": "market",
+            "time_in_force": "day",
+            "exchange": "UPBIT",
+            "quote_notional": "50000",
+            "price_precision": 0,
+        },
+    )
+    assert first.status_code == 201
+    duplicated_fill_at = datetime.now(UTC)
+    with create_session_factory(engine)() as session:
+        order = session.query(BrokerOrder).filter_by(
+            idempotency_key="upbit-deduped-fill-first"
+        ).one()
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=order.id,
+                    broker_fill_id="upbit-shared-fill-id",
+                    symbol="KRW-BTC",
+                    side="buy",
+                    quantity=1,
+                    quote_notional=Decimal("20000"),
+                    price=Decimal("20000"),
+                    filled_at=duplicated_fill_at,
+                ),
+                ExecutionFill(
+                    broker_order_pk=order.id,
+                    broker_fill_id="upbit-shared-fill-id",
+                    symbol="KRW-BTC",
+                    side="buy",
+                    quantity=1,
+                    quote_notional=Decimal("20000"),
+                    price=Decimal("20000"),
+                    filled_at=duplicated_fill_at,
+                ),
+            ]
+        )
+        session.commit()
+
+    second = client.post(
+        "/orders",
+        json={
+            "idempotency_key": "upbit-deduped-fill-second",
+            "provider": "upbit",
+            "asset_class": "crypto",
+            "venue": "upbit",
+            "symbol": "KRW-ETH",
+            "side": "buy",
+            "order_type": "market",
+            "time_in_force": "day",
+            "exchange": "UPBIT",
+            "quote_notional": "40000",
+            "price_precision": 0,
+        },
+    )
+
+    assert second.status_code == 201, second.json()
+    with create_session_factory(engine)() as session:
+        assert session.query(BrokerOrder).filter_by(status="submitted").count() == 2
+    engine.dispose()
+
+
 def test_paused_runtime_blocks_direct_order_without_persisting_broker_action() -> None:
     app, engine = build_test_app(
         Settings(database_url="sqlite:///:memory:", runtime_mode="paper", automation_enabled=True)

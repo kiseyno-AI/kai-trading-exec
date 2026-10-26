@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.broker.base import (
     BrokerAccountOpenOrder,
@@ -30,7 +30,7 @@ from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, Ex
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.account_drawdown_recovery import account_snapshot_freshness_failure
 from app.services.exec_agent_approval import load_strict_json_object
-from app.services.execution_semantics import is_short_term_watch_buy_intent
+from app.services.execution_semantics import KRX_EXCHANGES, is_short_term_watch_buy_intent
 from app.services.execution_account_route import classify_kis_account_route
 from app.services.live_market_context import (
     live_market_breadth_is_current,
@@ -51,8 +51,18 @@ from app.services.openclaw_runtime_contract import (
     stable_runtime_contract_proof,
 )
 from app.services.plan_item_identity import (
+    plan_item_decision_agent_name,
+    plan_item_entry_family_key,
+    plan_item_inventory_scope_key,
+    plan_item_source_plan_item_id,
     select_plan_item_family_members,
     serialize_plan_item_source_identity,
+)
+from app.services.strategy_lane_authority import (
+    normalized_decision_lane,
+    sizing_authority_account_context,
+    sizing_authority_risk_context,
+    strategy_feedback_for_decision_lane,
 )
 from app.services.broker_order_state import (
     CAPITAL_RESERVING_ORDER_STATUSES,
@@ -61,7 +71,15 @@ from app.services.broker_order_state import (
 from app.services.json_compaction import compact_json_object, compact_json_payload, json_payload_hash
 from app.services.trade_outcome_feedback import load_latest_trade_outcome_feedback_snippet
 from app.services.position_identity import PositionIdentity, build_position_identity
-from app.services.fifo_inventory import fifo_route_scope_from_order
+from app.services.fifo_inventory import (
+    canonical_fifo_inventory_route_scope,
+    fifo_route_scope_from_order,
+)
+from app.services.fill_economics import effective_fill_quantity
+from app.services.fill_idempotency import (
+    dedupe_execution_fills,
+    execution_fills_have_conflicting_identity,
+)
 from app.services.runtime_transitions import (
     ACTIVE_SELL_MONITORING_STATUSES,
     ACTIVE_WATCH_MONITORING_STATUSES,
@@ -233,7 +251,13 @@ def trigger_time_exec_agent_enabled(*, settings: Settings, item: ExecutionPlanIt
 
 
 def deterministic_emergency_stop_required(item: ExecutionPlanItem) -> bool:
-    return item.side == "sell" and item.intent == "stop_sell"
+    # A protective stop and an already-due max-holding close are both
+    # deterministic liquidation obligations. The exec-agent may shape normal
+    # target exits, but it must not veto or delay either hard exit.
+    return item.side == "sell" and item.intent in {
+        "stop_sell",
+        "max_holding_close_sell",
+    }
 
 
 def effective_protective_stop_price(item: ExecutionPlanItem) -> Decimal | None:
@@ -268,13 +292,17 @@ def effective_protective_stop_price(item: ExecutionPlanItem) -> Decimal | None:
             and sibling.intent == "stop_sell"
             and sibling.status not in terminal_statuses
         ]
-        for sibling in select_plan_item_family_members(
-            anchor=item,
-            candidates=stop_candidates,
-        ):
-            candidate = _positive_decimal(sibling.trigger_price)
-            if candidate is not None:
-                candidates.append(candidate)
+        item_route = plan_item_inventory_scope_key(item)
+        if item_route is not None:
+            for sibling in select_plan_item_family_members(
+                anchor=item,
+                candidates=stop_candidates,
+            ):
+                if plan_item_inventory_scope_key(sibling) != item_route:
+                    continue
+                candidate = _positive_decimal(sibling.trigger_price)
+                if candidate is not None:
+                    candidates.append(candidate)
     return max(candidates) if candidates else None
 
 
@@ -621,6 +649,26 @@ def _request_payload(
     remaining_quantity: int | None,
 ) -> dict[str, object]:
     plan = item.plan
+    feedback_scope = account_context.get("execution_account_scope")
+    feedback_scope = feedback_scope if isinstance(feedback_scope, dict) else {}
+    decision_lane = plan_item_decision_agent_name(item)
+    feedback_provider = str(feedback_scope.get("provider") or "").strip()
+    feedback_account_scope = str(
+        feedback_scope.get("account_scope") or ""
+    ).strip()
+    loaded_feedback = (
+        load_latest_trade_outcome_feedback_snippet(
+            settings,
+            provider=feedback_provider,
+            account_scope=feedback_account_scope,
+        )
+        if feedback_provider and feedback_account_scope
+        else {}
+    )
+    trade_outcome_feedback = strategy_feedback_for_decision_lane(
+        loaded_feedback,
+        decision_lane=decision_lane,
+    )
     return {
         "version": TRIGGER_TIME_EXEC_AGENT_VERSION,
         "agent_id": getattr(settings, "exec_agent_id", "exec-agent"),
@@ -641,19 +689,8 @@ def _request_payload(
             "source": plan.source if plan is not None else None,
         },
         "signal_context": _signal_context(item=item, side=side),
-        "trade_outcome_feedback": load_latest_trade_outcome_feedback_snippet(
-            settings,
-            provider=(
-                str(account_context["execution_account_scope"].get("provider") or "") or None
-                if isinstance(account_context.get("execution_account_scope"), dict)
-                else None
-            ),
-            account_scope=(
-                str(account_context["execution_account_scope"].get("account_scope") or "") or None
-                if isinstance(account_context.get("execution_account_scope"), dict)
-                else None
-            ),
-        ),
+        "decision_lane": decision_lane,
+        "trade_outcome_feedback": trade_outcome_feedback,
         "market_context": market_context,
         "account_context": account_context,
         "peer_context": peer_context,
@@ -691,8 +728,17 @@ def _request_payload(
 
 
 def _signal_context(*, item: ExecutionPlanItem, side: Literal["buy", "sell"]) -> dict[str, object]:
-    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
-    quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    decision_lane = plan_item_decision_agent_name(item)
+    raw_risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    raw_quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    risk_context = sizing_authority_risk_context(
+        raw_risk_context,
+        decision_lane=decision_lane,
+    )
+    quantity_policy = sizing_authority_risk_context(
+        raw_quantity_policy,
+        decision_lane=decision_lane,
+    )
     return {
         "execution_plan_item_id": item.id,
         "symbol": item.symbol,
@@ -1349,6 +1395,7 @@ def _load_account_context(
         snapshot=snapshot,
         provider=adapter.provider,
         exchange=_plan_item_exchange(item),
+        decision_lane=plan_item_decision_agent_name(item),
         observed_at=snapshot_evaluated_at,
     )
 
@@ -1360,6 +1407,7 @@ def _account_context_payload(
     snapshot: BrokerAccountSnapshot,
     provider: str,
     exchange: str,
+    decision_lane: str | None = None,
     observed_at: datetime | None = None,
 ) -> dict[str, object]:
     evaluated_at = _normalize_utc(observed_at or datetime.now(UTC))
@@ -1378,48 +1426,81 @@ def _account_context_payload(
             "max_age_seconds": settings.exec_agent_max_account_snapshot_age_seconds,
             "max_future_skew_seconds": settings.account_drawdown_recovery_max_snapshot_future_skew_seconds,
         }
-    positions = snapshot.positions or snapshot.holdings
-    holdings = [
-        {
-            "symbol": position.symbol,
-            "quantity": position.quantity,
-            "sellable_quantity": getattr(position, "sellable_quantity", None),
-            "average_price": _decimal_text(getattr(position, "average_price", None)),
-        }
-        for position in positions
-        if position.quantity > 0
-    ]
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_exchange = str(exchange or "").strip().upper()
+    inventory_exchange = (
+        "KRX"
+        if normalized_provider == "kis" and normalized_exchange in KRX_EXCHANGES
+        else normalized_exchange
+    )
     identity = build_position_identity(
         settings=settings,
         provider=provider,
-        exchange=exchange,
+        exchange=inventory_exchange,
         broker_account_id=snapshot.broker_account_id,
     )
-    local_positions = [
+    holdings_by_symbol: dict[str, int] = {}
+    average_price_by_symbol: dict[str, Decimal | None] = {}
+    sellable_by_symbol: dict[str, int | None] = {}
+    for position in snapshot.positions or snapshot.holdings:
+        symbol = str(position.symbol or "").strip().upper()
+        if not symbol or position.quantity <= 0:
+            continue
+        holdings_by_symbol[symbol] = max(
+            holdings_by_symbol.get(symbol, 0),
+            position.quantity,
+        )
+        average_price_by_symbol[symbol] = getattr(position, "average_price", None)
+        sellable_by_symbol[symbol] = getattr(position, "sellable_quantity", None)
+    local_positions = db.scalars(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.provider == identity.provider,
+            ExecutionPosition.account_scope == identity.account_scope,
+            ExecutionPosition.exchange == identity.exchange,
+        )
+    ).all()
+    for position in local_positions:
+        symbol = str(position.symbol or "").strip().upper()
+        if not symbol or position.quantity <= 0:
+            continue
+        holdings_by_symbol[symbol] = max(
+            holdings_by_symbol.get(symbol, 0),
+            position.quantity,
+        )
+        average_price_by_symbol.setdefault(symbol, position.average_price)
+        sellable_by_symbol.setdefault(symbol, None)
+    holdings = [
         {
-            "symbol": position.symbol,
-            "quantity": position.quantity,
-            "average_price": _decimal_text(position.average_price),
-            "last_reconciled_at": position.last_reconciled_at.isoformat() if position.last_reconciled_at else None,
+            "symbol": symbol,
+            "quantity": quantity,
+            "sellable_quantity": sellable_by_symbol.get(symbol),
+            "average_price": _decimal_text(average_price_by_symbol.get(symbol)),
         }
-        for position in db.scalars(
-            select(ExecutionPosition).where(
-                ExecutionPosition.mode == settings.runtime_mode,
-                ExecutionPosition.provider == identity.provider,
-                ExecutionPosition.account_scope == identity.account_scope,
-                ExecutionPosition.exchange == identity.exchange,
-            )
-        ).all()
-        if position.quantity > 0
+        for symbol, quantity in sorted(holdings_by_symbol.items())
     ]
-    open_orders = [
-        _open_order_payload(order)
-        for order in [
-            *snapshot.open_orders,
-            *_local_open_orders(settings=settings, db=db, identity=identity),
-        ]
-    ]
-    return {
+    # Reuse the shared exact fill-family reconstruction without importing it at
+    # module load time (monitoring imports this module during startup).
+    from app.services.exec_agent import (
+        _holding_lane_attribution,
+        _merge_account_open_orders,
+    )
+
+    quantities_by_lane, complete_by_symbol = _holding_lane_attribution(
+        settings=settings,
+        db=db,
+        holdings_by_symbol=holdings_by_symbol,
+        observed_at=_normalize_utc(snapshot.observed_at),
+    )
+    merged_orders = _merge_account_open_orders(
+        broker_orders=list(snapshot.open_orders),
+        local_orders=_local_open_orders(
+            settings=settings,
+            db=db,
+            identity=identity,
+        ),
+    )
+    payload = {
         "available": True,
         "holdings_complete": snapshot.holdings_complete,
         "open_orders_complete": snapshot.open_orders_complete,
@@ -1434,9 +1515,11 @@ def _account_context_payload(
         "buying_power_krw": _decimal_text(snapshot.buying_power),
         "holding_count": len(holdings),
         "holdings": holdings,
-        "local_positions": local_positions,
-        "open_order_count": len(open_orders),
-        "open_orders": open_orders,
+        "holdings_by_symbol": holdings_by_symbol,
+        "holding_quantities_by_decision_lane": quantities_by_lane,
+        "holding_lane_attribution_complete_by_symbol": complete_by_symbol,
+        "open_order_count": len(merged_orders),
+        "open_orders": [_open_order_payload(order) for order in merged_orders],
         "symbol_buying_power": {
             symbol: {
                 "available_cash": _decimal_text(power.available_cash),
@@ -1446,6 +1529,10 @@ def _account_context_payload(
             for symbol, power in snapshot.symbol_buying_power.items()
         },
     }
+    return sizing_authority_account_context(
+        payload,
+        decision_lane=decision_lane,
+    )
 
 
 def _local_open_orders(
@@ -1460,11 +1547,19 @@ def _local_open_orders(
                 settings=settings,
                 statuses=OPEN_ORDER_STATUSES,
             )
+        ).options(
+            selectinload(BrokerOrder.plan_item),
+            selectinload(BrokerOrder.fills),
         )
     ).all()
     scoped_orders: list[BrokerAccountOpenOrder] = []
     for order in orders:
-        route_scope = fifo_route_scope_from_order(order)
+        exact_route_scope = fifo_route_scope_from_order(order)
+        route_scope = (
+            canonical_fifo_inventory_route_scope(exact_route_scope)
+            if exact_route_scope is not None
+            else None
+        )
         if (
             route_scope is None
             or route_scope.provider != identity.provider
@@ -1472,11 +1567,21 @@ def _local_open_orders(
             or route_scope.exchange != identity.exchange
         ):
             continue
+        remaining_quantity, remaining_indeterminate = (
+            _local_open_order_remaining_quantity(order)
+        )
+        if remaining_quantity == 0:
+            continue
+        plan_item = order.plan_item
         scoped_orders.append(BrokerAccountOpenOrder(
             symbol=order.symbol,
             side=order.side,
-            quantity=order.quantity,
-            remaining_quantity=order.quantity,
+            quantity=order.quantity or 0,
+            remaining_quantity=(
+                remaining_quantity
+                if remaining_quantity is not None
+                else max(order.quantity or 0, 0)
+            ),
             status=order.status,
             broker_order_id=order.broker_order_id,
             idempotency_key=order.idempotency_key,
@@ -1485,13 +1590,61 @@ def _local_open_orders(
                 "source": "local_broker_orders",
                 "broker_order_pk": order.id,
                 "execution_plan_item_id": order.execution_plan_item_id,
+                "decision_agent_name": (
+                    plan_item_decision_agent_name(plan_item)
+                    if plan_item is not None
+                    else None
+                ),
+                "entry_family_key": (
+                    plan_item_entry_family_key(plan_item)
+                    if plan_item is not None
+                    else None
+                ),
+                "execution_scope": (
+                    exact_route_scope.as_payload()
+                    if exact_route_scope is not None
+                    else None
+                ),
+                "remaining_quantity_indeterminate": remaining_indeterminate,
             },
         ))
     return scoped_orders
 
 
+def _local_open_order_remaining_quantity(
+    order: BrokerOrder,
+) -> tuple[int | None, bool]:
+    ordered_quantity = order.quantity
+    if (
+        isinstance(ordered_quantity, bool)
+        or not isinstance(ordered_quantity, int)
+        or ordered_quantity <= 0
+        or execution_fills_have_conflicting_identity(list(order.fills))
+    ):
+        return None, True
+    filled_quantity = Decimal("0")
+    expected_side = str(order.side or "").strip().lower()
+    try:
+        for fill in dedupe_execution_fills(list(order.fills)):
+            if str(fill.side or "").strip().lower() != expected_side:
+                return None, True
+            quantity = effective_fill_quantity(fill)
+            if not quantity.is_finite() or quantity <= 0:
+                return None, True
+            filled_quantity += quantity
+    except (ArithmeticError, TypeError, ValueError):
+        return None, True
+    if filled_quantity > Decimal(ordered_quantity):
+        return None, True
+    remaining = Decimal(ordered_quantity) - filled_quantity
+    if remaining != remaining.to_integral_value():
+        return None, True
+    return int(remaining), False
+
+
 def _open_order_payload(order: BrokerAccountOpenOrder) -> dict[str, object]:
-    return {
+    payload = order.payload if isinstance(order.payload, dict) else {}
+    serialized: dict[str, object] = {
         "symbol": order.symbol,
         "side": order.side,
         "quantity": order.quantity,
@@ -1502,6 +1655,15 @@ def _open_order_payload(order: BrokerAccountOpenOrder) -> dict[str, object]:
         "source_candidate_id": order.source_candidate_id,
         "limit_price": _decimal_text(order.limit_price),
     }
+    for key in (
+        "decision_agent_name",
+        "entry_family_key",
+        "execution_scope",
+        "remaining_quantity_indeterminate",
+    ):
+        if payload.get(key) is not None:
+            serialized[key] = payload[key]
+    return serialized
 
 
 def _peer_context(*, settings: Settings, db: Session, item: ExecutionPlanItem) -> dict[str, object]:
@@ -1519,7 +1681,8 @@ def _peer_context(*, settings: Settings, db: Session, item: ExecutionPlanItem) -
         return provider, _plan_item_exchange(candidate)
 
     current_route = scoped_route(item)
-    if current_route is None:
+    current_lane = normalized_decision_lane(plan_item_decision_agent_name(item))
+    if current_route is None or current_lane is None:
         return {
             "active_candidate_count": 0,
             "pending_agent_decision_count": 0,
@@ -1540,6 +1703,11 @@ def _peer_context(*, settings: Settings, db: Session, item: ExecutionPlanItem) -
         candidate
         for candidate in unscoped_candidates
         if scoped_route(candidate) == current_route
+        # Peer state is strategy authority only inside the exact lane.  An
+        # unknown lane is excluded rather than borrowing another lane's
+        # queue pressure or delay/reject history.
+        and normalized_decision_lane(plan_item_decision_agent_name(candidate))
+        == current_lane
     ]
     pending_count = sum(
         candidate.status == AGENT_PENDING_STATUS for candidate in scoped_candidates
@@ -1785,6 +1953,8 @@ If bid/ask/orderbook/volume/turnover/session quality is missing, return delay or
 Apply trade_outcome_feedback lessons only when status=ready, consumer_eligible=true,
 and snippet.quality_gate.instruction=apply_only_quality_gated_lessons. When blocked or
 unavailable, treat the reasons as data-quality context and do not infer any lesson.
+The server has selected feedback for this request's exact decision_lane. Opposite-lane,
+unscoped, ambiguous, or aggregate feedback is audit-only and must never change execution.
 Operational failure/rejection evidence may only add delay, downsize, or reject pressure
 when operational_learning_context.consumer_eligible=true; it can never justify approve
 or increase_size.

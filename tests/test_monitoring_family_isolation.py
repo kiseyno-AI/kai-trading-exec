@@ -36,6 +36,7 @@ from app.services.monitoring import (
     materialize_monitoring_plan_items,
 )
 from app.services.position_identity import build_position_identity, execution_scope_payload
+from app.services.plan_item_identity import plan_item_entry_family_key
 from app.services.runtime_transitions import ACTIVE_SELL_MONITORING_STATUSES
 
 
@@ -122,6 +123,7 @@ def _sell_item(
         venue="KRX",
         asset_class="stock",
         trigger_price=Decimal(trigger_price),
+        decision_agent_name="signal-decider",
         source_plan_item_id=f"{item_id}:exit",
         quantity_policy=quantity_policy,
         risk_context=risk_context,
@@ -361,6 +363,41 @@ def test_active_sell_replacement_is_limited_to_the_same_explicit_family() -> Non
     assert newer.status == "stop_sell_monitoring"
     db.close()
     engine.dispose()
+
+
+def test_ambiguous_sell_claims_cannot_replace_exact_family_authority() -> None:
+    settings = _settings()
+    incumbent = _sell_item(
+        settings,
+        item_id="exact-family-incumbent",
+        family_key="family-a-entry",
+        accepted_at=datetime(2026, 9, 9, 12, tzinfo=UTC),
+    )
+    ambiguous = _sell_item(
+        settings,
+        item_id="ambiguous-family-newer",
+        family_key="family-a-entry",
+        accepted_at=datetime(2026, 9, 10, 12, tzinfo=UTC),
+        trigger_price="80",
+    )
+    incumbent.source_plan_item_id = "shared-direct-exit-row"
+    ambiguous.source_plan_item_id = "shared-direct-exit-row"
+    ambiguous.risk_context = {
+        **dict(ambiguous.risk_context or {}),
+        "entry_context": {"source_plan_item_id": "family-b-entry"},
+    }
+
+    canonical = _canonicalize_loaded_active_watch_buys(
+        [incumbent, ambiguous],
+        settings=settings,
+    )
+
+    assert plan_item_entry_family_key(incumbent) == "source:family-a-entry"
+    assert plan_item_entry_family_key(ambiguous) is None
+    assert {item.id for item in canonical} == {incumbent.id, ambiguous.id}
+    assert incumbent.status == "stop_sell_monitoring"
+    assert incumbent.trigger_price == Decimal("90")
+    assert ambiguous.status == "stop_sell_monitoring"
 
 
 def test_non_kis_sell_replan_never_crosses_authenticated_account_scope() -> None:

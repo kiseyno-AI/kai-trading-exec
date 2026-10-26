@@ -110,9 +110,25 @@ from app.services.core_buy_authority import (
     core_buy_authority_block_reason,
     project_plan_item_for_core_buy_authority,
 )
-from app.services.fill_idempotency import execution_fill_idempotency_key
-from app.services.fill_economics import COST_COVERAGE_UNKNOWN, settlement_currency_for_order
-from app.services.fifo_inventory import FifoRouteScope, fifo_route_scope_from_order
+from app.services.fill_idempotency import (
+    dedupe_execution_fills,
+    execution_fill_idempotency_key,
+    execution_fills_have_relevant_conflicting_identity,
+)
+from app.services.fill_economics import (
+    COST_COVERAGE_UNKNOWN,
+    effective_fill_quantity,
+    settlement_currency_for_order,
+)
+from app.services.fifo_inventory import (
+    FifoRouteScope,
+    ambiguous_fifo_chronology_buckets,
+    canonical_fifo_inventory_route_scope,
+    fifo_chronology_is_ambiguous_at,
+    fifo_fill_sort_key,
+    fifo_route_scope_from_order,
+    load_fifo_isolation_cursor,
+)
 from app.services.json_compaction import PLAN_ITEM_SUBMISSION_RISK_KEYS, json_payload_hash
 from app.services.monitoring_price_source import is_us_regular_session, next_us_regular_open
 from app.services.order_intent_serialization import (
@@ -121,7 +137,13 @@ from app.services.order_intent_serialization import (
     order_intent_process_lock,
     order_intent_scope_key_for_account,
 )
-from app.services.plan_item_identity import select_plan_item_family_members
+from app.services.plan_item_identity import (
+    plan_item_decision_agent_name,
+    plan_item_entry_family_key,
+    plan_item_execution_route_key,
+    plan_item_inventory_scope_key,
+    select_plan_item_family_members,
+)
 from app.services.plan_judgment_actions import project_buy_plan_item_for_hourly_risk_off
 from app.services.position_identity import (
     EXECUTION_SCOPE_POLICY_VERSION,
@@ -197,6 +219,18 @@ ACCOUNT_DRAWDOWN_RECOVERY_AUTOMATED_SOURCE_PREFIXES = (
     "execution-job:",
     "short-term-watcher:",
 )
+STRATEGY_ENTRY_FAMILY_METADATA_KEY = "strategy_entry_family_v1"
+STRATEGY_ENTRY_FAMILY_POLICY_VERSION = 1
+SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY = "symbol_exposure_reservation_v1"
+AUTOMATED_MONITORING_SOURCE = "monitoring:intraday_target_stop_monitor"
+AUTOMATED_FAMILY_EXIT_INTENTS = frozenset(
+    {"target_sell", "stop_sell", "max_holding_close_sell"}
+)
+CONCLUSIVE_MONITORING_SESSION_REJECTION_CODES = frozenset(
+    {"KIOK0320", "APBK0918"}
+)
+
+
 @dataclass(frozen=True)
 class PlaceBrokerOrderResult:
     status_code: int
@@ -229,9 +263,317 @@ class AutomatedKisSellMarketEvidence:
 
 
 @dataclass(frozen=True)
+class AutomatedKisBuySymbolExposureFailure:
+    block_reason: str
+    message: str
+    metrics: dict[str, object]
+
+
+@dataclass(frozen=True)
+class AutomatedKisOppositeOrderFailure:
+    block_reason: str
+    message: str
+    metrics: dict[str, object]
+
+
+@dataclass(frozen=True)
 class ScopedLocalOrderSelection:
     matching_orders: tuple[BrokerOrder, ...]
     indeterminate_order: BrokerOrder | None = None
+
+
+@dataclass(frozen=True)
+class OpenBuyReservationResolution:
+    broker_open_notional: Decimal
+    local_unmatched_notional: Decimal
+    broker_unknown_count: int
+    local_unknown_count: int
+
+
+@dataclass(frozen=True)
+class AutomatedBuyLaneInventoryFailure:
+    block_reason: str
+    message: str
+    manual_review_required: bool
+    metrics: dict[str, object]
+
+
+@dataclass(frozen=True)
+class StrategyFamilyLedgerReplay:
+    family_balances: dict[tuple[str, str], Decimal]
+    family_bought: dict[tuple[str, str], Decimal]
+    family_sold: dict[tuple[str, str], Decimal]
+    total_position: Decimal
+    error_kind: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class RejectedOrderRetryLineageProof:
+    job: ExecutionJob
+    failure: ExecutionFailure
+    source_order: BrokerOrder
+    root_order: BrokerOrder
+    source_scope: dict[str, object]
+    source_route: FifoRouteScope
+    automated_monitoring_family_identity: dict[str, object] | None = None
+    automated_monitoring_family_error: str | None = None
+
+
+def _normalized_strategy_lane(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    lane = value.strip().casefold()
+    return lane or None
+
+
+def _strategy_entry_family_identity(
+    plan_item: ExecutionPlanItem | None,
+) -> dict[str, object] | None:
+    """Return the exact strategy-owned inventory identity for an order.
+
+    The broker account remains aggregate, but automated entry duplication and
+    exits must be resolved inside the originating decision lane and entry
+    family.  Missing lane or family evidence is never inferred from symbol.
+    """
+
+    if plan_item is None:
+        return None
+    family_key = plan_item_entry_family_key(plan_item)
+    decision_lane = _normalized_strategy_lane(
+        plan_item_decision_agent_name(plan_item)
+    )
+    if family_key is None or decision_lane is None:
+        return None
+    return {
+        "policy_version": STRATEGY_ENTRY_FAMILY_POLICY_VERSION,
+        "entry_family_key": family_key,
+        "decision_lane": decision_lane,
+    }
+
+
+def _canonical_strategy_entry_family_identity(
+    value: object,
+) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    family_key = value.get("entry_family_key")
+    lane = value.get("decision_lane")
+    if (
+        value.get("policy_version") != STRATEGY_ENTRY_FAMILY_POLICY_VERSION
+        or not isinstance(family_key, str)
+        or not family_key.strip()
+        or not isinstance(lane, str)
+    ):
+        return None
+    normalized_lane = _normalized_strategy_lane(lane)
+    if normalized_lane is None:
+        return None
+    return {
+        "policy_version": STRATEGY_ENTRY_FAMILY_POLICY_VERSION,
+        "entry_family_key": family_key.strip(),
+        "decision_lane": normalized_lane,
+    }
+
+
+def _persisted_order_strategy_family_identity(
+    order: BrokerOrder,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Read family ownership only when both immutable command copies agree."""
+
+    request_metadata = (
+        order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    )
+    routed_metadata = request_metadata.get("metadata")
+    original_command = request_metadata.get("original_command")
+    original_metadata = (
+        original_command.get("metadata")
+        if isinstance(original_command, dict)
+        else None
+    )
+    routed_identity = (
+        routed_metadata.get(STRATEGY_ENTRY_FAMILY_METADATA_KEY)
+        if isinstance(routed_metadata, dict)
+        else None
+    )
+    original_identity = (
+        original_metadata.get(STRATEGY_ENTRY_FAMILY_METADATA_KEY)
+        if isinstance(original_metadata, dict)
+        else None
+    )
+    routed_canonical = _canonical_strategy_entry_family_identity(routed_identity)
+    original_canonical = _canonical_strategy_entry_family_identity(original_identity)
+    if routed_canonical is None or original_canonical is None:
+        return None, "strategy_family_persisted_identity_unavailable"
+    if (
+        routed_canonical != original_canonical
+        or routed_identity != routed_canonical
+        or original_identity != original_canonical
+    ):
+        return None, "strategy_family_persisted_identity_mismatch"
+    return routed_canonical, None
+
+
+def _validated_order_strategy_family_identity(
+    order: BrokerOrder,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Cross-check immutable command ownership against the current plan row."""
+
+    persisted_identity, persisted_error = (
+        _persisted_order_strategy_family_identity(order)
+    )
+    current_identity = _strategy_entry_family_identity(order.plan_item)
+    if persisted_error is not None:
+        return None, persisted_error
+    if current_identity is None or current_identity != persisted_identity:
+        return None, "strategy_family_persisted_identity_mismatch"
+    return persisted_identity, None
+
+
+def _is_automated_monitoring_order(
+    *,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+) -> bool:
+    if request_source != AUTOMATED_MONITORING_SOURCE or plan_item is None:
+        return False
+    if command.execution_plan_item_id != plan_item.id:
+        return False
+    if (
+        command.provider != "kis"
+        or command.asset_class != "stock"
+        or command.exchange not in KRX_EXCHANGES
+    ):
+        return False
+    return bool(
+        (command.side == "buy" and is_watch_buy_intent(plan_item.intent))
+        or (
+            command.side == "sell"
+            and plan_item.intent in AUTOMATED_FAMILY_EXIT_INTENTS
+        )
+    )
+
+
+def _is_trusted_automated_watch_buy(
+    *,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+) -> bool:
+    """Identify internal KRX watch-buy paths that require the final lane gate."""
+
+    return bool(
+        adapter.provider == "kis"
+        and command.provider == "kis"
+        and command.side == "buy"
+        and command.asset_class == "stock"
+        and command.exchange in KRX_EXCHANGES
+        and plan_item is not None
+        and command.execution_plan_item_id == plan_item.id
+        and is_watch_buy_intent(plan_item.intent)
+        and any(
+            request_source.startswith(prefix)
+            for prefix in ACCOUNT_DRAWDOWN_RECOVERY_AUTOMATED_SOURCE_PREFIXES
+        )
+    )
+
+
+def _bind_server_owned_watch_buy_identity(
+    *,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+) -> tuple[PlaceOrderRequest, tuple[str, str] | None]:
+    """Persist exact plan-owned lane identity for every internal watch-buy source."""
+
+    if not _is_trusted_automated_watch_buy(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+    ):
+        return command, None
+    expected_identity = _strategy_entry_family_identity(plan_item)
+    if expected_identity is None:
+        return command, (
+            "strategy_family_lineage_unavailable",
+            "automated watch buy lacks exact strategy lane lineage",
+        )
+    metadata = dict(command.metadata or {})
+    supplied_identity = metadata.get(STRATEGY_ENTRY_FAMILY_METADATA_KEY)
+    if supplied_identity is not None and supplied_identity != expected_identity:
+        return command, (
+            "strategy_family_identity_mismatch",
+            "automated watch buy strategy identity conflicts with its plan item",
+        )
+    metadata[STRATEGY_ENTRY_FAMILY_METADATA_KEY] = expected_identity
+    return command.model_copy(update={"metadata": metadata}), None
+
+
+def _automated_strategy_identity_error(
+    *,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    retry_lineage_proof: RejectedOrderRetryLineageProof | None = None,
+) -> tuple[str, str] | None:
+    if not _is_trusted_automated_family_sell(
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+        retry_lineage_proof=retry_lineage_proof,
+    ):
+        return None
+    expected = _strategy_entry_family_identity(plan_item)
+    if expected is None:
+        return (
+            "strategy_family_lineage_unavailable",
+            "automated monitoring order lacks exact strategy family lineage",
+        )
+    metadata = command.metadata if isinstance(command.metadata, dict) else {}
+    supplied = metadata.get(STRATEGY_ENTRY_FAMILY_METADATA_KEY)
+    if supplied != expected:
+        return (
+            "strategy_family_identity_mismatch",
+            "automated monitoring order strategy family identity does not match its plan item",
+        )
+    return None
+
+
+def _manual_review_strategy_boundary_result(
+    *,
+    db: Session,
+    plan_item: ExecutionPlanItem | None,
+    block_reason: str,
+    message: str,
+) -> PlaceBrokerOrderResult:
+    if plan_item is not None:
+        set_plan_item_status(
+            db=db,
+            plan_item=plan_item,
+            status="manual_review_required",
+            source="broker_order_service",
+            event_type="strategy_family_boundary_manual_review",
+            reason=message,
+            payload={
+                "block_reason": block_reason,
+                "broker_call_started": False,
+            },
+        )
+        db.commit()
+    return PlaceBrokerOrderResult(
+        status_code=409,
+        payload={
+            "duplicate": False,
+            "message": message,
+            "block_reason": block_reason,
+            "manual_review_required": True,
+            "permanent_rejection": True,
+        },
+    )
 
 
 def inspect_account_drawdown_recovery(
@@ -840,6 +1182,14 @@ def _place_broker_order_serialized(
             request_source=request_source,
         )
     )
+    rejected_retry_lineage_proof = _rejected_order_retry_lineage_proof(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+    )
 
     if (
         command.side == "buy"
@@ -864,7 +1214,9 @@ def _place_broker_order_serialized(
 
     monitoring_sell_cap_error = _monitoring_sell_quantity_cap_error(
         command=command,
+        plan_item=plan_item,
         request_source=request_source,
+        retry_lineage_proof=rejected_retry_lineage_proof,
     )
     if monitoring_sell_cap_error is not None:
         block_reason, message = monitoring_sell_cap_error
@@ -877,6 +1229,21 @@ def _place_broker_order_serialized(
                 "permanent_rejection": True,
                 "rejection_reason": message,
             },
+        )
+
+    strategy_identity_error = _automated_strategy_identity_error(
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+        retry_lineage_proof=rejected_retry_lineage_proof,
+    )
+    if strategy_identity_error is not None:
+        block_reason, message = strategy_identity_error
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason=block_reason,
+            message=message,
         )
 
     if command.side == "buy" and not _is_new_buy_order(
@@ -1283,6 +1650,7 @@ def _place_broker_order_serialized(
         routed_command=routed_command,
         request_source=request_source,
         observed_at=observed_at,
+        retry_lineage_proof=rejected_retry_lineage_proof,
     )
     if rejected_retry_route_guard is not None:
         return rejected_retry_route_guard
@@ -1305,6 +1673,33 @@ def _place_broker_order_serialized(
         routed_command = routed_command.model_copy(
             update={"venue": adapter.provider}
         )
+    routed_command, watch_buy_identity_error = (
+        _bind_server_owned_watch_buy_identity(
+            adapter=adapter,
+            command=routed_command,
+            plan_item=plan_item,
+            request_source=request_source,
+        )
+    )
+    if watch_buy_identity_error is not None:
+        block_reason, message = watch_buy_identity_error
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason=block_reason,
+            message=message,
+        )
+    if _is_trusted_automated_watch_buy(
+        adapter=adapter,
+        command=routed_command,
+        plan_item=plan_item,
+        request_source=request_source,
+    ):
+        original_metadata = dict(command.metadata or {})
+        original_metadata[STRATEGY_ENTRY_FAMILY_METADATA_KEY] = (
+            routed_command.metadata or {}
+        )[STRATEGY_ENTRY_FAMILY_METADATA_KEY]
+        command = command.model_copy(update={"metadata": original_metadata})
     strategy_execution_scope_required = _is_trusted_alpaca_strategy_source(
         request_source
     )
@@ -1454,6 +1849,22 @@ def _place_broker_order_serialized(
         command=routed_command,
         execution_scope=prepared_execution_scope,
     )
+    lane_boundary_block = _evaluate_automated_buy_lane_boundary(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=routed_command,
+        plan_item=plan_item,
+        request_source=request_source,
+        execution_scope=prepared_execution_scope,
+        exclude_order_id=(
+            retryable_safety_fenced_order.id
+            if retryable_safety_fenced_order is not None
+            else None
+        ),
+    )
+    if lane_boundary_block is not None:
+        return lane_boundary_block
     quarantine_block = _kis_us_otc_quarantine_block(
         settings=settings,
         db=db,
@@ -1651,6 +2062,8 @@ def _place_broker_order_serialized(
         adapter=adapter,
         command=routed_command,
         execution_scope=prepared_execution_scope,
+        plan_item=plan_item,
+        request_source=request_source,
     )
     if unresolved_selection.indeterminate_order is not None:
         return _reservation_scope_indeterminate_result(
@@ -1672,6 +2085,45 @@ def _place_broker_order_serialized(
             },
         )
 
+    prepared_sell_snapshot: BrokerAccountSnapshot | None = None
+    prepared_sell_snapshot_error: str | None = None
+    if routed_command.side == "sell" and adapter.provider == "kis":
+        if prepared_broker_session_exception is not None or prepared_broker_session is None:
+            prepared_sell_snapshot_error = (
+                prepared_broker_session_error
+                or "broker authentication failed before position verification"
+            )
+        else:
+            try:
+                prepared_sell_snapshot = adapter.get_account_snapshot(
+                    prepared_broker_session.access_token or "",
+                    symbols=[routed_command.symbol],
+                    exchange=routed_command.exchange,
+                )
+            except Exception as exc:
+                prepared_sell_snapshot_error = safe_broker_error_message(exc)
+
+    family_sell_reservation_block = _evaluate_automated_family_sell_boundary(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=routed_command,
+        plan_item=plan_item,
+        request_source=request_source,
+        execution_scope=prepared_execution_scope,
+        account_snapshot=prepared_sell_snapshot,
+        account_snapshot_error=prepared_sell_snapshot_error,
+        retry_lineage_proof=rejected_retry_lineage_proof,
+        exclude_order_id=(
+            retryable_safety_fenced_order.id
+            if retrying_proven_pre_submit_failure
+            and retryable_safety_fenced_order is not None
+            else None
+        ),
+    )
+    if family_sell_reservation_block is not None:
+        return family_sell_reservation_block
+
     sell_reservation_block = (
         None
         if prepared_broker_session_exception is not None
@@ -1684,6 +2136,9 @@ def _place_broker_order_serialized(
             execution_scope=prepared_execution_scope,
             session_state=prepared_broker_session,
             session_error=prepared_broker_session_error,
+            account_snapshot=prepared_sell_snapshot,
+            account_snapshot_error=prepared_sell_snapshot_error,
+            retry_lineage_proof=rejected_retry_lineage_proof,
             exclude_order_id=(
                 retryable_safety_fenced_order.id
                 if retrying_proven_pre_submit_failure
@@ -2004,6 +2459,18 @@ def _place_broker_order_serialized(
             else {}
         ),
     }
+    symbol_exposure_reservation = (
+        _automated_kis_symbol_exposure_reservation_payload(
+            adapter=adapter,
+            command=routed_command,
+            plan_item=plan_item,
+            request_source=request_source,
+        )
+    )
+    if symbol_exposure_reservation is not None:
+        request_metadata[SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY] = (
+            symbol_exposure_reservation
+        )
     request_metadata = _preserve_canonical_execution_scope(
         request_metadata=request_metadata,
         existing_order=(
@@ -2282,6 +2749,36 @@ def _place_broker_order_serialized(
             plan_item=plan_item,
             request_source=request_source,
         )
+        (
+            symbol_exposure_snapshot,
+            symbol_exposure_snapshot_error,
+        ) = _load_automated_kis_symbol_exposure_snapshot(
+            adapter=adapter,
+            access_token=session_state.access_token or "",
+            command=routed_command,
+            plan_item=plan_item,
+            request_source=request_source,
+        )
+        if _requires_automated_kis_symbol_exposure_boundary(
+            adapter=adapter,
+            command=routed_command,
+            plan_item=plan_item,
+            request_source=request_source,
+        ):
+            opposite_order_snapshot = symbol_exposure_snapshot
+            opposite_order_snapshot_error = symbol_exposure_snapshot_error
+        else:
+            (
+                opposite_order_snapshot,
+                opposite_order_snapshot_error,
+            ) = _load_automated_kis_opposite_order_snapshot(
+                adapter=adapter,
+                access_token=session_state.access_token or "",
+                command=routed_command,
+                plan_item=plan_item,
+                request_source=request_source,
+                retry_lineage_proof=rejected_retry_lineage_proof,
+            )
         # Loading broker evidence happens after the durable intent commit,
         # which releases transaction-scoped PostgreSQL locks. Reacquire the
         # exact account/currency scope before any final authority checks.
@@ -2763,6 +3260,40 @@ def _place_broker_order_serialized(
             final_command_metadata["final_broker_command"] = (
                 _order_command_payload(routed_command)
             )
+            final_symbol_exposure_reservation = (
+                _automated_kis_symbol_exposure_reservation_payload(
+                    adapter=adapter,
+                    command=routed_command,
+                    plan_item=plan_item,
+                    request_source=request_source,
+                )
+            )
+            if (
+                _requires_automated_kis_symbol_exposure_boundary(
+                    adapter=adapter,
+                    command=routed_command,
+                    plan_item=plan_item,
+                    request_source=request_source,
+                )
+                and final_symbol_exposure_reservation is None
+            ):
+                return _persist_runtime_safety_fence(
+                    settings=settings,
+                    db=db,
+                    order=order,
+                    plan_item=plan_item,
+                    command=routed_command,
+                    control_state=control_state,
+                    block_reason_override="buy_capital_reservation",
+                    message_override=(
+                        "final automated buy price cannot be converted into an "
+                        "exact durable cash reservation"
+                    ),
+                )
+            if final_symbol_exposure_reservation is not None:
+                final_command_metadata[SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY] = (
+                    final_symbol_exposure_reservation
+                )
             order.request_metadata = _redacted_payload(final_command_metadata) or {}
             order.limit_price = routed_command.limit_price
             db.add(order)
@@ -2777,6 +3308,36 @@ def _place_broker_order_serialized(
             # The commit above releases PostgreSQL transaction advisory locks
             # and all row locks. Reacquire every serialization/authority fence
             # and validate the committed intent before calling the broker.
+            (
+                symbol_exposure_snapshot,
+                symbol_exposure_snapshot_error,
+            ) = _load_automated_kis_symbol_exposure_snapshot(
+                adapter=adapter,
+                access_token=session_state.access_token or "",
+                command=routed_command,
+                plan_item=plan_item,
+                request_source=request_source,
+            )
+            if _requires_automated_kis_symbol_exposure_boundary(
+                adapter=adapter,
+                command=routed_command,
+                plan_item=plan_item,
+                request_source=request_source,
+            ):
+                opposite_order_snapshot = symbol_exposure_snapshot
+                opposite_order_snapshot_error = symbol_exposure_snapshot_error
+            else:
+                (
+                    opposite_order_snapshot,
+                    opposite_order_snapshot_error,
+                ) = _load_automated_kis_opposite_order_snapshot(
+                    adapter=adapter,
+                    access_token=session_state.access_token or "",
+                    command=routed_command,
+                    plan_item=plan_item,
+                    request_source=request_source,
+                    retry_lineage_proof=rejected_retry_lineage_proof,
+                )
             _acquire_cross_process_order_intent_lock(
                 settings=settings,
                 db=db,
@@ -3117,6 +3678,273 @@ def _place_broker_order_serialized(
                         else None
                     ),
                 )
+        opposite_order_failure = _automated_kis_opposite_order_boundary_failure(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            command=routed_command,
+            plan_item=plan_item,
+            request_source=request_source,
+            retry_lineage_proof=rejected_retry_lineage_proof,
+            execution_scope=current_execution_scope,
+            snapshot=opposite_order_snapshot,
+            snapshot_error=opposite_order_snapshot_error,
+            exclude_order_id=order.id,
+            observed_at=datetime.now(UTC),
+            operation_reference_at=(
+                snapshot_freshness_reference_at
+                + timedelta(seconds=max(0.0, monotonic() - submission_started))
+            ),
+        )
+        if opposite_order_failure is not None:
+            fenced = _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=opposite_order_failure.block_reason,
+                message_override=opposite_order_failure.message,
+                retry_after_at_override=(
+                    datetime.now(UTC)
+                    + timedelta(
+                        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                    )
+                ),
+                plan_item_status_override=(
+                    (
+                        "next_open_buy_retry_pending"
+                        if plan_item is not None
+                        and plan_item.intent == "next_open_buy"
+                        else "watch_buy_triggered_blocked"
+                    )
+                    if routed_command.side == "buy"
+                    else (
+                        f"{plan_item.intent}_monitoring"
+                        if plan_item is not None
+                        else None
+                    )
+                ),
+            )
+            return PlaceBrokerOrderResult(
+                status_code=fenced.status_code,
+                payload={
+                    **fenced.payload,
+                    "opposite_order_boundary": opposite_order_failure.metrics,
+                },
+            )
+        final_family_sell_failure = _evaluate_automated_family_sell_boundary(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            command=routed_command,
+            plan_item=plan_item,
+            request_source=request_source,
+            execution_scope=current_execution_scope,
+            account_snapshot=opposite_order_snapshot,
+            account_snapshot_error=opposite_order_snapshot_error,
+            retry_lineage_proof=rejected_retry_lineage_proof,
+            exclude_order_id=order.id,
+        )
+        if final_family_sell_failure is not None:
+            manual_review_required = bool(
+                final_family_sell_failure.payload.get("manual_review_required")
+            )
+            fenced = _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=str(
+                    final_family_sell_failure.payload.get("block_reason")
+                    or "strategy_family_inventory_indeterminate"
+                ),
+                message_override=str(
+                    final_family_sell_failure.payload.get("message")
+                    or "strategy family inventory changed before broker submission"
+                ),
+                retry_after_at_override=(
+                    None
+                    if manual_review_required
+                    else datetime.now(UTC)
+                    + timedelta(
+                        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                    )
+                ),
+                plan_item_status_override=(
+                    None
+                    if manual_review_required
+                    else (
+                        f"{plan_item.intent}_monitoring"
+                        if plan_item is not None
+                        else None
+                    )
+                ),
+                preserve_plan_item_status=manual_review_required,
+                retryable_override=not manual_review_required,
+                permanent_rejection=manual_review_required,
+            )
+            return PlaceBrokerOrderResult(
+                status_code=fenced.status_code,
+                payload={
+                    **fenced.payload,
+                    "manual_review_required": manual_review_required,
+                    "strategy_family_inventory": (
+                        final_family_sell_failure.payload
+                    ),
+                },
+            )
+        final_cash_decision = _evaluate_final_automated_buy_cash_boundary(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            command=routed_command,
+            plan_item=plan_item,
+            request_source=request_source,
+            execution_scope=current_execution_scope,
+            snapshot=symbol_exposure_snapshot,
+            snapshot_error=symbol_exposure_snapshot_error,
+            exclude_order_id=order.id,
+            observed_at=final_market_reference_at,
+        )
+        if final_cash_decision is not None and not final_cash_decision.allowed:
+            fenced = _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=final_cash_decision.gate_name,
+                message_override=final_cash_decision.reason,
+                retry_after_at_override=(
+                    datetime.now(UTC)
+                    + timedelta(
+                        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                    )
+                ),
+                plan_item_status_override=(
+                    "next_open_buy_retry_pending"
+                    if plan_item is not None and plan_item.intent == "next_open_buy"
+                    else "watch_buy_triggered_blocked"
+                ),
+            )
+            return PlaceBrokerOrderResult(
+                status_code=fenced.status_code,
+                payload={
+                    **fenced.payload,
+                    "buy_capital_reservation": final_cash_decision.payload,
+                },
+            )
+
+        lane_inventory_failure = _automated_buy_lane_inventory_failure(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            command=routed_command,
+            plan_item=plan_item,
+            request_source=request_source,
+            execution_scope=current_execution_scope,
+            account_snapshot=symbol_exposure_snapshot,
+            account_snapshot_error=symbol_exposure_snapshot_error,
+        )
+        if lane_inventory_failure is not None:
+            manual_review_required = (
+                lane_inventory_failure.manual_review_required
+            )
+            fenced = _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=lane_inventory_failure.block_reason,
+                message_override=lane_inventory_failure.message,
+                retry_after_at_override=(
+                    None
+                    if manual_review_required
+                    else datetime.now(UTC)
+                    + timedelta(
+                        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                    )
+                ),
+                plan_item_status_override=(
+                    "manual_review_required"
+                    if manual_review_required
+                    else (
+                        "next_open_buy_retry_pending"
+                        if plan_item is not None
+                        and plan_item.intent == "next_open_buy"
+                        else "watch_buy_triggered_blocked"
+                    )
+                ),
+                retryable_override=not manual_review_required,
+                permanent_rejection=manual_review_required,
+            )
+            return PlaceBrokerOrderResult(
+                status_code=fenced.status_code,
+                payload={
+                    **fenced.payload,
+                    "manual_review_required": manual_review_required,
+                    "strategy_lane_inventory": lane_inventory_failure.metrics,
+                },
+            )
+
+        symbol_exposure_failure = _evaluate_automated_kis_buy_symbol_exposure_boundary(
+            settings=settings,
+            db=db,
+            adapter=adapter,
+            command=routed_command,
+            plan_item=plan_item,
+            request_source=request_source,
+            execution_scope=current_execution_scope,
+            snapshot=symbol_exposure_snapshot,
+            snapshot_error=symbol_exposure_snapshot_error,
+            exclude_order_id=order.id,
+            # This snapshot is fetched synchronously at the final broker
+            # boundary, so its freshness must be judged against wall-clock
+            # receipt time as well as the operation's monotonic-adjusted
+            # reference (paper/replay dispatches can intentionally be dated).
+            observed_at=datetime.now(UTC),
+            operation_reference_at=(
+                snapshot_freshness_reference_at
+                + timedelta(seconds=max(0.0, monotonic() - submission_started))
+            ),
+        )
+        if symbol_exposure_failure is not None:
+            fenced = _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=symbol_exposure_failure.block_reason,
+                message_override=symbol_exposure_failure.message,
+                retry_after_at_override=(
+                    datetime.now(UTC)
+                    + timedelta(
+                        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                    )
+                ),
+                plan_item_status_override=(
+                    "next_open_buy_retry_pending"
+                    if plan_item is not None and plan_item.intent == "next_open_buy"
+                    else "watch_buy_triggered_blocked"
+                ),
+            )
+            return PlaceBrokerOrderResult(
+                status_code=fenced.status_code,
+                payload={
+                    **fenced.payload,
+                    "symbol_exposure": symbol_exposure_failure.metrics,
+                },
+            )
+
         quarantine_block = _kis_us_otc_quarantine_block(
             settings=settings,
             db=db,
@@ -3441,6 +4269,15 @@ def _place_broker_order_serialized(
         # The account scope was derived locally before submission and is an
         # immutable attribution boundary for fills, PnL, and feedback.
         order_request_metadata["broker_account_scope"] = stable_account_scope
+    stable_symbol_exposure_reservation = pre_ack_request_metadata.get(
+        SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY
+    )
+    if isinstance(stable_symbol_exposure_reservation, dict):
+        # This locally-derived valuation is part of the durable pre-submit
+        # reservation. A broker echo must not replace it after acknowledgement.
+        order_request_metadata[SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY] = (
+            stable_symbol_exposure_reservation
+        )
     if account_gate_decision is not None:
         order_request_metadata["account_drawdown_recovery_policy"] = {
             "policy_version": 1,
@@ -5814,6 +6651,13 @@ def _final_target_sell_stop_integrity_failure(
         return None
     if not proposed_stop.is_finite() or proposed_stop <= 0:
         return None
+    target_route = plan_item_execution_route_key(plan_item)
+    target_inventory_scope = plan_item_inventory_scope_key(plan_item)
+    if target_route is None or target_inventory_scope is None:
+        return (
+            "live_sell_protective_stop_route_unavailable",
+            "trigger-time target sell approval has no exact execution route",
+        )
     terminal_statuses = {
         "agent_rejected",
         "broker_order_failed",
@@ -5840,6 +6684,11 @@ def _final_target_sell_stop_integrity_failure(
         anchor=plan_item,
         candidates=sibling_stops,
     )
+    sibling_stops = [
+        sibling
+        for sibling in sibling_stops
+        if plan_item_inventory_scope_key(sibling) == target_inventory_scope
+    ]
     effective_stop = max(
         (
             sibling.trigger_price
@@ -6896,6 +7745,67 @@ def _select_local_orders_for_execution_scope(
     return ScopedLocalOrderSelection(matching_orders=tuple(matching_orders))
 
 
+def _select_local_orders_for_fifo_inventory_scope(
+    *,
+    orders: list[BrokerOrder],
+    execution_scope: dict[str, object] | None,
+) -> ScopedLocalOrderSelection:
+    """Select physical-inventory peers without relaxing persisted route proof.
+
+    Each order must still contain one internally consistent exact execution
+    scope.  Only after that proof succeeds do KIS domestic order routes fold
+    into their shared account inventory.  Non-KIS and overseas routes retain
+    exact-route matching.
+    """
+
+    expected_exact_scope = _execution_scope_route(execution_scope)
+    expected_inventory_scope = (
+        canonical_fifo_inventory_route_scope(expected_exact_scope)
+        if expected_exact_scope is not None
+        else None
+    )
+    matching_orders: list[BrokerOrder] = []
+    for order in orders:
+        metadata = (
+            order.request_metadata
+            if isinstance(order.request_metadata, dict)
+            else {}
+        )
+        stored_exact_scope = _execution_scope_route(metadata.get("execution_scope"))
+        persisted_exact_scope = fifo_route_scope_from_order(order)
+        if (
+            expected_exact_scope is None
+            or expected_inventory_scope is None
+            or stored_exact_scope is None
+            or persisted_exact_scope is None
+            or stored_exact_scope != persisted_exact_scope
+        ):
+            return ScopedLocalOrderSelection(
+                matching_orders=tuple(matching_orders),
+                indeterminate_order=order,
+            )
+        if (
+            canonical_fifo_inventory_route_scope(stored_exact_scope)
+            == expected_inventory_scope
+        ):
+            matching_orders.append(order)
+    return ScopedLocalOrderSelection(matching_orders=tuple(matching_orders))
+
+
+def _fifo_inventory_position_exchanges(
+    route_scope: FifoRouteScope,
+) -> tuple[str, ...]:
+    inventory_scope = canonical_fifo_inventory_route_scope(route_scope)
+    if (
+        inventory_scope.provider == "kis"
+        and inventory_scope.asset_class == "stock"
+        and inventory_scope.exchange == "KRX"
+        and route_scope.exchange in KRX_EXCHANGES
+    ):
+        return tuple(sorted(KRX_EXCHANGES))
+    return (route_scope.exchange,)
+
+
 def _reservation_scope_indeterminate_result(
     order: BrokerOrder,
 ) -> PlaceBrokerOrderResult:
@@ -6921,6 +7831,8 @@ def _load_unresolved_prior_submission(
     adapter: BrokerAdapter,
     command: PlaceOrderRequest,
     execution_scope: dict[str, object] | None,
+    plan_item: ExecutionPlanItem | None = None,
+    request_source: str = "post:/orders",
 ) -> ScopedLocalOrderSelection:
     """Keep a new key from bypassing an order whose broker outcome is unknown."""
     orders = db.scalars(
@@ -6937,12 +7849,69 @@ def _load_unresolved_prior_submission(
                 )
             ),
         )
+        .options(selectinload(BrokerOrder.plan_item))
         .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc())
     ).all()
-    return _select_local_orders_for_execution_scope(
+    selection = _select_local_orders_for_execution_scope(
         orders=list(orders),
         execution_scope=execution_scope,
     )
+    if selection.indeterminate_order is not None:
+        return selection
+    return ScopedLocalOrderSelection(
+        matching_orders=tuple(
+            order
+            for order in selection.matching_orders
+            if _unresolved_order_conflicts_with_strategy_identity(
+                adapter=adapter,
+                candidate_plan_item=plan_item,
+                prior_order=order,
+                command=command,
+                request_source=request_source,
+            )
+        )
+    )
+
+
+def _unresolved_order_conflicts_with_strategy_identity(
+    *,
+    adapter: BrokerAdapter,
+    candidate_plan_item: ExecutionPlanItem | None,
+    prior_order: BrokerOrder,
+    command: PlaceOrderRequest,
+    request_source: str,
+) -> bool:
+    if _is_trusted_automated_watch_buy(
+        adapter=adapter,
+        command=command,
+        plan_item=candidate_plan_item,
+        request_source=request_source,
+    ):
+        candidate_identity = _strategy_entry_family_identity(candidate_plan_item)
+        prior_identity, prior_identity_error = (
+            _validated_order_strategy_family_identity(prior_order)
+        )
+        if (
+            candidate_identity is None
+            or prior_identity_error is not None
+            or prior_identity is None
+        ):
+            return True
+        return bool(
+            prior_identity["decision_lane"]
+            == candidate_identity["decision_lane"]
+        )
+    if not _is_automated_monitoring_order(
+        command=command,
+        plan_item=candidate_plan_item,
+        request_source=request_source,
+    ):
+        return True
+    candidate_identity = _strategy_entry_family_identity(candidate_plan_item)
+    prior_identity = _strategy_entry_family_identity(prior_order.plan_item)
+    if candidate_identity is None or prior_identity is None:
+        return True
+    return prior_identity == candidate_identity
 
 
 def _local_capital_reserving_orders(
@@ -6955,6 +7924,7 @@ def _local_capital_reserving_orders(
     symbol: str | None = None,
     settlement_currency: str | None = None,
     exclude_order_id: int | None = None,
+    fifo_inventory_scope: bool = False,
 ) -> ScopedLocalOrderSelection:
     query = select(BrokerOrder).where(
         BrokerOrder.mode == settings.runtime_mode,
@@ -6967,6 +7937,15 @@ def _local_capital_reserving_orders(
     if exclude_order_id is not None:
         query = query.where(BrokerOrder.id != exclude_order_id)
     orders = db.scalars(query.order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())).all()
+    if fifo_inventory_scope:
+        if settlement_currency is not None:
+            raise ValueError(
+                "FIFO inventory order selection cannot use currency-only scope"
+            )
+        return _select_local_orders_for_fifo_inventory_scope(
+            orders=list(orders),
+            execution_scope=execution_scope,
+        )
     return _select_local_orders_for_execution_scope(
         orders=list(orders),
         execution_scope=execution_scope,
@@ -7035,8 +8014,37 @@ def _local_unmatched_buy_reservation(
     execution_scope: dict[str, object] | None,
     exclude_order_id: int | None = None,
 ) -> tuple[Decimal, int, BrokerOrder | None]:
-    total = Decimal("0")
-    unknown_count = 0
+    resolution, indeterminate_order = _scoped_open_buy_reservation(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=command,
+        snapshot=snapshot,
+        request_source=request_source,
+        execution_scope=execution_scope,
+        exclude_order_id=exclude_order_id,
+    )
+    if indeterminate_order is not None:
+        return Decimal("0"), 0, indeterminate_order
+    assert resolution is not None
+    return (
+        resolution.local_unmatched_notional,
+        resolution.local_unknown_count,
+        None,
+    )
+
+
+def _scoped_open_buy_reservation(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    snapshot: BrokerAccountSnapshot,
+    request_source: str,
+    execution_scope: dict[str, object] | None,
+    exclude_order_id: int | None = None,
+) -> tuple[OpenBuyReservationResolution | None, BrokerOrder | None]:
     retry_source_order_pk = _trusted_retry_source_order_pk(
         command=command,
         request_source=request_source,
@@ -7054,48 +8062,1042 @@ def _local_unmatched_buy_reservation(
         exclude_order_id=exclude_order_id,
     )
     if selection.indeterminate_order is not None:
-        return Decimal("0"), 0, selection.indeterminate_order
-    for order in selection.matching_orders:
-        if order.id == retry_source_order_pk:
+        return None, selection.indeterminate_order
+    local_orders = tuple(
+        order
+        for order in selection.matching_orders
+        if order.id != retry_source_order_pk
+    )
+    return (
+        _resolve_open_buy_reservations(
+            snapshot=snapshot,
+            local_orders=local_orders,
+        ),
+        None,
+    )
+
+
+def _requires_automated_kis_symbol_exposure_boundary(
+    *,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+) -> bool:
+    return _is_trusted_automated_watch_buy(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+    )
+
+
+def _load_automated_kis_symbol_exposure_snapshot(
+    *,
+    adapter: BrokerAdapter,
+    access_token: str,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+) -> tuple[BrokerAccountSnapshot | None, str | None]:
+    if not _requires_automated_kis_symbol_exposure_boundary(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+    ):
+        return None, None
+    try:
+        return (
+            adapter.get_account_snapshot(
+                access_token,
+                symbols=[command.symbol],
+                exchange=command.exchange or "KRX",
+            ),
+            None,
+        )
+    except Exception as exc:
+        return None, safe_broker_error_message(exc)
+
+
+def _requires_automated_kis_opposite_order_boundary(
+    *,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    retry_lineage_proof: RejectedOrderRetryLineageProof | None,
+) -> bool:
+    if adapter.provider != "kis":
+        return False
+    return bool(
+        _is_trusted_automated_watch_buy(
+            adapter=adapter,
+            command=command,
+            plan_item=plan_item,
+            request_source=request_source,
+        )
+        or _is_trusted_automated_family_sell(
+            command=command,
+            plan_item=plan_item,
+            request_source=request_source,
+            retry_lineage_proof=retry_lineage_proof,
+        )
+    )
+
+
+def _load_automated_kis_opposite_order_snapshot(
+    *,
+    adapter: BrokerAdapter,
+    access_token: str,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    retry_lineage_proof: RejectedOrderRetryLineageProof | None,
+) -> tuple[BrokerAccountSnapshot | None, str | None]:
+    if not _requires_automated_kis_opposite_order_boundary(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+        retry_lineage_proof=retry_lineage_proof,
+    ):
+        return None, None
+    try:
+        return (
+            adapter.get_account_snapshot(
+                access_token,
+                symbols=[command.symbol],
+                exchange=command.exchange or "KRX",
+            ),
+            None,
+        )
+    except Exception as exc:
+        return None, safe_broker_error_message(exc)
+
+
+def _holding_current_market_value(holding: BrokerAccountHolding) -> Decimal | None:
+    if isinstance(holding.quantity, bool):
+        return None
+    if holding.quantity <= 0:
+        return Decimal("0") if holding.quantity == 0 else None
+    payload = holding.payload if isinstance(holding.payload, dict) else {}
+    for key in ("market_value", "valuation", "evaluated_amount", "evlu_amt"):
+        value = _positive_decimal(payload.get(key))
+        if value is not None:
+            return value
+    for key in ("current_price", "prpr", "now_pric", "cur_prc", "stck_prpr"):
+        price = _positive_decimal(payload.get(key))
+        if price is not None:
+            return Decimal(holding.quantity) * price
+    return None
+
+
+def _snapshot_symbol_holding_exposure(
+    *,
+    snapshot: BrokerAccountSnapshot,
+    symbol: str,
+) -> tuple[Decimal, int]:
+    normalized_symbol = symbol.strip().upper()
+    holdings_value = Decimal("0")
+    unknown_count = 0
+    for holding in snapshot.holdings:
+        if holding.symbol.strip().upper() != normalized_symbol:
             continue
-        if any(
-            _same_order_identity(local=order, snapshot=snapshot_order)
-            for snapshot_order in snapshot.open_orders
-        ):
-            continue
-        notional = _local_order_notional(order)
-        if notional is None:
+        value = _holding_current_market_value(holding)
+        if value is None or not value.is_finite() or value < 0:
             unknown_count += 1
         else:
-            total += notional
-    return total, unknown_count, None
+            holdings_value += value
+    return holdings_value, unknown_count
+
+
+def _automated_kis_symbol_exposure_reservation_payload(
+    *,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+) -> dict[str, object] | None:
+    if not _requires_automated_kis_symbol_exposure_boundary(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+    ):
+        return None
+    quantity = command.quantity
+    notional = _order_notional(command=command, plan_item=plan_item)
+    if (
+        isinstance(quantity, bool)
+        or quantity is None
+        or quantity <= 0
+        or notional is None
+        or not notional.is_finite()
+        or notional <= 0
+    ):
+        return None
+    unit_price = notional / Decimal(quantity)
+    if not unit_price.is_finite() or unit_price <= 0:
+        return None
+    return {
+        "policy_version": 1,
+        "provider": command.provider,
+        "exchange": command.exchange,
+        "symbol": command.symbol,
+        "side": command.side,
+        "execution_plan_item_id": command.execution_plan_item_id,
+        "idempotency_key": command.idempotency_key,
+        "quantity": quantity,
+        "unit_price": str(unit_price),
+        "reserved_notional": str(notional),
+    }
+
+
+def _persisted_local_buy_reservation_unit_price(order: BrokerOrder) -> Decimal | None:
+    request_metadata = (
+        order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    )
+    reservation = request_metadata.get(SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY)
+    if not isinstance(reservation, dict) or reservation.get("policy_version") != 1:
+        return None
+    quantity = reservation.get("quantity")
+    if (
+        reservation.get("provider") != order.broker_name
+        or str(reservation.get("symbol") or "").strip().upper()
+        != order.symbol.strip().upper()
+        or reservation.get("side") != "buy"
+        or reservation.get("execution_plan_item_id") != order.execution_plan_item_id
+        or reservation.get("idempotency_key") != order.idempotency_key
+        or isinstance(quantity, bool)
+        or not isinstance(quantity, int)
+        or order.quantity != quantity
+        or quantity <= 0
+    ):
+        return None
+    unit_price = _positive_decimal(reservation.get("unit_price"))
+    notional = _positive_decimal(reservation.get("reserved_notional"))
+    if (
+        unit_price is None
+        or notional is None
+        or unit_price * Decimal(quantity) != notional
+    ):
+        return None
+    return unit_price
+
+
+def _local_order_remaining_buy_notional(order: BrokerOrder) -> Decimal | None:
+    requested_quote_notional = _positive_decimal(order.quote_notional)
+    if (
+        requested_quote_notional is not None
+        and order.quantity is None
+        and order.base_quantity is None
+    ):
+        filled_quote_notional = Decimal("0")
+        for fill in dedupe_execution_fills(list(order.fills)):
+            if str(fill.side or "").strip().lower() != "buy":
+                return None
+            fill_quote_notional = _positive_decimal(fill.quote_notional)
+            if fill_quote_notional is None:
+                return None
+            filled_quote_notional += fill_quote_notional
+        remaining_quote_notional = (
+            requested_quote_notional - filled_quote_notional
+        )
+        if remaining_quote_notional < 0:
+            return None
+        return remaining_quote_notional
+
+    requested: Decimal | None = None
+    require_integral_quantity = False
+    if order.quantity is not None and order.quantity > 0:
+        requested = Decimal(order.quantity)
+        require_integral_quantity = True
+    elif order.base_quantity is not None and order.base_quantity > 0:
+        requested = Decimal(order.base_quantity)
+    if requested is None or not requested.is_finite() or requested <= 0:
+        return None
+    if (
+        require_integral_quantity
+        and requested != requested.to_integral_value(rounding=ROUND_DOWN)
+    ):
+        return None
+    filled = Decimal("0")
+    for fill in dedupe_execution_fills(list(order.fills)):
+        if str(fill.side or "").strip().lower() != "buy":
+            return None
+        quantity = effective_fill_quantity(fill)
+        if not quantity.is_finite() or quantity <= 0:
+            return None
+        if (
+            require_integral_quantity
+            and quantity != quantity.to_integral_value(rounding=ROUND_DOWN)
+        ):
+            return None
+        filled += quantity
+    remaining = requested - filled
+    if remaining < 0:
+        return None
+    if remaining == 0:
+        return Decimal("0")
+    persisted_price = _persisted_local_buy_reservation_unit_price(order)
+    price = _positive_decimal(order.limit_price)
+    if price is not None and persisted_price is not None and price != persisted_price:
+        return None
+    if price is None:
+        price = persisted_price
+    if price is None:
+        return None
+    return remaining * price
+
+
+def _snapshot_open_order_remaining_quantity(
+    order: BrokerAccountOpenOrder,
+) -> Decimal | None:
+    payload = order.payload if isinstance(order.payload, dict) else {}
+    raw_quantity: object
+    if "remaining_base_quantity" in payload:
+        raw_quantity = payload.get("remaining_base_quantity")
+    else:
+        raw_quantity = (
+            order.remaining_quantity
+            if order.remaining_quantity is not None
+            else order.quantity
+        )
+    if isinstance(raw_quantity, bool):
+        return None
+    try:
+        remaining = Decimal(str(raw_quantity).strip())
+    except (DecimalException, TypeError, ValueError):
+        return None
+    if not remaining.is_finite() or remaining < 0:
+        return None
+    return remaining
+
+
+def _order_identity_claims_overlap(
+    *,
+    local: BrokerOrder,
+    snapshot: BrokerAccountOpenOrder,
+) -> bool:
+    return bool(
+        (
+            local.broker_order_id
+            and snapshot.broker_order_id
+            and local.broker_order_id == snapshot.broker_order_id
+        )
+        or (
+            local.idempotency_key
+            and snapshot.idempotency_key
+            and local.idempotency_key == snapshot.idempotency_key
+        )
+    )
+
+
+def _order_identity_claims_conflict(
+    *,
+    local: BrokerOrder,
+    snapshot: BrokerAccountOpenOrder,
+) -> bool:
+    return bool(
+        (
+            local.broker_order_id
+            and snapshot.broker_order_id
+            and local.broker_order_id != snapshot.broker_order_id
+        )
+        or (
+            local.idempotency_key
+            and snapshot.idempotency_key
+            and local.idempotency_key != snapshot.idempotency_key
+        )
+    )
+
+
+def _matched_local_open_buy_reservation_unit_price(
+    *,
+    local: BrokerOrder,
+    snapshot: BrokerAccountOpenOrder,
+    remaining: Decimal,
+) -> Decimal | None:
+    if not _order_identity_claims_overlap(local=local, snapshot=snapshot):
+        return None
+    if _order_identity_claims_conflict(local=local, snapshot=snapshot):
+        return None
+    if (
+        str(local.symbol or "").strip().upper()
+        != str(snapshot.symbol or "").strip().upper()
+        or str(local.side or "").strip().lower() != "buy"
+        or str(snapshot.side or "").strip().lower() != "buy"
+        or isinstance(snapshot.quantity, bool)
+        or not isinstance(snapshot.quantity, int)
+        or snapshot.quantity <= 0
+        or local.quantity != snapshot.quantity
+        or remaining != remaining.to_integral_value(rounding=ROUND_DOWN)
+        or remaining > Decimal(snapshot.quantity)
+    ):
+        return None
+    persisted_price = _persisted_local_buy_reservation_unit_price(local)
+    if persisted_price is None:
+        return None
+    local_limit_price = _positive_decimal(local.limit_price)
+    if local_limit_price is not None and local_limit_price != persisted_price:
+        return None
+    return persisted_price
+
+
+def _resolve_open_buy_reservations(
+    *,
+    snapshot: BrokerAccountSnapshot,
+    local_orders: tuple[BrokerOrder, ...],
+    symbol: str | None = None,
+) -> OpenBuyReservationResolution:
+    normalized_symbol = symbol.strip().upper() if symbol is not None else None
+    broker_notional = Decimal("0")
+    local_notional = Decimal("0")
+    broker_unknown_count = 0
+    local_unknown_count = 0
+    matched_local_ids: set[str] = set()
+
+    for broker_order in snapshot.open_orders:
+        if str(broker_order.side or "").strip().lower() != "buy":
+            continue
+        if (
+            normalized_symbol is not None
+            and str(broker_order.symbol or "").strip().upper()
+            != normalized_symbol
+        ):
+            continue
+        matching_local_orders = [
+            local
+            for local in local_orders
+            if _order_identity_claims_overlap(
+                local=local,
+                snapshot=broker_order,
+            )
+        ]
+        identity_claims_conflict = any(
+            _order_identity_claims_conflict(
+                local=local,
+                snapshot=broker_order,
+            )
+            for local in matching_local_orders
+        )
+        reuses_matched_local = any(
+            order.id in matched_local_ids for order in matching_local_orders
+        )
+        remaining = _snapshot_open_order_remaining_quantity(broker_order)
+        if identity_claims_conflict:
+            if remaining is None or remaining > 0:
+                broker_unknown_count += 1
+            continue
+        matched_local_ids.update(order.id for order in matching_local_orders)
+        if remaining is None:
+            broker_unknown_count += 1
+            continue
+        if len(matching_local_orders) > 1 or reuses_matched_local:
+            broker_unknown_count += 1
+            continue
+        matched_local = (
+            matching_local_orders[0] if matching_local_orders else None
+        )
+        if remaining == 0:
+            continue
+
+        broker_price = _positive_decimal(broker_order.limit_price)
+        if broker_price is None:
+            if matched_local is None:
+                broker_unknown_count += 1
+                continue
+            broker_price = _matched_local_open_buy_reservation_unit_price(
+                local=matched_local,
+                snapshot=broker_order,
+                remaining=remaining,
+            )
+            if broker_price is None:
+                broker_unknown_count += 1
+                continue
+        elif matched_local is not None:
+            local_price = _positive_decimal(matched_local.limit_price)
+            persisted_price = _persisted_local_buy_reservation_unit_price(
+                matched_local
+            )
+            if (
+                (local_price is not None and local_price != broker_price)
+                or (
+                    persisted_price is not None
+                    and persisted_price != broker_price
+                )
+            ):
+                broker_unknown_count += 1
+                continue
+        broker_notional += remaining * broker_price
+
+    for local_order in local_orders:
+        if local_order.id in matched_local_ids:
+            continue
+        notional = _local_order_remaining_buy_notional(local_order)
+        if notional is None:
+            local_unknown_count += 1
+        else:
+            local_notional += notional
+
+    return OpenBuyReservationResolution(
+        broker_open_notional=broker_notional,
+        local_unmatched_notional=local_notional,
+        broker_unknown_count=broker_unknown_count,
+        local_unknown_count=local_unknown_count,
+    )
+
+
+def _self_cross_local_order_remaining_quantity(
+    order: BrokerOrder,
+) -> Decimal | None:
+    requested = order.quantity
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, int)
+        or requested <= 0
+    ):
+        return None
+    raw_fills = list(order.fills)
+    if execution_fills_have_relevant_conflicting_identity(
+        raw_fills,
+        is_relevant=lambda _fill: True,
+    ):
+        return None
+    filled = Decimal("0")
+    try:
+        for fill in dedupe_execution_fills(raw_fills):
+            if str(fill.side or "").strip().lower() != order.side:
+                return None
+            quantity = effective_fill_quantity(fill)
+            if (
+                not quantity.is_finite()
+                or quantity <= 0
+                or quantity != quantity.to_integral_value(rounding=ROUND_DOWN)
+            ):
+                return None
+            filled += quantity
+    except (DecimalException, TypeError, ValueError):
+        return None
+    remaining = Decimal(requested) - filled
+    if (
+        remaining < 0
+        or remaining != remaining.to_integral_value(rounding=ROUND_DOWN)
+    ):
+        return None
+    return remaining
+
+
+def _automated_kis_opposite_order_boundary_failure(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    retry_lineage_proof: RejectedOrderRetryLineageProof | None,
+    execution_scope: dict[str, object] | None,
+    snapshot: BrokerAccountSnapshot | None,
+    snapshot_error: str | None,
+    exclude_order_id: str,
+    observed_at: datetime,
+    operation_reference_at: datetime,
+) -> AutomatedKisOppositeOrderFailure | None:
+    """Fence only opposite orders that can trade against this automated order.
+
+    The strategy lanes own inventory independently, but the broker account can
+    still self-match two orders for the same physical KIS domestic position.
+    This final boundary therefore folds only KRX/NXT/SOR inventory routes for
+    the authenticated account, then permits a proven non-crossing pair while
+    failing closed on crossing, market, or indeterminate opposite-order truth.
+    """
+
+    if not _requires_automated_kis_opposite_order_boundary(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+        retry_lineage_proof=retry_lineage_proof,
+    ):
+        return None
+
+    def indeterminate(
+        message: str,
+        **metrics: object,
+    ) -> AutomatedKisOppositeOrderFailure:
+        return AutomatedKisOppositeOrderFailure(
+            block_reason="opposite_order_truth_indeterminate",
+            message=message,
+            metrics={"truth_complete": False, **metrics},
+        )
+
+    if snapshot_error is not None or snapshot is None:
+        return indeterminate(
+            "automated KIS order cannot verify opposite-side broker orders",
+            snapshot_error=snapshot_error,
+        )
+    fresh_at_receipt = snapshot_is_fresh_for_recovery(
+        observed_at=snapshot.observed_at,
+        now=observed_at,
+        settings=settings,
+    )
+    fresh_at_operation = snapshot_is_fresh_for_recovery(
+        observed_at=snapshot.observed_at,
+        now=operation_reference_at,
+        settings=settings,
+    )
+    snapshot_payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
+    aggregated_open_order_errors = snapshot_payload.get("open_orders_errors")
+    if not (fresh_at_receipt or fresh_at_operation):
+        return indeterminate(
+            "automated KIS opposite-order snapshot is stale or future-dated"
+        )
+    if (
+        not snapshot.open_orders_complete
+        or (
+            isinstance(snapshot_payload.get("open_orders_error"), dict)
+            and snapshot_payload["open_orders_error"].get("degraded") is True
+        )
+        or (
+            isinstance(aggregated_open_order_errors, list)
+            and any(
+                isinstance(error, dict) and error.get("degraded") is True
+                for error in aggregated_open_order_errors
+            )
+        )
+    ):
+        return indeterminate(
+            "automated KIS order requires complete broker open-order truth"
+        )
+
+    opposite_side = "sell" if command.side == "buy" else "buy"
+    selection = _local_capital_reserving_orders(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        side=opposite_side,
+        execution_scope=execution_scope,
+        symbol=command.symbol,
+        exclude_order_id=exclude_order_id,
+        fifo_inventory_scope=True,
+    )
+    if selection.indeterminate_order is not None:
+        return indeterminate(
+            "an active opposite-side order lacks a proven account inventory scope",
+            prior_order_id=selection.indeterminate_order.id,
+        )
+    local_orders = selection.matching_orders
+    normalized_symbol = command.symbol.strip().upper()
+    broker_orders = tuple(
+        broker_order
+        for broker_order in snapshot.open_orders
+        if str(broker_order.side or "").strip().lower() == opposite_side
+        and str(broker_order.symbol or "").strip().upper() == normalized_symbol
+    )
+
+    candidate_price = _positive_decimal(command.limit_price)
+    candidate_is_market = str(command.order_type or "").strip().lower() == "market"
+    if not candidate_is_market and candidate_price is None and (
+        broker_orders or local_orders
+    ):
+        return indeterminate(
+            "the final automated KIS order has no exact executable price"
+        )
+
+    matched_local_ids: set[str] = set()
+    seen_broker_identity_claims: set[tuple[str, str]] = set()
+    crossing_order_count = 0
+    market_or_unknown_price_count = 0
+    active_broker_order_count = 0
+    active_local_only_order_count = 0
+
+    def prices_cross(opposite_price: Decimal | None) -> bool:
+        if candidate_is_market or opposite_price is None:
+            return True
+        assert candidate_price is not None
+        if command.side == "buy":
+            return candidate_price >= opposite_price
+        return opposite_price >= candidate_price
+
+    for broker_order in broker_orders:
+        remaining = _snapshot_open_order_remaining_quantity(broker_order)
+        if (
+            isinstance(broker_order.quantity, bool)
+            or not isinstance(broker_order.quantity, int)
+            or broker_order.quantity <= 0
+            or remaining is None
+            or remaining != remaining.to_integral_value(rounding=ROUND_DOWN)
+            or remaining > Decimal(broker_order.quantity)
+        ):
+            return indeterminate(
+                "an opposite-side broker order has unverifiable remaining quantity"
+            )
+        if remaining == 0:
+            continue
+        active_broker_order_count += 1
+        identity_claims = {
+            ("broker_order_id", str(broker_order.broker_order_id).strip())
+            for _present in [broker_order.broker_order_id]
+            if _present and str(_present).strip()
+        } | {
+            ("idempotency_key", str(broker_order.idempotency_key).strip())
+            for _present in [broker_order.idempotency_key]
+            if _present and str(_present).strip()
+        }
+        if not identity_claims:
+            return indeterminate(
+                "an opposite-side broker order has no durable identity"
+            )
+        if seen_broker_identity_claims.intersection(identity_claims):
+            return indeterminate(
+                "opposite-side broker order identity is duplicated"
+            )
+        seen_broker_identity_claims.update(identity_claims)
+
+        matching_local_orders = [
+            local
+            for local in local_orders
+            if _order_identity_claims_overlap(local=local, snapshot=broker_order)
+        ]
+        if len(matching_local_orders) > 1 or any(
+            local.id in matched_local_ids for local in matching_local_orders
+        ):
+            return indeterminate(
+                "opposite-side broker identity cannot be matched one-to-one locally"
+            )
+        matching_local = (
+            matching_local_orders[0] if matching_local_orders else None
+        )
+        broker_price = _positive_decimal(broker_order.limit_price)
+        if matching_local is not None:
+            if (
+                (
+                    matching_local.broker_order_id
+                    and broker_order.broker_order_id
+                    and matching_local.broker_order_id
+                    != broker_order.broker_order_id
+                )
+                or (
+                    matching_local.idempotency_key
+                    and broker_order.idempotency_key
+                    and matching_local.idempotency_key
+                    != broker_order.idempotency_key
+                )
+            ):
+                return indeterminate(
+                    "opposite-side broker and local identity claims conflict"
+                )
+            local_remaining = _self_cross_local_order_remaining_quantity(
+                matching_local
+            )
+            if local_remaining is None or local_remaining != remaining:
+                return indeterminate(
+                    "opposite-side broker and local remaining quantities conflict"
+                )
+            local_price = _positive_decimal(matching_local.limit_price)
+            if (
+                broker_price is not None
+                and local_price is not None
+                and broker_price != local_price
+            ):
+                return indeterminate(
+                    "opposite-side broker and local executable prices conflict"
+                )
+            matched_local_ids.add(matching_local.id)
+
+        if broker_price is None:
+            market_or_unknown_price_count += 1
+        if prices_cross(broker_price):
+            crossing_order_count += 1
+
+    for local_order in local_orders:
+        if local_order.id in matched_local_ids:
+            continue
+        if not str(local_order.idempotency_key or "").strip():
+            return indeterminate(
+                "an unmatched local opposite-side order has no durable identity"
+            )
+        remaining = _self_cross_local_order_remaining_quantity(local_order)
+        if remaining is None:
+            return indeterminate(
+                "an unmatched local opposite-side order has unverifiable remaining quantity",
+                prior_order_id=local_order.id,
+            )
+        if remaining == 0:
+            continue
+        active_local_only_order_count += 1
+        local_price = _positive_decimal(local_order.limit_price)
+        if local_price is None:
+            market_or_unknown_price_count += 1
+        if prices_cross(local_price):
+            crossing_order_count += 1
+
+    metrics: dict[str, object] = {
+        "truth_complete": True,
+        "candidate_side": command.side,
+        "opposite_side": opposite_side,
+        "broker_active_order_count": active_broker_order_count,
+        "local_unmatched_active_order_count": active_local_only_order_count,
+        "crossing_order_count": crossing_order_count,
+        "market_or_unknown_price_count": market_or_unknown_price_count,
+    }
+    if crossing_order_count == 0:
+        return None
+    return AutomatedKisOppositeOrderFailure(
+        block_reason="opposite_order_self_cross_risk",
+        message=(
+            "automated KIS order was deferred because an active opposite-side "
+            "order could self-match in the same account"
+        ),
+        metrics=metrics,
+    )
+
+
+def _evaluate_automated_kis_buy_symbol_exposure_boundary(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    execution_scope: dict[str, object] | None,
+    snapshot: BrokerAccountSnapshot | None,
+    snapshot_error: str | None,
+    exclude_order_id: str,
+    observed_at: datetime,
+    operation_reference_at: datetime,
+) -> AutomatedKisBuySymbolExposureFailure | None:
+    if not _requires_automated_kis_symbol_exposure_boundary(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+    ):
+        return None
+
+    def indeterminate(message: str, **metrics: object) -> AutomatedKisBuySymbolExposureFailure:
+        return AutomatedKisBuySymbolExposureFailure(
+            block_reason="symbol_exposure_indeterminate",
+            message=message,
+            metrics={"unknown_exposure": True, **metrics},
+        )
+
+    if snapshot_error is not None or snapshot is None:
+        return indeterminate(
+            "automated KIS buy cannot verify final symbol exposure from the broker",
+            snapshot_error=snapshot_error,
+        )
+    fresh_at_receipt = snapshot_is_fresh_for_recovery(
+        observed_at=snapshot.observed_at,
+        now=observed_at,
+        settings=settings,
+    )
+    fresh_at_operation = snapshot_is_fresh_for_recovery(
+        observed_at=snapshot.observed_at,
+        now=operation_reference_at,
+        settings=settings,
+    )
+    if not (fresh_at_receipt or fresh_at_operation):
+        return indeterminate("automated KIS buy account snapshot is stale or future-dated")
+    snapshot_payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
+    aggregated_open_order_errors = snapshot_payload.get("open_orders_errors")
+    if (
+        not snapshot.holdings_complete
+        or not snapshot.open_orders_complete
+        or (
+            isinstance(snapshot_payload.get("open_orders_error"), dict)
+            and snapshot_payload["open_orders_error"].get("degraded") is True
+        )
+        or (
+            isinstance(aggregated_open_order_errors, list)
+            and any(
+                isinstance(error, dict) and error.get("degraded") is True
+                for error in aggregated_open_order_errors
+            )
+        )
+    ):
+        return indeterminate(
+            "automated KIS buy requires complete holdings and open-order truth"
+        )
+
+    selection = _local_capital_reserving_orders(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        side="buy",
+        execution_scope=execution_scope,
+        symbol=command.symbol,
+        settlement_currency="KRW",
+        exclude_order_id=exclude_order_id,
+    )
+    if selection.indeterminate_order is not None:
+        return indeterminate(
+            "an active symbol buy lacks a proven exact execution scope",
+            prior_order_id=selection.indeterminate_order.id,
+        )
+    reservation = _resolve_open_buy_reservations(
+        snapshot=snapshot,
+        local_orders=selection.matching_orders,
+        symbol=command.symbol,
+    )
+    holdings_value, holdings_unknown_count = _snapshot_symbol_holding_exposure(
+        snapshot=snapshot,
+        symbol=command.symbol,
+    )
+    broker_open_value = reservation.broker_open_notional
+    local_open_value = reservation.local_unmatched_notional
+    snapshot_unknown_count = (
+        holdings_unknown_count + reservation.broker_unknown_count
+    )
+    local_unknown_count = reservation.local_unknown_count
+
+    candidate_value = _order_notional(command=command, plan_item=plan_item)
+    if (
+        candidate_value is None
+        or not candidate_value.is_finite()
+        or candidate_value <= 0
+        or snapshot_unknown_count > 0
+        or local_unknown_count > 0
+    ):
+        return indeterminate(
+            "automated KIS buy cannot prove every symbol exposure component",
+            snapshot_unknown_count=snapshot_unknown_count,
+            local_unknown_count=local_unknown_count,
+        )
+
+    account_basis = _positive_decimal(snapshot.total_asset_value)
+    account_basis_source = "broker_total_asset_value"
+    if account_basis is None:
+        orderable_cash = [
+            value
+            for value in (
+                _positive_decimal(snapshot.available_cash),
+                _positive_decimal(snapshot.buying_power),
+            )
+            if value is not None
+        ]
+        if not orderable_cash:
+            return indeterminate(
+                "automated KIS buy cannot verify the broker account allocation basis"
+            )
+        account_basis = min(orderable_cash)
+        account_basis_source = "broker_orderable_cash"
+    cap_candidates = {
+        "configured_symbol_budget": Decimal(settings.exec_agent_max_symbol_budget),
+        "position_allocation_cap": (
+            account_basis * Decimal(settings.exec_agent_max_position_allocation_pct)
+        ),
+        "symbol_exposure_cap": (
+            account_basis * Decimal(settings.exec_agent_max_symbol_exposure_pct)
+        ),
+        "symbol_total_exposure_cap": (
+            account_basis * Decimal(settings.exec_agent_max_symbol_total_exposure_pct)
+        ),
+    }
+    if any(not value.is_finite() or value <= 0 for value in cap_candidates.values()):
+        return indeterminate("automated KIS buy has an invalid configured symbol cap")
+    symbol_cap = min(cap_candidates.values())
+    projected_value = (
+        holdings_value + broker_open_value + local_open_value + candidate_value
+    )
+    metrics: dict[str, object] = {
+        "account_basis": str(account_basis),
+        "account_basis_source": account_basis_source,
+        "holdings_current_value": str(holdings_value),
+        "broker_open_buy_remaining_notional": str(broker_open_value),
+        "local_unmatched_buy_remaining_notional": str(local_open_value),
+        "candidate_notional": str(candidate_value),
+        "projected_symbol_exposure": str(projected_value),
+        "symbol_exposure_cap": str(symbol_cap),
+        "cap_candidates": {key: str(value) for key, value in cap_candidates.items()},
+        "broker_open_orders_counted_in_symbol_exposure": True,
+        "broker_open_orders_reapplied_to_buying_power": False,
+    }
+    if projected_value <= symbol_cap:
+        return None
+    return AutomatedKisBuySymbolExposureFailure(
+        block_reason="symbol_exposure_cap_exceeded",
+        message=(
+            "automated KIS buy would exceed the aggregate per-symbol exposure cap"
+        ),
+        metrics=metrics,
+    )
+
+
+def _evaluate_final_automated_buy_cash_boundary(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    execution_scope: dict[str, object] | None,
+    snapshot: BrokerAccountSnapshot | None,
+    snapshot_error: str | None,
+    exclude_order_id: str,
+    observed_at: datetime,
+) -> AccountDrawdownDecision | None:
+    """Recheck aggregate cash after the final executable price is durable."""
+
+    if not _requires_automated_kis_symbol_exposure_boundary(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+    ):
+        return None
+    if snapshot_error is not None or snapshot is None:
+        return account_drawdown_uncertain_decision(
+            order_idempotency_key=command.idempotency_key,
+            execution_plan_item_id=(
+                plan_item.id if plan_item is not None else command.execution_plan_item_id
+            ),
+            reason=(
+                "final buy capital reservation cannot verify the broker account "
+                f"snapshot: {snapshot_error or 'snapshot unavailable'}"
+            ),
+            now=observed_at,
+        )
+    reservation, indeterminate_order = _scoped_open_buy_reservation(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=command,
+        snapshot=snapshot,
+        request_source=request_source,
+        execution_scope=execution_scope,
+        exclude_order_id=exclude_order_id,
+    )
+    if indeterminate_order is not None:
+        return _reservation_scope_indeterminate_decision(
+            command=command,
+            plan_item=plan_item,
+            order=indeterminate_order,
+            observed_at=observed_at,
+        )
+    assert reservation is not None
+    return _buy_capital_reservation_decision(
+        settings=settings,
+        snapshot=snapshot,
+        command=command,
+        plan_item=plan_item,
+        local_open_buy_notional=reservation.local_unmatched_notional,
+        local_open_buy_unknown_count=reservation.local_unknown_count,
+        observed_at=observed_at,
+        open_buy_reservation=reservation,
+    )
 
 
 def _snapshot_open_buy_reservation(snapshot: BrokerAccountSnapshot) -> tuple[Decimal, int]:
-    total = Decimal("0")
-    unknown_count = 0
-    for order in snapshot.open_orders:
-        if order.side.lower() != "buy":
-            continue
-        payload = order.payload if isinstance(order.payload, dict) else {}
-        if "remaining_base_quantity" in payload:
-            try:
-                remaining = Decimal(str(payload["remaining_base_quantity"]).strip())
-            except (DecimalException, TypeError, ValueError):
-                unknown_count += 1
-                continue
-            if not remaining.is_finite() or remaining < 0:
-                unknown_count += 1
-                continue
-        else:
-            remaining = Decimal(order.remaining_quantity or order.quantity)
-        if remaining <= 0:
-            continue
-        if order.limit_price is None or order.limit_price <= 0:
-            unknown_count += 1
-        else:
-            total += remaining * order.limit_price
-    return total, unknown_count
+    resolution = _resolve_open_buy_reservations(
+        snapshot=snapshot,
+        local_orders=(),
+    )
+    return resolution.broker_open_notional, resolution.broker_unknown_count
 
 
 def _buy_capital_reservation_decision(
@@ -7107,6 +9109,7 @@ def _buy_capital_reservation_decision(
     local_open_buy_notional: Decimal,
     local_open_buy_unknown_count: int,
     observed_at: datetime,
+    open_buy_reservation: OpenBuyReservationResolution | None = None,
 ) -> AccountDrawdownDecision | None:
     if settings.runtime_mode == "live" and not snapshot.holdings_complete:
         return account_drawdown_uncertain_decision(
@@ -7120,7 +9123,19 @@ def _buy_capital_reservation_decision(
             ),
         )
     candidate_notional = _order_notional(command=command, plan_item=plan_item)
-    snapshot_notional, snapshot_unknown_count = _snapshot_open_buy_reservation(snapshot)
+    if open_buy_reservation is None:
+        snapshot_notional, snapshot_unknown_count = (
+            _snapshot_open_buy_reservation(snapshot)
+        )
+    else:
+        snapshot_notional = open_buy_reservation.broker_open_notional
+        snapshot_unknown_count = open_buy_reservation.broker_unknown_count
+        local_open_buy_notional = (
+            open_buy_reservation.local_unmatched_notional
+        )
+        local_open_buy_unknown_count = (
+            open_buy_reservation.local_unknown_count
+        )
     provider = str(command.provider or "").strip().lower()
     buying_power_is_net_of_broker_open_orders = provider == "alpaca"
     unknown_count = local_open_buy_unknown_count
@@ -7128,10 +9143,14 @@ def _buy_capital_reservation_decision(
         unknown_count += snapshot_unknown_count
     snapshot_payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
     open_orders_error = snapshot_payload.get("open_orders_error")
-    if settings.runtime_mode == "live" and (
-        candidate_notional is None
-        or unknown_count > 0
-        or (
+    configured_paper_budget_requires_exact_reservations = bool(
+        settings.runtime_mode == "paper"
+        and command.provider == "upbit"
+        and settings.exec_agent_max_total_budget > 0
+    )
+    incomplete_reservation = candidate_notional is None or unknown_count > 0
+    if settings.runtime_mode == "live":
+        incomplete_reservation = incomplete_reservation or bool(
             not buying_power_is_net_of_broker_open_orders
             and (
                 not snapshot.open_orders_complete
@@ -7141,7 +9160,10 @@ def _buy_capital_reservation_decision(
                 )
             )
         )
-    ):
+    if (
+        settings.runtime_mode == "live"
+        or configured_paper_budget_requires_exact_reservations
+    ) and incomplete_reservation:
         return account_drawdown_uncertain_decision(
             order_idempotency_key=command.idempotency_key,
             execution_plan_item_id=(
@@ -7288,6 +9310,1079 @@ def _reservation_scope_indeterminate_decision(
     )
 
 
+def _replay_exact_strategy_family_ledger(
+    *,
+    orders: tuple[BrokerOrder, ...],
+    fills_by_order: dict[str, list[ExecutionFill]],
+) -> StrategyFamilyLedgerReplay:
+    """Replay every exact family on one global, broker-time chronology."""
+
+    empty = StrategyFamilyLedgerReplay(
+        family_balances={},
+        family_bought={},
+        family_sold={},
+        total_position=Decimal("0"),
+    )
+    replay_events: list[
+        tuple[ExecutionFill, tuple[str, str], str, Decimal]
+    ] = []
+    for order in orders:
+        replay_fills = fills_by_order.get(order.id, [])
+        if not replay_fills:
+            continue
+        order_identity, identity_error = _validated_order_strategy_family_identity(
+            order
+        )
+        if identity_error is not None or order_identity is None:
+            return StrategyFamilyLedgerReplay(
+                **{
+                    **empty.__dict__,
+                    "error_kind": "persisted_identity",
+                    "error_message": (
+                        "filled symbol inventory conflicts with its immutable "
+                        "strategy family command identity"
+                    ),
+                }
+            )
+        family_key = (
+            str(order_identity["entry_family_key"]),
+            str(order_identity["decision_lane"]),
+        )
+        plan_side = str(
+            order.plan_item.side if order.plan_item is not None else ""
+        ).strip().lower()
+        for fill in replay_fills:
+            quantity = effective_fill_quantity(fill)
+            if (
+                not quantity.is_finite()
+                or quantity <= 0
+                or quantity != quantity.to_integral_value(rounding=ROUND_DOWN)
+            ):
+                return StrategyFamilyLedgerReplay(
+                    **{
+                        **empty.__dict__,
+                        "error_kind": "invalid_quantity",
+                        "error_message": (
+                            "strategy family fill quantity is not a positive "
+                            "whole-share value"
+                        ),
+                    }
+                )
+            side = str(fill.side or "").strip().lower()
+            if side not in {"buy", "sell"} or side != order.side or side != plan_side:
+                return StrategyFamilyLedgerReplay(
+                    **{
+                        **empty.__dict__,
+                        "error_kind": "side_conflict",
+                        "error_message": (
+                            "strategy family fill side conflicts with its plan item"
+                        ),
+                    }
+                )
+            replay_events.append((fill, family_key, side, quantity))
+
+    balances: dict[tuple[str, str], Decimal] = {}
+    bought: dict[tuple[str, str], Decimal] = {}
+    sold: dict[tuple[str, str], Decimal] = {}
+    total_position = Decimal("0")
+    for _fill, family_key, side, quantity in sorted(
+        replay_events,
+        key=lambda event: fifo_fill_sort_key(event[0]),
+    ):
+        signed_quantity = quantity if side == "buy" else -quantity
+        balance = balances.get(family_key, Decimal("0")) + signed_quantity
+        total_position += signed_quantity
+        if side == "buy":
+            bought[family_key] = bought.get(family_key, Decimal("0")) + quantity
+        else:
+            sold[family_key] = sold.get(family_key, Decimal("0")) + quantity
+        if balance < 0:
+            return StrategyFamilyLedgerReplay(
+                family_balances=balances,
+                family_bought=bought,
+                family_sold=sold,
+                total_position=total_position,
+                error_kind="family_overdraw",
+                error_message=(
+                    "a strategy family has an overdrawn current-generation ledger"
+                ),
+            )
+        balances[family_key] = balance
+
+    return StrategyFamilyLedgerReplay(
+        family_balances=balances,
+        family_bought=bought,
+        family_sold=sold,
+        total_position=total_position,
+    )
+
+
+def _evaluate_automated_buy_lane_boundary(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    execution_scope: dict[str, object] | None,
+    exclude_order_id: str | None = None,
+) -> PlaceBrokerOrderResult | None:
+    if not _is_trusted_automated_watch_buy(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+    ):
+        return None
+    candidate_identity = _strategy_entry_family_identity(plan_item)
+    if candidate_identity is None:
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_lineage_unavailable",
+            message="automated watch buy lacks exact strategy lane lineage",
+        )
+    selection = _local_capital_reserving_orders(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        side="buy",
+        execution_scope=execution_scope,
+        symbol=command.symbol,
+        exclude_order_id=exclude_order_id,
+        fifo_inventory_scope=True,
+    )
+    if selection.indeterminate_order is not None:
+        return _reservation_scope_indeterminate_result(
+            selection.indeterminate_order
+        )
+    candidate_lane = candidate_identity["decision_lane"]
+    for order in selection.matching_orders:
+        if order.idempotency_key == command.idempotency_key:
+            continue
+        prior_identity, prior_identity_error = (
+            _validated_order_strategy_family_identity(order)
+        )
+        if prior_identity_error is not None or prior_identity is None:
+            return _manual_review_strategy_boundary_result(
+                db=db,
+                plan_item=plan_item,
+                block_reason="strategy_family_persisted_identity_mismatch",
+                message=(
+                    "an active automated buy lacks a matching immutable "
+                    "strategy lane identity"
+                ),
+            )
+        prior_lane = prior_identity["decision_lane"]
+        if prior_lane != candidate_lane:
+            continue
+        return PlaceBrokerOrderResult(
+            status_code=409,
+            payload={
+                "duplicate": False,
+                "message": (
+                    "the same decision lane already has a durable active buy "
+                    "reservation for this symbol"
+                ),
+                "block_reason": "same_lane_active_buy",
+                "prior_order_id": order.id,
+                "decision_lane": candidate_lane,
+            },
+        )
+    return None
+
+
+def _automated_buy_lane_inventory_failure(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    execution_scope: dict[str, object] | None,
+    account_snapshot: BrokerAccountSnapshot | None,
+    account_snapshot_error: str | None,
+) -> AutomatedBuyLaneInventoryFailure | None:
+    """Prove that the candidate lane does not already own current inventory."""
+
+    if not _is_trusted_automated_watch_buy(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+    ):
+        return None
+
+    def failure(
+        *,
+        block_reason: str,
+        message: str,
+        manual_review_required: bool = True,
+        **metrics: object,
+    ) -> AutomatedBuyLaneInventoryFailure:
+        return AutomatedBuyLaneInventoryFailure(
+            block_reason=block_reason,
+            message=message,
+            manual_review_required=manual_review_required,
+            metrics=metrics,
+        )
+
+    candidate_identity = _strategy_entry_family_identity(plan_item)
+    route_scope = _execution_scope_route(execution_scope)
+    if candidate_identity is None or route_scope is None:
+        return failure(
+            block_reason="strategy_lane_inventory_indeterminate",
+            message=(
+                "automated watch buy cannot prove its exact strategy lane "
+                "and execution route"
+            ),
+        )
+    if account_snapshot_error is not None or account_snapshot is None:
+        return failure(
+            block_reason="strategy_lane_position_truth_unavailable",
+            message=(
+                "automated watch buy cannot verify current broker position truth"
+            ),
+            snapshot_error=account_snapshot_error,
+        )
+
+    normalized_symbol = command.symbol.strip().upper()
+    broker_positions = [
+        position
+        for position in (account_snapshot.holdings or account_snapshot.positions)
+        if position.symbol.strip().upper() == normalized_symbol
+    ]
+    if len(broker_positions) > 1:
+        return failure(
+            block_reason="strategy_lane_position_truth_unavailable",
+            message="broker position truth contains duplicate symbol rows",
+        )
+    broker_position_quantity: Decimal | None = None
+    if broker_positions:
+        raw_broker_quantity = broker_positions[0].quantity
+        if (
+            isinstance(raw_broker_quantity, bool)
+            or raw_broker_quantity < 0
+            or Decimal(raw_broker_quantity)
+            != Decimal(raw_broker_quantity).to_integral_value(rounding=ROUND_DOWN)
+        ):
+            return failure(
+                block_reason="strategy_lane_position_truth_unavailable",
+                message="broker position truth has an invalid share quantity",
+            )
+        broker_position_quantity = Decimal(raw_broker_quantity)
+    elif account_snapshot.holdings_complete:
+        broker_position_quantity = Decimal("0")
+
+    local_positions = db.scalars(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.provider == route_scope.provider,
+            ExecutionPosition.account_scope == route_scope.account_scope,
+            ExecutionPosition.exchange.in_(
+                _fifo_inventory_position_exchanges(route_scope)
+            ),
+            ExecutionPosition.symbol == command.symbol,
+        )
+    ).all()
+    if len(local_positions) > 1 or any(
+        position.quantity < 0
+        or Decimal(position.quantity)
+        != Decimal(position.quantity).to_integral_value(rounding=ROUND_DOWN)
+        for position in local_positions
+    ):
+        return failure(
+            block_reason="strategy_lane_position_truth_unavailable",
+            message="local position truth has an invalid inventory-scope quantity",
+        )
+    local_position_quantity = (
+        Decimal(local_positions[0].quantity) if local_positions else None
+    )
+    if (
+        local_position_quantity is not None
+        and broker_positions
+        and local_position_quantity != broker_position_quantity
+    ):
+        return failure(
+            block_reason="strategy_lane_position_mismatch",
+            message="local and broker position truth disagree for this inventory scope",
+        )
+    if settings.runtime_mode == "live":
+        if not account_snapshot.holdings_complete or broker_position_quantity is None:
+            return failure(
+                block_reason="strategy_lane_position_truth_unavailable",
+                message="live automated buy requires complete broker position truth",
+            )
+        if (
+            local_position_quantity is not None
+            and local_position_quantity != broker_position_quantity
+        ):
+            return failure(
+                block_reason="strategy_lane_position_mismatch",
+                message="local and broker position truth disagree for this inventory scope",
+            )
+        authoritative_position_quantity = broker_position_quantity
+    elif local_position_quantity is not None:
+        authoritative_position_quantity = local_position_quantity
+    elif broker_position_quantity is not None:
+        authoritative_position_quantity = broker_position_quantity
+    else:
+        return failure(
+            block_reason="strategy_lane_position_truth_unavailable",
+            message=(
+                "automated watch buy cannot reconcile strategy inventory to "
+                "broker or exact local position truth"
+            ),
+        )
+
+    ledger_through = datetime.now(UTC)
+    isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=settings.runtime_mode,
+        through=ledger_through,
+    )
+    if not isolation_cursor.apply_through(
+        route_scope=route_scope,
+        symbol=normalized_symbol,
+        observed_at=ledger_through,
+        lots=[],
+    ):
+        return failure(
+            block_reason="strategy_lane_inventory_indeterminate",
+            message="strategy lane inventory has unresolved flat-boundary evidence",
+        )
+    latest_flat_boundary = isolation_cursor.latest_boundary_through(
+        route_scope=route_scope,
+        symbol=normalized_symbol,
+        observed_at=ledger_through,
+    )
+
+    family_orders = db.scalars(
+        select(BrokerOrder)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.broker_name == adapter.provider,
+            BrokerOrder.symbol == command.symbol,
+        )
+        .options(
+            selectinload(BrokerOrder.plan_item),
+            selectinload(BrokerOrder.fills),
+        )
+        .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
+        .with_for_update()
+    ).all()
+    raw_fills_by_order = {
+        order.id: list(order.fills)
+        for order in family_orders
+        if order.fills
+    }
+
+    scoped_orders = _select_local_orders_for_fifo_inventory_scope(
+        orders=[
+            order
+            for order in family_orders
+            if order.id in raw_fills_by_order
+        ],
+        execution_scope=execution_scope,
+    )
+    if scoped_orders.indeterminate_order is not None:
+        return failure(
+            block_reason="strategy_lane_inventory_indeterminate",
+            message=(
+                "automated watch buy cannot prove account inventory-scoped "
+                "strategy inventory"
+            ),
+        )
+    all_scoped_raw_fills = [
+        fill
+        for order in scoped_orders.matching_orders
+        for fill in raw_fills_by_order[order.id]
+    ]
+    def is_current_generation_fill(fill: ExecutionFill) -> bool:
+        return (
+            latest_flat_boundary is None
+            or _normalize_utc_datetime(fill.filled_at) > latest_flat_boundary
+        )
+    scoped_raw_fills = [
+        fill for fill in all_scoped_raw_fills if is_current_generation_fill(fill)
+    ]
+    if any(
+        _normalize_utc_datetime(fill.filled_at) > ledger_through
+        for fill in scoped_raw_fills
+    ):
+        return failure(
+            block_reason="strategy_lane_inventory_indeterminate",
+            message="strategy lane inventory contains a future-dated fill",
+        )
+    if execution_fills_have_relevant_conflicting_identity(
+        all_scoped_raw_fills,
+        is_relevant=is_current_generation_fill,
+    ):
+        return failure(
+            block_reason="strategy_lane_inventory_indeterminate",
+            message=(
+                "current-generation strategy inventory contains conflicting "
+                "duplicate fill evidence"
+            ),
+        )
+    post_boundary_fills_by_order = {
+        order.id: canonical_fills
+        for order in scoped_orders.matching_orders
+        if (
+            canonical_fills := dedupe_execution_fills(
+                [
+                    fill
+                    for fill in raw_fills_by_order[order.id]
+                    if is_current_generation_fill(fill)
+                ]
+            )
+        )
+    }
+    scoped_fills = [
+        fill
+        for order in scoped_orders.matching_orders
+        for fill in post_boundary_fills_by_order.get(order.id, [])
+    ]
+    if any(
+        not isinstance(fill.payload, dict)
+        or fill.payload.get("fill_time_precision") != "exact"
+        for fill in scoped_fills
+    ):
+        return failure(
+            block_reason="strategy_lane_inventory_indeterminate",
+            message=(
+                "current-generation strategy inventory contains a fill "
+                "without exact execution-time precision"
+            ),
+        )
+    ambiguous_buckets = ambiguous_fifo_chronology_buckets(scoped_fills)
+    if any(
+        fifo_chronology_is_ambiguous_at(
+            ambiguous_buckets=ambiguous_buckets,
+            isolation_cursor=isolation_cursor,
+            route_scope=route_scope,
+            symbol=normalized_symbol,
+            observed_at=fill.filled_at,
+        )
+        for fill in scoped_fills
+    ):
+        return failure(
+            block_reason="strategy_lane_inventory_indeterminate",
+            message="current-generation strategy fill chronology is ambiguous",
+        )
+
+    ledger = _replay_exact_strategy_family_ledger(
+        orders=scoped_orders.matching_orders,
+        fills_by_order=post_boundary_fills_by_order,
+    )
+    if ledger.error_kind is not None:
+        return failure(
+            block_reason=(
+                "strategy_family_persisted_identity_mismatch"
+                if ledger.error_kind == "persisted_identity"
+                else "strategy_lane_inventory_indeterminate"
+            ),
+            message=ledger.error_message or "strategy lane inventory is indeterminate",
+        )
+
+    if ledger.total_position != authoritative_position_quantity:
+        return failure(
+            block_reason="strategy_lane_position_mismatch",
+            message=(
+                "current-generation strategy ledger does not reconcile to "
+                "the authoritative current position"
+            ),
+            ledger_quantity=str(ledger.total_position),
+            authoritative_position_quantity=str(authoritative_position_quantity),
+        )
+
+    candidate_lane = str(candidate_identity["decision_lane"])
+    lane_remaining = sum(
+        (
+            quantity
+            for (_family_key, lane), quantity in ledger.family_balances.items()
+            if lane == candidate_lane
+        ),
+        Decimal("0"),
+    )
+    if lane_remaining <= 0:
+        return None
+    return failure(
+        block_reason="same_lane_existing_position",
+        message=(
+            "the same decision lane already owns current inventory for this symbol"
+        ),
+        manual_review_required=False,
+        decision_lane=candidate_lane,
+        lane_position_quantity=int(lane_remaining),
+        authoritative_position_quantity=int(authoritative_position_quantity),
+    )
+
+
+def _evaluate_automated_family_sell_boundary(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    execution_scope: dict[str, object] | None,
+    account_snapshot: BrokerAccountSnapshot | None = None,
+    account_snapshot_error: str | None = None,
+    exclude_order_id: str | None = None,
+    retry_lineage_proof: RejectedOrderRetryLineageProof | None = None,
+) -> PlaceBrokerOrderResult | None:
+    if (
+        command.side != "sell"
+        or not _is_trusted_automated_family_sell(
+            command=command,
+            plan_item=plan_item,
+            request_source=request_source,
+            retry_lineage_proof=retry_lineage_proof,
+        )
+    ):
+        return None
+    candidate_identity = _strategy_entry_family_identity(plan_item)
+    if candidate_identity is None:
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_lineage_unavailable",
+            message="automated monitoring exit lacks exact strategy family lineage",
+        )
+
+    route_scope = _execution_scope_route(execution_scope)
+    if route_scope is None:
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_ledger_indeterminate",
+            message=(
+                "automated monitoring exit cannot prove its exact inventory route"
+            ),
+        )
+    if account_snapshot_error is not None or account_snapshot is None:
+        # Authentication/snapshot failures remain retryable at the existing
+        # broker boundary below. They must not be converted into a permanent
+        # family-attribution review solely because no snapshot was returned.
+        return None
+
+    normalized_symbol = command.symbol.strip().upper()
+    broker_positions = [
+        position
+        for position in (account_snapshot.holdings or account_snapshot.positions)
+        if position.symbol.strip().upper() == normalized_symbol
+    ]
+    if len(broker_positions) > 1:
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_position_truth_unavailable",
+            message="broker position truth contains duplicate symbol rows",
+        )
+    broker_position_quantity: Decimal | None = None
+    if broker_positions:
+        raw_broker_quantity = broker_positions[0].quantity
+        if (
+            isinstance(raw_broker_quantity, bool)
+            or raw_broker_quantity < 0
+            or Decimal(raw_broker_quantity)
+            != Decimal(raw_broker_quantity).to_integral_value(rounding=ROUND_DOWN)
+        ):
+            return _manual_review_strategy_boundary_result(
+                db=db,
+                plan_item=plan_item,
+                block_reason="strategy_family_position_truth_unavailable",
+                message="broker position truth has an invalid share quantity",
+            )
+        broker_position_quantity = Decimal(raw_broker_quantity)
+    elif account_snapshot.holdings_complete:
+        broker_position_quantity = Decimal("0")
+
+    local_positions = db.scalars(
+        select(ExecutionPosition).where(
+            ExecutionPosition.mode == settings.runtime_mode,
+            ExecutionPosition.provider == route_scope.provider,
+            ExecutionPosition.account_scope == route_scope.account_scope,
+            ExecutionPosition.exchange.in_(
+                _fifo_inventory_position_exchanges(route_scope)
+            ),
+            ExecutionPosition.symbol == command.symbol,
+        )
+    ).all()
+    if len(local_positions) > 1 or any(
+        position.quantity < 0
+        or Decimal(position.quantity)
+        != Decimal(position.quantity).to_integral_value(rounding=ROUND_DOWN)
+        for position in local_positions
+    ):
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_position_truth_unavailable",
+            message="local position truth has an invalid inventory-scope quantity",
+        )
+    local_position_quantity = (
+        Decimal(local_positions[0].quantity) if local_positions else None
+    )
+    if (
+        local_position_quantity is not None
+        and broker_positions
+        and local_position_quantity != broker_position_quantity
+    ):
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_position_mismatch",
+            message="local and broker position truth disagree for this inventory scope",
+        )
+    if settings.runtime_mode == "live":
+        if not account_snapshot.holdings_complete or broker_position_quantity is None:
+            return _manual_review_strategy_boundary_result(
+                db=db,
+                plan_item=plan_item,
+                block_reason="strategy_family_position_truth_unavailable",
+                message=(
+                    "live automated exit requires complete broker position truth"
+                ),
+            )
+        if (
+            local_position_quantity is not None
+            and local_position_quantity != broker_position_quantity
+        ):
+            return _manual_review_strategy_boundary_result(
+                db=db,
+                plan_item=plan_item,
+                block_reason="strategy_family_position_mismatch",
+                message="local and broker position truth disagree for this inventory scope",
+            )
+        authoritative_position_quantity = broker_position_quantity
+    elif local_position_quantity is not None:
+        authoritative_position_quantity = local_position_quantity
+    elif broker_position_quantity is not None:
+        authoritative_position_quantity = broker_position_quantity
+    else:
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_position_truth_unavailable",
+            message=(
+                "automated monitoring exit cannot reconcile family inventory "
+                "to broker or exact local position truth"
+            ),
+        )
+
+    ledger_through = datetime.now(UTC)
+    isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=settings.runtime_mode,
+        through=ledger_through,
+    )
+    if not isolation_cursor.apply_through(
+        route_scope=route_scope,
+        symbol=normalized_symbol,
+        observed_at=ledger_through,
+        lots=[],
+    ):
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_ledger_indeterminate",
+            message=(
+                "automated monitoring exit has unresolved legacy flat-boundary evidence"
+            ),
+        )
+    latest_flat_boundary = isolation_cursor.latest_boundary_through(
+        route_scope=route_scope,
+        symbol=normalized_symbol,
+        observed_at=ledger_through,
+    )
+
+    family_orders = db.scalars(
+        select(BrokerOrder)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            BrokerOrder.broker_name == adapter.provider,
+            BrokerOrder.symbol == command.symbol,
+        )
+        .options(
+            selectinload(BrokerOrder.plan_item),
+            selectinload(BrokerOrder.fills),
+        )
+        .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
+        .with_for_update()
+    ).all()
+    raw_fills_by_order = {
+        order.id: list(order.fills)
+        for order in family_orders
+        if order.fills
+    }
+    filled_family_orders = [
+        order
+        for order in family_orders
+        if order.id in raw_fills_by_order
+    ]
+    scoped_orders = _select_local_orders_for_fifo_inventory_scope(
+        orders=filled_family_orders,
+        execution_scope=execution_scope,
+    )
+    if scoped_orders.indeterminate_order is not None:
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_ledger_indeterminate",
+            message=(
+                "automated monitoring exit cannot prove account inventory-scoped "
+                "strategy family inventory"
+            ),
+        )
+    all_scoped_raw_fills = [
+        fill
+        for order in scoped_orders.matching_orders
+        for fill in raw_fills_by_order[order.id]
+    ]
+    def is_current_generation_fill(fill: ExecutionFill) -> bool:
+        return (
+            latest_flat_boundary is None
+            or _normalize_utc_datetime(fill.filled_at) > latest_flat_boundary
+        )
+    scoped_raw_fills = [
+        fill for fill in all_scoped_raw_fills if is_current_generation_fill(fill)
+    ]
+    if any(
+        _normalize_utc_datetime(fill.filled_at) > ledger_through
+        for fill in scoped_raw_fills
+    ):
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_ledger_indeterminate",
+            message="strategy family ledger contains a future-dated fill",
+        )
+    if execution_fills_have_relevant_conflicting_identity(
+        all_scoped_raw_fills,
+        is_relevant=is_current_generation_fill,
+    ):
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_ledger_indeterminate",
+            message=(
+                "current-generation strategy family inventory contains "
+                "conflicting duplicate fill evidence"
+            ),
+        )
+    post_boundary_fills_by_order = {
+        order.id: canonical_fills
+        for order in scoped_orders.matching_orders
+        if (
+            canonical_fills := dedupe_execution_fills(
+                [
+                    fill
+                    for fill in raw_fills_by_order[order.id]
+                    if is_current_generation_fill(fill)
+                ]
+            )
+        )
+    }
+    scoped_post_boundary_fills = [
+        fill
+        for order in scoped_orders.matching_orders
+        for fill in post_boundary_fills_by_order.get(order.id, [])
+    ]
+    if any(
+        not isinstance(fill.payload, dict)
+        or fill.payload.get("fill_time_precision") != "exact"
+        for fill in scoped_post_boundary_fills
+    ):
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_ledger_indeterminate",
+            message=(
+                "post-boundary strategy family inventory contains a fill "
+                "without exact execution-time precision"
+            ),
+        )
+    ambiguous_buckets = ambiguous_fifo_chronology_buckets(
+        scoped_post_boundary_fills
+    )
+    if any(
+        fifo_chronology_is_ambiguous_at(
+            ambiguous_buckets=ambiguous_buckets,
+            isolation_cursor=isolation_cursor,
+            route_scope=route_scope,
+            symbol=normalized_symbol,
+            observed_at=fill.filled_at,
+        )
+        for fill in scoped_post_boundary_fills
+    ):
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_ledger_indeterminate",
+            message="post-boundary strategy family fill chronology is ambiguous",
+        )
+
+    ledger = _replay_exact_strategy_family_ledger(
+        orders=scoped_orders.matching_orders,
+        fills_by_order=post_boundary_fills_by_order,
+    )
+    if ledger.error_kind is not None:
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason=(
+                "strategy_family_persisted_identity_mismatch"
+                if ledger.error_kind == "persisted_identity"
+                else "strategy_family_ledger_indeterminate"
+            ),
+            message=ledger.error_message
+            or "automated monitoring exit has no complete family ledger",
+        )
+    if ledger.total_position != authoritative_position_quantity:
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_position_mismatch",
+            message=(
+                "post-boundary strategy family ledger does not reconcile to "
+                "the authoritative current position"
+            ),
+        )
+    candidate_family_key = (
+        str(candidate_identity["entry_family_key"]),
+        str(candidate_identity["decision_lane"]),
+    )
+    bought = ledger.family_bought.get(candidate_family_key, Decimal("0"))
+    sold = ledger.family_sold.get(candidate_family_key, Decimal("0"))
+
+    snapshot_payload = (
+        account_snapshot.payload
+        if isinstance(account_snapshot.payload, dict)
+        else {}
+    )
+    degraded_open_order = snapshot_payload.get("open_orders_error")
+    degraded_open_orders = snapshot_payload.get("open_orders_errors")
+    if (
+        not account_snapshot.open_orders_complete
+        or (
+            isinstance(degraded_open_order, dict)
+            and degraded_open_order.get("degraded") is True
+        )
+        or (
+            isinstance(degraded_open_orders, list)
+            and any(
+                isinstance(error, dict) and error.get("degraded") is True
+                for error in degraded_open_orders
+            )
+        )
+    ):
+        return _manual_review_strategy_boundary_result(
+            db=db,
+            plan_item=plan_item,
+            block_reason="strategy_family_reservation_indeterminate",
+            message=(
+                "automated monitoring exit requires complete broker open-sell truth"
+            ),
+        )
+
+    broker_family_reserved = Decimal("0")
+    matched_broker_local_order_ids: set[str] = set()
+    for broker_order in account_snapshot.open_orders:
+        if (
+            str(broker_order.side or "").strip().lower() != "sell"
+            or str(broker_order.symbol or "").strip().upper()
+            != normalized_symbol
+        ):
+            continue
+        matching_local_orders = [
+            order
+            for order in family_orders
+            if _order_identity_claims_overlap(
+                local=order,
+                snapshot=broker_order,
+            )
+        ]
+        reuses_local_order = any(
+            order.id in matched_broker_local_order_ids
+            for order in matching_local_orders
+        )
+        if len(matching_local_orders) != 1 or reuses_local_order:
+            return _manual_review_strategy_boundary_result(
+                db=db,
+                plan_item=plan_item,
+                block_reason="strategy_family_reservation_indeterminate",
+                message=(
+                    "a broker-open sell cannot be matched one-to-one to exact "
+                    "local strategy ownership"
+                ),
+            )
+        local_order = matching_local_orders[0]
+        if (
+            local_order.broker_order_id
+            and broker_order.broker_order_id
+            and local_order.broker_order_id != broker_order.broker_order_id
+        ) or (
+            local_order.idempotency_key
+            and broker_order.idempotency_key
+            and local_order.idempotency_key != broker_order.idempotency_key
+        ):
+            return _manual_review_strategy_boundary_result(
+                db=db,
+                plan_item=plan_item,
+                block_reason="strategy_family_reservation_indeterminate",
+                message="broker-open sell identity claims conflict with its local row",
+            )
+        local_scope = _select_local_orders_for_fifo_inventory_scope(
+            orders=[local_order],
+            execution_scope=execution_scope,
+        )
+        remaining = _snapshot_open_order_remaining_quantity(broker_order)
+        if (
+            local_scope.indeterminate_order is not None
+            or local_scope.matching_orders != (local_order,)
+            or local_order.side != "sell"
+            or local_order.symbol.strip().upper() != normalized_symbol
+            or isinstance(broker_order.quantity, bool)
+            or not isinstance(broker_order.quantity, int)
+            or local_order.quantity is None
+            or local_order.quantity <= 0
+            or broker_order.quantity != local_order.quantity
+            or remaining is None
+            or remaining <= 0
+            or remaining != remaining.to_integral_value(rounding=ROUND_DOWN)
+            or remaining > Decimal(local_order.quantity)
+        ):
+            return _manual_review_strategy_boundary_result(
+                db=db,
+                plan_item=plan_item,
+                block_reason="strategy_family_reservation_indeterminate",
+                message="broker-open sell has unverifiable exact family quantity",
+            )
+        local_identity, local_identity_error = (
+            _validated_order_strategy_family_identity(local_order)
+        )
+        if local_identity_error is not None or local_identity is None:
+            return _manual_review_strategy_boundary_result(
+                db=db,
+                plan_item=plan_item,
+                block_reason="strategy_family_persisted_identity_mismatch",
+                message=(
+                    "broker-open sell conflicts with its immutable strategy "
+                    "family command identity"
+                ),
+            )
+        matched_broker_local_order_ids.add(local_order.id)
+        if local_identity == candidate_identity:
+            broker_family_reserved += remaining
+
+    active_selection = _local_capital_reserving_orders(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        side="sell",
+        execution_scope=execution_scope,
+        symbol=command.symbol,
+        exclude_order_id=exclude_order_id,
+        fifo_inventory_scope=True,
+    )
+    if active_selection.indeterminate_order is not None:
+        return _reservation_scope_indeterminate_result(
+            active_selection.indeterminate_order
+        )
+    retry_lineage_order_ids = _trusted_monitoring_retry_lineage_order_ids(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=command,
+        request_source=request_source,
+        source_order_pk=_trusted_retry_source_order_pk(
+            command=command,
+            request_source=request_source,
+        ),
+        execution_scope=execution_scope,
+        expected_family_identity=candidate_identity,
+        retry_lineage_proof=retry_lineage_proof,
+        exclude_order_id=exclude_order_id,
+    )
+    reserved = broker_family_reserved
+    for order in active_selection.matching_orders:
+        if order.idempotency_key == command.idempotency_key:
+            continue
+        if order.id in matched_broker_local_order_ids:
+            continue
+        order_identity, persisted_identity_error = (
+            _validated_order_strategy_family_identity(order)
+        )
+        if persisted_identity_error is not None or order_identity is None:
+            return _manual_review_strategy_boundary_result(
+                db=db,
+                plan_item=plan_item,
+                block_reason="strategy_family_persisted_identity_mismatch",
+                message=(
+                    "an active symbol exit conflicts with its immutable strategy "
+                    "family command identity"
+                ),
+            )
+        if order.id in retry_lineage_order_ids:
+            continue
+        if order_identity != candidate_identity:
+            continue
+        if order.quantity is None or order.quantity <= 0:
+            return _manual_review_strategy_boundary_result(
+                db=db,
+                plan_item=plan_item,
+                block_reason="strategy_family_reservation_indeterminate",
+                message="an active family exit has unknown reserved quantity",
+            )
+        filled = sum(
+            (
+                effective_fill_quantity(fill)
+                for fill in dedupe_execution_fills(list(order.fills))
+                if str(fill.side or "").strip().lower() == "sell"
+            ),
+            Decimal("0"),
+        )
+        outstanding = max(Decimal("0"), Decimal(order.quantity) - filled)
+        if outstanding != outstanding.to_integral_value(rounding=ROUND_DOWN):
+            return _manual_review_strategy_boundary_result(
+                db=db,
+                plan_item=plan_item,
+                block_reason="strategy_family_reservation_indeterminate",
+                message="an active family exit has non-integral reserved quantity",
+            )
+        reserved += outstanding
+
+    candidate_quantity = command.quantity
+    family_remaining = bought - sold
+    available = family_remaining - reserved
+    if candidate_quantity is not None and Decimal(candidate_quantity) <= available:
+        return None
+    return PlaceBrokerOrderResult(
+        status_code=409,
+        payload={
+            "duplicate": False,
+            "message": (
+                "automated exit quantity exceeds its exact strategy family "
+                "inventory after active reservations"
+            ),
+            "block_reason": "strategy_family_quantity_unavailable",
+            "manual_review_required": False,
+            "entry_family_key": candidate_identity["entry_family_key"],
+            "decision_lane": candidate_identity["decision_lane"],
+            "family_filled_quantity": int(bought),
+            "family_exited_quantity": int(sold),
+            "family_reserved_quantity": int(reserved),
+            "family_available_quantity": max(0, int(available)),
+            "candidate_quantity": candidate_quantity,
+        },
+    )
+
+
 def _evaluate_sell_reservation_gate(
     *,
     settings: Settings,
@@ -7298,7 +10393,10 @@ def _evaluate_sell_reservation_gate(
     execution_scope: dict[str, object] | None,
     session_state: BrokerSession | None = None,
     session_error: str | None = None,
+    account_snapshot: BrokerAccountSnapshot | None = None,
+    account_snapshot_error: str | None = None,
     exclude_order_id: int | None = None,
+    retry_lineage_proof: RejectedOrderRetryLineageProof | None = None,
 ) -> PlaceBrokerOrderResult | None:
     if command.side != "sell":
         return None
@@ -7323,6 +10421,7 @@ def _evaluate_sell_reservation_gate(
         execution_scope=execution_scope,
         symbol=command.symbol,
         exclude_order_id=exclude_order_id,
+        fifo_inventory_scope=True,
     )
     if local_selection.indeterminate_order is not None:
         return _reservation_scope_indeterminate_result(
@@ -7340,20 +10439,34 @@ def _evaluate_sell_reservation_gate(
         command=command,
         request_source=request_source,
         source_order_pk=retry_source_order_pk,
+        execution_scope=execution_scope,
+        retry_lineage_proof=retry_lineage_proof,
+        exclude_order_id=exclude_order_id,
     )
-    if retry_source_order_pk is not None:
+    if (
+        request_source == AUTOMATED_MONITORING_SOURCE
+        or retry_lineage_proof is not None
+        and retry_lineage_proof.automated_monitoring_family_identity is not None
+    ):
+        # Monitoring retries may release only the exact, durably linked chain
+        # of terminal non-exposed submissions proven below. A caller-provided
+        # source id alone is never enough to release a reservation.
+        local_orders = [
+            order for order in local_orders if order.id not in retry_lineage_order_ids
+        ]
+    elif retry_source_order_pk is not None:
         # A trusted internal retry intentionally replaces this exact row.
         # User-supplied metadata cannot bypass reservations because the caller
         # source is fixed by the execution-job or monitoring service.
-        local_orders = [
-            order
-            for order in local_orders
-            if order.id != retry_source_order_pk and order.id not in retry_lineage_order_ids
-        ]
+        local_orders = [order for order in local_orders if order.id != retry_source_order_pk]
     if not local_orders and settings.runtime_mode != "live":
         return None
 
-    if session_error is not None or session_state is None:
+    if (
+        account_snapshot_error is not None
+        or session_error is not None
+        or session_state is None
+    ):
         return PlaceBrokerOrderResult(
             status_code=409,
             payload={
@@ -7363,22 +10476,24 @@ def _evaluate_sell_reservation_gate(
                 "error_type": "BrokerSessionUnavailable",
             },
         )
-    try:
-        snapshot = adapter.get_account_snapshot(
-            session_state.access_token or "",
-            symbols=[command.symbol],
-            exchange=command.exchange,
-        )
-    except Exception as exc:
-        return PlaceBrokerOrderResult(
-            status_code=409,
-            payload={
-                "duplicate": False,
-                "message": "sellable position truth is unavailable; replacement sell is blocked",
-                "block_reason": "sell_position_truth_unavailable",
-                "error_type": exc.__class__.__name__,
-            },
-        )
+    snapshot = account_snapshot
+    if snapshot is None:
+        try:
+            snapshot = adapter.get_account_snapshot(
+                session_state.access_token or "",
+                symbols=[command.symbol],
+                exchange=command.exchange,
+            )
+        except Exception as exc:
+            return PlaceBrokerOrderResult(
+                status_code=409,
+                payload={
+                    "duplicate": False,
+                    "message": "sellable position truth is unavailable; replacement sell is blocked",
+                    "block_reason": "sell_position_truth_unavailable",
+                    "error_type": exc.__class__.__name__,
+                },
+            )
 
     matching_positions = [
         position
@@ -7710,11 +10825,15 @@ def _evaluate_alpaca_sell_reservation_gate(
 def _monitoring_sell_quantity_cap_error(
     *,
     command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
     request_source: str,
+    retry_lineage_proof: RejectedOrderRetryLineageProof | None = None,
 ) -> tuple[str, str] | None:
-    if (
-        request_source != "monitoring:intraday_target_stop_monitor"
-        or command.side != "sell"
+    if not _is_trusted_automated_family_sell(
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+        retry_lineage_proof=retry_lineage_proof,
     ):
         return None
     metadata = command.metadata if isinstance(command.metadata, dict) else {}
@@ -7756,6 +10875,223 @@ def _trusted_retry_source_order_pk(
     return source_order_pk
 
 
+def _persisted_retry_root_order_pk(order: BrokerOrder) -> str | None:
+    """Return a prior retry's root only when both command copies and audit agree."""
+
+    request_metadata = (
+        order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    )
+    routed_metadata = request_metadata.get("metadata")
+    original_command = request_metadata.get("original_command")
+    original_metadata = (
+        original_command.get("metadata")
+        if isinstance(original_command, dict)
+        else None
+    )
+    routed_retry = (
+        routed_metadata.get("retry") if isinstance(routed_metadata, dict) else None
+    )
+    original_retry = (
+        original_metadata.get("retry")
+        if isinstance(original_metadata, dict)
+        else None
+    )
+    if not (
+        isinstance(routed_retry, dict)
+        and routed_retry.get("source") == "rejected_order_retry"
+        and routed_retry == original_retry
+    ):
+        return None
+    retry_job_id = routed_retry.get("retry_job_id")
+    root_order_pk = routed_retry.get("root_broker_order_pk")
+    if not (
+        isinstance(retry_job_id, str)
+        and retry_job_id
+        and request_metadata.get("source") == f"execution-job:{retry_job_id}"
+        and isinstance(root_order_pk, str)
+        and root_order_pk
+        and order.idempotency_key == f"retry:{root_order_pk}:{retry_job_id}"
+    ):
+        return None
+    durable_edge = any(
+        event.event_type in {"submit_requested", "submit_failed_before_broker_call"}
+        and isinstance(event.request_payload, dict)
+        and isinstance(event.request_payload.get("metadata"), dict)
+        and event.request_payload["metadata"].get("retry") == routed_retry
+        for event in order.events
+    )
+    return root_order_pk if durable_edge else None
+
+
+def _rejected_order_retry_lineage_proof(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+) -> RejectedOrderRetryLineageProof | None:
+    """Prove an execution-job retry without trusting its source prefix alone."""
+
+    metadata = command.metadata if isinstance(command.metadata, dict) else {}
+    retry = metadata.get("retry")
+    if not (
+        request_source.startswith("execution-job:")
+        and isinstance(retry, dict)
+        and retry.get("source") == "rejected_order_retry"
+    ):
+        return None
+
+    job_id = request_source.split(":", 1)[1].strip()
+    source_order_pk = retry.get("source_broker_order_pk")
+    failure_id = retry.get("execution_failure_id")
+    retry_job_id = retry.get("retry_job_id")
+    source_scope = retry.get("source_execution_scope")
+    source_route = _execution_scope_route(source_scope)
+    job = db.get(ExecutionJob, job_id) if job_id else None
+    source_order = (
+        db.get(BrokerOrder, source_order_pk)
+        if isinstance(source_order_pk, str) and source_order_pk
+        else None
+    )
+    failure = (
+        db.get(ExecutionFailure, failure_id)
+        if isinstance(failure_id, str) and failure_id
+        else None
+    )
+    source_metadata = (
+        source_order.request_metadata
+        if source_order is not None
+        and isinstance(source_order.request_metadata, dict)
+        else {}
+    )
+    source_root_order_pk = (
+        _persisted_retry_root_order_pk(source_order)
+        if source_order is not None
+        and isinstance(source_metadata.get("metadata"), dict)
+        and isinstance(source_metadata["metadata"].get("retry"), dict)
+        else source_order.id if source_order is not None else None
+    )
+    root_order_pk = retry.get("root_broker_order_pk")
+    root_order = (
+        db.get(BrokerOrder, root_order_pk)
+        if isinstance(root_order_pk, str) and root_order_pk
+        else None
+    )
+    root_metadata = (
+        root_order.request_metadata
+        if root_order is not None and isinstance(root_order.request_metadata, dict)
+        else {}
+    )
+    if not (
+        source_route is not None
+        and isinstance(source_scope, dict)
+        and job is not None
+        and job.id == retry_job_id == job_id
+        and job.job_type == "broker_order_retry"
+        and job.status == "running"
+        and job.execution_plan_item_id == command.execution_plan_item_id
+        and failure is not None
+        and failure.mode == settings.runtime_mode
+        and failure.retry_job_id == job.id
+        and failure.broker_order_pk == source_order_pk
+        and failure.execution_plan_item_id == command.execution_plan_item_id
+        and failure.retry_order_idempotency_key == command.idempotency_key
+        and retry.get("attempt") == failure.retry_attempt_count
+        and retry.get("max_attempts") == failure.retry_max_attempts
+        and source_order is not None
+        and source_order.mode == settings.runtime_mode
+        and source_order.broker_name == adapter.provider == source_route.provider
+        and source_order.execution_plan_item_id == command.execution_plan_item_id
+        and source_order.symbol == command.symbol
+        and source_order.side == command.side
+        and retry.get("source_broker_order_id") == source_order.broker_order_id
+        and source_metadata.get("execution_scope") == source_scope
+        and source_root_order_pk is not None
+        and root_order_pk == source_root_order_pk
+        and root_order is not None
+        and root_order.mode == source_order.mode
+        and root_order.broker_name == source_order.broker_name
+        and root_order.execution_plan_item_id
+        == source_order.execution_plan_item_id
+        and root_order.symbol == source_order.symbol
+        and root_order.side == source_order.side
+        and root_metadata.get("execution_scope") == source_scope
+    ):
+        return None
+
+    automated_family_identity: dict[str, object] | None = None
+    automated_family_error: str | None = None
+    expected_identity = _strategy_entry_family_identity(plan_item)
+    supplied_identity = metadata.get(STRATEGY_ENTRY_FAMILY_METADATA_KEY)
+    source_identity, source_identity_error = (
+        _validated_order_strategy_family_identity(source_order)
+    )
+    root_identity, root_identity_error = _validated_order_strategy_family_identity(
+        root_order
+    )
+    root_is_automated_monitoring_family_sell = bool(
+        root_metadata.get("source") == AUTOMATED_MONITORING_SOURCE
+        and command.side == "sell"
+        and command.provider == "kis"
+        and command.asset_class == "stock"
+        and command.exchange in KRX_EXCHANGES
+        and plan_item is not None
+        and command.execution_plan_item_id == plan_item.id
+        and plan_item.intent in AUTOMATED_FAMILY_EXIT_INTENTS
+    )
+    if (
+        root_is_automated_monitoring_family_sell
+        and expected_identity is not None
+        and supplied_identity == expected_identity
+        and source_identity_error is None
+        and root_identity_error is None
+        and source_identity == root_identity == expected_identity
+    ):
+        automated_family_identity = expected_identity
+    elif root_is_automated_monitoring_family_sell:
+        automated_family_error = "strategy_family_persisted_identity_mismatch"
+
+    return RejectedOrderRetryLineageProof(
+        job=job,
+        failure=failure,
+        source_order=source_order,
+        root_order=root_order,
+        source_scope=dict(source_scope),
+        source_route=source_route,
+        automated_monitoring_family_identity=automated_family_identity,
+        automated_monitoring_family_error=automated_family_error,
+    )
+
+
+def _is_trusted_automated_family_sell(
+    *,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    retry_lineage_proof: RejectedOrderRetryLineageProof | None,
+) -> bool:
+    return bool(
+        (
+            command.side == "sell"
+            and _is_automated_monitoring_order(
+                command=command,
+                plan_item=plan_item,
+                request_source=request_source,
+            )
+        )
+        or (
+            retry_lineage_proof is not None
+            and retry_lineage_proof.automated_monitoring_family_identity is not None
+            and retry_lineage_proof.source_order.execution_plan_item_id
+            == command.execution_plan_item_id
+            and retry_lineage_proof.source_order.symbol == command.symbol
+            and retry_lineage_proof.source_order.side == command.side == "sell"
+        )
+    )
+
+
 def _rejected_order_retry_route_guard(
     *,
     settings: Settings,
@@ -7765,6 +11101,7 @@ def _rejected_order_retry_route_guard(
     routed_command: PlaceOrderRequest,
     request_source: str,
     observed_at: datetime,
+    retry_lineage_proof: RejectedOrderRetryLineageProof | None = None,
 ) -> PlaceBrokerOrderResult | None:
     """Keep an acknowledged rejection retry inside its proven route authority."""
 
@@ -7800,31 +11137,15 @@ def _rejected_order_retry_route_guard(
         and isinstance(source_order.request_metadata, dict)
         else {}
     )
-    lineage_is_verified = bool(
-        source_route is not None
-        and isinstance(source_scope, dict)
-        and job is not None
-        and job.id == retry_job_id == job_id
-        and job.job_type == "broker_order_retry"
-        and job.status == "running"
-        and job.execution_plan_item_id == command.execution_plan_item_id
-        and failure is not None
-        and failure.mode == settings.runtime_mode
-        and failure.retry_job_id == job.id
-        and failure.broker_order_pk == source_order_pk
-        and failure.execution_plan_item_id == command.execution_plan_item_id
-        and failure.retry_order_idempotency_key == command.idempotency_key
-        and retry.get("attempt") == failure.retry_attempt_count
-        and retry.get("max_attempts") == failure.retry_max_attempts
-        and source_order is not None
-        and source_order.mode == settings.runtime_mode
-        and source_order.broker_name == adapter.provider == source_route.provider
-        and source_order.execution_plan_item_id == command.execution_plan_item_id
-        and source_order.symbol == command.symbol
-        and source_order.side == command.side
-        and retry.get("source_broker_order_id") == source_order.broker_order_id
-        and source_metadata.get("execution_scope") == source_scope
+    retry_lineage_proof = retry_lineage_proof or _rejected_order_retry_lineage_proof(
+        settings=settings,
+        db=db,
+        adapter=adapter,
+        command=command,
+        plan_item=source_order.plan_item if source_order is not None else None,
+        request_source=request_source,
     )
+    lineage_is_verified = retry_lineage_proof is not None
     canonical_route = (
         str(command.provider or "").strip().lower(),
         str(command.venue or adapter.provider).strip().upper(),
@@ -7851,6 +11172,10 @@ def _rejected_order_retry_route_guard(
         else None
     )
     reason = (
+        "retry_lineage_authority_invalid"
+        if retry_lineage_proof is not None
+        and retry_lineage_proof.automated_monitoring_family_error is not None
+        else
         "retry_route_authority_changed"
         if lineage_is_verified
         and canonical_route == proven_route
@@ -7903,21 +11228,38 @@ def _trusted_monitoring_retry_lineage_order_ids(
     command: PlaceOrderRequest,
     request_source: str,
     source_order_pk: str | None,
+    execution_scope: dict[str, object] | None,
+    expected_family_identity: dict[str, object] | None = None,
+    retry_lineage_proof: RejectedOrderRetryLineageProof | None = None,
+    exclude_order_id: str | None = None,
 ) -> set[str]:
-    """Return superseded retry-pending rows for a verified stop retry lineage.
+    """Return only a proven chain of terminal, non-exposed monitoring retries.
 
-    Retry-pending rows represent acknowledged terminal submission failures, not
-    live broker orders. Active, pending-outcome, and manual-review rows are never
-    returned and therefore continue to reserve quantity.
+    The current command names one source row. Older ancestors are released only
+    when every child-to-parent edge is persisted in both order metadata and the
+    immutable submission event. A same-plan scan is intentionally insufficient:
+    unrelated, partially filled, active, and unknown-outcome rows keep reserving
+    quantity even when a caller supplies their primary key.
     """
 
     if (
         request_source != "monitoring:intraday_target_stop_monitor"
+        and (
+            retry_lineage_proof is None
+            or retry_lineage_proof.automated_monitoring_family_identity is None
+        )
+        or (
+            retry_lineage_proof is not None
+            and retry_lineage_proof.source_order.id != source_order_pk
+        )
         or source_order_pk is None
         or command.execution_plan_item_id is None
     ):
         return set()
-    source_order = db.get(BrokerOrder, source_order_pk)
+    source_order = _load_monitoring_retry_lineage_order(
+        db=db,
+        order_id=source_order_pk,
+    )
     if source_order is None:
         return set()
     if not (
@@ -7926,12 +11268,6 @@ def _trusted_monitoring_retry_lineage_order_ids(
         and source_order.execution_plan_item_id == command.execution_plan_item_id
         and source_order.symbol == command.symbol
         and source_order.side == command.side
-        and source_order.status
-        in {
-            NormalizedBrokerOrderStatus.RETRY_PENDING.value,
-            NormalizedBrokerOrderStatus.REJECTED.value,
-        }
-        and source_order.last_error_retryable is True
     ):
         return set()
     latest_order_id = db.scalar(
@@ -7943,7 +11279,14 @@ def _trusted_monitoring_retry_lineage_order_ids(
             BrokerOrder.execution_plan_item_id == command.execution_plan_item_id,
             BrokerOrder.symbol == command.symbol,
             BrokerOrder.side == command.side,
-            BrokerOrderEvent.event_type == "submit_requested",
+            *(
+                (BrokerOrder.id != exclude_order_id,)
+                if exclude_order_id is not None
+                else ()
+            ),
+            BrokerOrderEvent.event_type.in_(
+                ("submit_requested", "submit_failed_before_broker_call")
+            ),
         )
         .order_by(
             BrokerOrderEvent.observed_at.desc(),
@@ -7961,6 +11304,11 @@ def _trusted_monitoring_retry_lineage_order_ids(
                 BrokerOrder.execution_plan_item_id == command.execution_plan_item_id,
                 BrokerOrder.symbol == command.symbol,
                 BrokerOrder.side == command.side,
+                *(
+                    (BrokerOrder.id != exclude_order_id,)
+                    if exclude_order_id is not None
+                    else ()
+                ),
             )
             .order_by(
                 BrokerOrder.updated_at.desc(),
@@ -7971,18 +11319,181 @@ def _trusted_monitoring_retry_lineage_order_ids(
         )
     if latest_order_id != source_order.id:
         return set()
-    return set(
-        db.scalars(
-            select(BrokerOrder.id).where(
-                BrokerOrder.mode == settings.runtime_mode,
-                BrokerOrder.broker_name == adapter.provider,
-                BrokerOrder.execution_plan_item_id == command.execution_plan_item_id,
-                BrokerOrder.symbol == command.symbol,
-                BrokerOrder.side == command.side,
-                BrokerOrder.status == NormalizedBrokerOrderStatus.RETRY_PENDING.value,
-            )
-        ).all()
+
+    family_identity = expected_family_identity or _strategy_entry_family_identity(
+        source_order.plan_item
     )
+    if family_identity is None:
+        return set()
+    trusted_order_ids: set[str] = set()
+    current = source_order
+    while current.id not in trusted_order_ids:
+        if not _monitoring_retry_order_is_conclusively_non_exposed(
+            settings=settings,
+            adapter=adapter,
+            order=current,
+            command=command,
+            execution_scope=execution_scope,
+            expected_family_identity=family_identity,
+        ):
+            break
+        trusted_order_ids.add(current.id)
+        parent_order_id = _persisted_monitoring_retry_parent_order_id(current)
+        if parent_order_id is None or parent_order_id in trusted_order_ids:
+            break
+        parent = _load_monitoring_retry_lineage_order(
+            db=db,
+            order_id=parent_order_id,
+        )
+        if parent is None:
+            break
+        current = parent
+    return trusted_order_ids
+
+
+def _load_monitoring_retry_lineage_order(
+    *,
+    db: Session,
+    order_id: str,
+) -> BrokerOrder | None:
+    return db.scalar(
+        select(BrokerOrder)
+        .where(BrokerOrder.id == order_id)
+        .options(
+            selectinload(BrokerOrder.plan_item),
+            selectinload(BrokerOrder.events),
+            selectinload(BrokerOrder.fills),
+        )
+        .with_for_update()
+    )
+
+
+def _monitoring_retry_order_is_conclusively_non_exposed(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    order: BrokerOrder,
+    command: PlaceOrderRequest,
+    execution_scope: dict[str, object] | None,
+    expected_family_identity: dict[str, object],
+) -> bool:
+    persisted_family_identity, persisted_family_error = (
+        _persisted_order_strategy_family_identity(order)
+    )
+    current_family_identity = _strategy_entry_family_identity(order.plan_item)
+    if not (
+        order.mode == settings.runtime_mode
+        and order.broker_name == adapter.provider
+        and order.execution_plan_item_id == command.execution_plan_item_id
+        and order.symbol == command.symbol
+        and order.side == command.side
+        and order.status
+        in {
+            NormalizedBrokerOrderStatus.RETRY_PENDING.value,
+            NormalizedBrokerOrderStatus.REJECTED.value,
+        }
+        and order.last_error_retryable is True
+        and order.broker_order_id is None
+        and order.submitted_at is None
+        and persisted_family_error is None
+        and persisted_family_identity == expected_family_identity
+        and current_family_identity == persisted_family_identity
+        and not order.fills
+    ):
+        return False
+    scoped = _select_local_orders_for_execution_scope(
+        orders=[order],
+        execution_scope=execution_scope,
+    )
+    if scoped.indeterminate_order is not None or scoped.matching_orders != (order,):
+        return False
+    if any(
+        event.event_type == "submit_outcome_unknown"
+        or (
+            isinstance(event.payload, dict)
+            and event.payload.get("manual_reconciliation_required") is True
+        )
+        for event in order.events
+    ):
+        return False
+    error_code = str(order.last_error_code or "").strip().upper()
+    for event in order.events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if (
+            event.retryable is True
+            and event.event_type == "submit_failed_before_broker_call"
+            and payload.get("broker_call_started") is False
+            and payload.get("manual_reconciliation_required") is False
+        ):
+            return True
+        if (
+            error_code in CONCLUSIVE_MONITORING_SESSION_REJECTION_CODES
+            and event.retryable is True
+            and event.event_type == "submit_failed"
+            and str(event.broker_status or "").strip().upper() == error_code
+            and event.normalized_status == order.status
+            and payload.get("broker_rejection_acknowledged") is True
+            and payload.get("manual_reconciliation_required") is False
+        ):
+            return True
+    return False
+
+
+def _persisted_monitoring_retry_parent_order_id(
+    order: BrokerOrder,
+) -> str | None:
+    metadata = order.request_metadata if isinstance(order.request_metadata, dict) else {}
+    command_metadata = metadata.get("metadata")
+    retry = command_metadata.get("retry") if isinstance(command_metadata, dict) else None
+    original_command = metadata.get("original_command")
+    original_metadata = (
+        original_command.get("metadata")
+        if isinstance(original_command, dict)
+        else None
+    )
+    original_retry = (
+        original_metadata.get("retry")
+        if isinstance(original_metadata, dict)
+        else None
+    )
+    if not (
+        isinstance(retry, dict)
+        and retry.get("source") == "rejected_order_retry"
+        and retry == original_retry
+    ):
+        return None
+    parent_order_id = retry.get("source_broker_order_pk")
+    if not isinstance(parent_order_id, str) or not parent_order_id.strip():
+        return None
+    request_source = str(metadata.get("source") or "").strip()
+    if request_source == AUTOMATED_MONITORING_SOURCE:
+        expected_prefix = f"monitoring:stop_sell:{order.execution_plan_item_id}"
+        if not (
+            order.idempotency_key.startswith(expected_prefix)
+            and order.idempotency_key.endswith(f":retry:{parent_order_id}")
+        ):
+            return None
+    elif request_source.startswith("execution-job:"):
+        retry_job_id = retry.get("retry_job_id")
+        root_order_pk = _persisted_retry_root_order_pk(order)
+        if not (
+            isinstance(retry_job_id, str)
+            and retry_job_id
+            and request_source == f"execution-job:{retry_job_id}"
+            and root_order_pk is not None
+            and order.idempotency_key == f"retry:{root_order_pk}:{retry_job_id}"
+        ):
+            return None
+    else:
+        return None
+    durable_edge = any(
+        event.event_type in {"submit_requested", "submit_failed_before_broker_call"}
+        and isinstance(event.request_payload, dict)
+        and isinstance(event.request_payload.get("metadata"), dict)
+        and event.request_payload["metadata"].get("retry") == retry
+        for event in order.events
+    )
+    return parent_order_id if durable_edge else None
 
 
 def _evaluate_new_buy_account_gate(
@@ -8075,11 +11586,7 @@ def _evaluate_new_buy_account_gate(
             reason="broker account snapshot is stale or future-dated during recovery",
             now=observed_at,
         )
-    (
-        local_open_buy_notional,
-        local_open_buy_unknown_count,
-        indeterminate_order,
-    ) = _local_unmatched_buy_reservation(
+    open_buy_reservation, indeterminate_order = _scoped_open_buy_reservation(
         settings=settings,
         db=db,
         adapter=adapter,
@@ -8096,6 +11603,9 @@ def _evaluate_new_buy_account_gate(
             order=indeterminate_order,
             observed_at=observed_at,
         )
+    assert open_buy_reservation is not None
+    local_open_buy_notional = open_buy_reservation.local_unmatched_notional
+    local_open_buy_unknown_count = open_buy_reservation.local_unknown_count
     capital_decision = _buy_capital_reservation_decision(
         settings=settings,
         snapshot=snapshot,
@@ -8104,6 +11614,7 @@ def _evaluate_new_buy_account_gate(
         local_open_buy_notional=local_open_buy_notional,
         local_open_buy_unknown_count=local_open_buy_unknown_count,
         observed_at=observed_at,
+        open_buy_reservation=open_buy_reservation,
     )
     if capital_decision is not None:
         return capital_decision

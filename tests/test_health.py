@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 import httpx
 import pytest
 from sqlalchemy import inspect, select, text
-from sqlalchemy.orm import load_only
+from sqlalchemy.orm import Session, load_only
 
 from app.api.schemas.execution import MonitoringPriceRequest
 from app.api.routes import runtime as runtime_routes
@@ -37,18 +37,22 @@ from app.main import create_app
 from app.models import EXEC_OWNED_TABLES
 from app.models.runtime import (
     BrokerOrder,
+    BrokerOrderEvent,
     ExecutionJob,
     ExecutionFill,
+    FifoInventoryIsolation,
     ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPosition,
     RuntimeControlEvent,
     RuntimeControlState,
 )
+from app.services import broker_orders as broker_orders_service
 from app.services import runtime as runtime_service, runtime_controls
 from app.services import schema as schema_service
 from app.services.execution_account_route import bind_kis_account_route
 from app.services.execution_lineage import decision_lineage_for_plan_item
+from app.services.plan_item_identity import plan_item_entry_family_key
 from app.services.position_identity import (
     build_position_identity,
     execution_scope_payload,
@@ -68,7 +72,10 @@ from app.services.monitoring import (
     _monitoring_order_idempotency_key,
     _pending_broker_order_symbols,
     _plan_item_exchange,
+    _post_entry_review_state,
+    _remaining_quantities_by_entry_family,
     _resolve_sell_quantity,
+    _sell_remaining_quantity,
     _update_sibling_trigger_price,
     expire_known_flat_pending_sell_monitors,
     list_autonomous_monitoring_symbols,
@@ -139,6 +146,58 @@ def _execution_scope_metadata(
     }
 
 
+def _monitoring_order_request_metadata(
+    settings: Settings,
+    *,
+    entry_family: str,
+    decision_lane: str,
+) -> dict[str, object]:
+    family_identity = {
+        "policy_version": 1,
+        "entry_family_key": f"source:{entry_family}",
+        "decision_lane": decision_lane,
+    }
+    request_metadata = _execution_scope_metadata(
+        settings,
+        asset_class="stock",
+    )
+    request_metadata.update(
+        {
+            "source": "monitoring:intraday_target_stop_monitor",
+            "metadata": {"strategy_entry_family_v1": family_identity},
+            "original_command": {
+                "metadata": {"strategy_entry_family_v1": family_identity}
+            },
+        }
+    )
+    return request_metadata
+
+
+def _add_verified_session_rejection_event(
+    session: Session,
+    *,
+    order: BrokerOrder,
+    observed_at: datetime,
+) -> None:
+    session.add(
+        BrokerOrderEvent(
+            broker_order_pk=order.id,
+            event_type="submit_failed",
+            event_source="submission",
+            normalized_status=order.status,
+            broker_status=order.last_error_code,
+            error_classification=order.last_error_classification,
+            retryable=True,
+            payload={
+                "broker_call_started": True,
+                "broker_rejection_acknowledged": True,
+                "manual_reconciliation_required": False,
+            },
+            observed_at=observed_at,
+        )
+    )
+
+
 def _scoped_execution_position(
     settings: Settings,
     *,
@@ -176,6 +235,123 @@ def _scoped_execution_position(
         ),
         **values,
     )
+
+
+def _add_filled_entry_family(
+    session: Session,
+    *,
+    settings: Settings,
+    symbol: str,
+    quantity: int,
+    price: Decimal,
+    item_id: str,
+    source_plan_item_id: str,
+    decision_agent_name: str,
+    filled_at: datetime,
+    plan: ExecutionPlan | None = None,
+) -> ExecutionPlanItem:
+    risk_context, quantity_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": quantity},
+    )
+    market_date = filled_at.astimezone(ZoneInfo("Asia/Seoul")).date()
+    if plan is None:
+        plan = ExecutionPlan(
+            id=f"plan-{item_id}",
+            external_plan_id=f"plan-{item_id}",
+            source="test-fixture",
+            market_date=market_date,
+            mode=settings.runtime_mode,
+            status="accepted",
+            strategy_run_id=f"run-{item_id}",
+            accepted_at=filled_at - timedelta(minutes=2),
+        )
+    plan_item_index = max(
+        (item.plan_item_index for item in plan.items),
+        default=-1,
+    ) + 1
+    entry_item = ExecutionPlanItem(
+        id=item_id,
+        plan=plan,
+        plan_item_index=plan_item_index,
+        symbol=symbol,
+        side="buy",
+        intent="intraday_watch_buy",
+        status="filled",
+        quantity_policy=quantity_policy,
+        risk_context=risk_context,
+        decision_agent_name=decision_agent_name,
+        decision_snapshot_id=f"snapshot-{item_id}",
+        decision_run_id=f"run-{item_id}",
+        source_plan_item_id=source_plan_item_id,
+        source_market_date=plan.market_date or market_date,
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        limit_price=price,
+        trigger_price=price,
+        time_in_force="day",
+    )
+    session.add(plan)
+    session.flush()
+    family_identity = broker_orders_service._strategy_entry_family_identity(entry_item)
+    assert family_identity is not None
+    entry_request_metadata = _execution_scope_metadata(
+        settings,
+        asset_class="stock",
+    )
+    entry_request_metadata.update(
+        {
+            "metadata": {
+                broker_orders_service.STRATEGY_ENTRY_FAMILY_METADATA_KEY: (
+                    family_identity
+                ),
+            },
+            "original_command": {
+                "metadata": {
+                    broker_orders_service.STRATEGY_ENTRY_FAMILY_METADATA_KEY: (
+                        family_identity
+                    ),
+                }
+            },
+        }
+    )
+    entry_order = BrokerOrder(
+        broker_name="kis",
+        broker_order_id=f"broker-{item_id}",
+        mode=settings.runtime_mode,
+        execution_plan_item_id=entry_item.id,
+        idempotency_key=f"filled-entry:{item_id}",
+        symbol=symbol,
+        side="buy",
+        status="filled",
+        quantity=quantity,
+        venue="KRX",
+        asset_class="stock",
+        limit_price=price,
+        request_metadata=entry_request_metadata,
+        submitted_at=filled_at - timedelta(minutes=1),
+    )
+    session.add(entry_order)
+    session.flush()
+    session.add(
+        ExecutionFill(
+            broker_order_pk=entry_order.id,
+            broker_fill_id=f"fill-{item_id}",
+            symbol=symbol,
+            side="buy",
+            quantity=quantity,
+            price=price,
+            filled_at=filled_at,
+            payload={
+                "fill_time_precision": "exact",
+                "fill_time_source": "test_fixture",
+            },
+        )
+    )
+    return entry_item
 
 
 def test_monitoring_symbol_cycle_limit_auto_uses_timeout_budget() -> None:
@@ -2958,6 +3134,95 @@ def test_position_exit_pending_sell_is_autonomous_monitored_when_position_exists
     engine.dispose()
 
 
+def test_sell_quantity_caps_every_exit_intent_to_family_remaining() -> None:
+    for intent in ("target_sell", "stop_sell", "max_holding_close_sell"):
+        item = ExecutionPlanItem(
+            symbol="005930",
+            side="sell",
+            intent=intent,
+            quantity_policy={"kind": "shares", "quantity": 5},
+        )
+
+        assert _resolve_sell_quantity(item=item, remaining_quantity=2) == 2
+
+
+def test_sell_remaining_quantity_requires_exact_entry_family_inventory() -> None:
+    linked = ExecutionPlanItem(
+        symbol="005930",
+        side="sell",
+        intent="target_sell",
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 5,
+            "linked_entry_item_key": "family-a",
+        },
+    )
+    unlinked = ExecutionPlanItem(
+        symbol="005930",
+        side="sell",
+        intent="stop_sell",
+        quantity_policy={"kind": "shares", "quantity": 5},
+    )
+    lane_only = ExecutionPlanItem(
+        symbol="005930",
+        side="sell",
+        intent="stop_sell",
+        decision_agent_name="signal-decider",
+        quantity_policy={"kind": "shares", "quantity": 5},
+    )
+
+    assert _sell_remaining_quantity(
+        item=linked,
+        remaining_quantities_by_symbol={"005930": 10},
+        remaining_quantities_by_family={},
+    ) is None
+    assert _sell_remaining_quantity(
+        item=unlinked,
+        remaining_quantities_by_symbol={"005930": 10},
+        remaining_quantities_by_family={
+            ("005930", "source:family-a", None): 5,
+            ("005930", "", None): 0,
+        },
+    ) is None
+    assert _sell_remaining_quantity(
+        item=lane_only,
+        remaining_quantities_by_symbol={"005930": 10},
+        remaining_quantities_by_family={},
+    ) is None
+
+
+def test_post_entry_time_review_applies_only_when_max_holding_is_enabled() -> None:
+    common = {
+        "settings": Settings(runtime_mode="paper"),
+        "entry_price": Decimal("100"),
+        "observed_price": Decimal("100"),
+        "holding_session": 3,
+        "holding_session_status": "authoritative",
+        "holding_session_source": "test",
+        "holding_session_count_capped_at": 3,
+        "stop_price": Decimal("95"),
+        "triggered_at": datetime(2026, 6, 10, 1, 0, tzinfo=UTC),
+    }
+
+    signal_review = _post_entry_review_state(
+        **common,
+        max_holding_sessions=None,
+    )
+    short_review = _post_entry_review_state(
+        **common,
+        max_holding_sessions=3,
+    )
+
+    assert signal_review["requires_review"] is False
+    assert signal_review["reasons"] == []
+    assert signal_review["tightened_stop_price"] == "95.0000"
+    assert short_review["reasons"] == [
+        "next_day_no_progress",
+        "max_holding_without_progress",
+    ]
+    assert short_review["tightened_stop_price"] == "99.0000"
+
+
 def test_default_monitor_loader_allows_only_live_or_pending_sell_states() -> None:
     app, engine = build_test_app(
         Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
@@ -3526,8 +3791,12 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
                     "intent": "target_sell",
                     "source_plan_item_id": "core-plan-row-1",
                     "trigger_price": "100.00",
-                    "quantity_policy": {"kind": "shares", "quantity": 1},
-                    "decision_agent_name": "old-agent",
+                    "quantity_policy": {
+                        "kind": "shares",
+                        "quantity": 1,
+                        "linked_entry_item_key": "core-plan-row-1",
+                    },
+                    "decision_agent_name": "signal-decider",
                     "decision_snapshot_id": "snapshot-old",
                     "decision_run_id": "old-run",
                     "source_market_date": "2026-05-20",
@@ -3538,8 +3807,12 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
                     "intent": "stop_sell",
                     "source_plan_item_id": "core-plan-row-1",
                     "trigger_price": "90.00",
-                    "quantity_policy": {"kind": "shares", "quantity": 1},
-                    "decision_agent_name": "old-agent",
+                    "quantity_policy": {
+                        "kind": "shares",
+                        "quantity": 1,
+                        "linked_entry_item_key": "core-plan-row-1",
+                    },
+                    "decision_agent_name": "signal-decider",
                     "decision_snapshot_id": "snapshot-old",
                     "decision_run_id": "old-run",
                     "source_market_date": "2026-05-20",
@@ -3578,8 +3851,12 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
                     "intent": "target_sell",
                     "source_plan_item_id": "core-plan-row-1",
                     "trigger_price": "112.00",
-                    "quantity_policy": {"kind": "shares", "quantity": 3},
-                    "decision_agent_name": "new-agent",
+                    "quantity_policy": {
+                        "kind": "shares",
+                        "quantity": 3,
+                        "linked_entry_item_key": "core-plan-row-1",
+                    },
+                    "decision_agent_name": "signal-decider",
                     "decision_snapshot_id": "snapshot-new",
                     "decision_run_id": "new-run",
                     "source_market_date": "2026-05-21",
@@ -3590,8 +3867,12 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
                     "intent": "stop_sell",
                     "source_plan_item_id": "core-plan-row-1",
                     "trigger_price": "94.00",
-                    "quantity_policy": {"kind": "shares", "quantity": 3},
-                    "decision_agent_name": "new-agent",
+                    "quantity_policy": {
+                        "kind": "shares",
+                        "quantity": 3,
+                        "linked_entry_item_key": "core-plan-row-1",
+                    },
+                    "decision_agent_name": "signal-decider",
                     "decision_snapshot_id": "snapshot-new",
                     "decision_run_id": "new-run",
                     "source_market_date": "2026-05-21",
@@ -3623,8 +3904,16 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
         assert stop_item.status == "stop_sell_monitoring"
         assert target_item.trigger_price == Decimal("112.0000")
         assert stop_item.trigger_price == Decimal("94.0000")
-        assert target_item.quantity_policy == {"kind": "shares", "quantity": 3}
-        assert stop_item.quantity_policy == {"kind": "shares", "quantity": 3}
+        assert target_item.quantity_policy == {
+            "kind": "shares",
+            "quantity": 3,
+            "linked_entry_item_key": "core-plan-row-1",
+        }
+        assert stop_item.quantity_policy == {
+            "kind": "shares",
+            "quantity": 3,
+            "linked_entry_item_key": "core-plan-row-1",
+        }
         assert target_item.decision_snapshot_id == "snapshot-new"
         assert stop_item.decision_snapshot_id == "snapshot-new"
         assert target_item.risk_context["last_monitoring_event"]["event"] == "sell_monitor_replanned_in_place"
@@ -3646,7 +3935,7 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
             assert lineage["external_plan_id"] == "plan-new-replanned-sell"
             assert lineage["strategy_run_id"] == "new-run"
             assert lineage["decision_run_id"] == "new-run"
-            assert lineage["decision_agent_name"] == "new-agent"
+            assert lineage["decision_agent_name"] == "signal-decider"
         assert "sell_monitor_authority_v1" in target_item.risk_context
         assert "sell_monitor_authority_v1" in stop_item.risk_context
 
@@ -3662,6 +3951,493 @@ def test_replanned_sell_monitor_updates_existing_source_row_in_place() -> None:
         assert target_item_id in autonomous_item_ids
         assert stop_item_id in autonomous_item_ids
         assert not (autonomous_item_ids & set(new_item_ids))
+
+    engine.dispose()
+
+
+def test_replanned_sell_monitor_never_rewrites_historical_order_entry_family() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_account_number="12345678",
+            kis_account_product_code="01",
+            account_drawdown_recovery_scope_secret=(
+                "replanned-family-scope-secret-at-least-32-bytes"
+            ),
+        )
+    )
+    client = TestClient(app)
+    source_plan_item_id = "shared-core-sell-row"
+    decision_lane = "signal-decider"
+    family_a = "family-a"
+    family_b = "family-b"
+
+    # Replans may refer to a globally unique historical entry row from another
+    # plan, but that immutable entry must already exist when the exit is
+    # accepted so the family claim can be verified immediately.
+    with app.state.db_session_factory() as session:
+        _add_filled_entry_family(
+            session,
+            settings=app.state.settings,
+            symbol="000660",
+            quantity=5,
+            price=Decimal("100.00"),
+            item_id="entry-family-a",
+            source_plan_item_id=family_a,
+            decision_agent_name=decision_lane,
+            filled_at=datetime(2026, 5, 20, 1, 0, tzinfo=UTC),
+        )
+        _add_filled_entry_family(
+            session,
+            settings=app.state.settings,
+            symbol="000660",
+            quantity=5,
+            price=Decimal("101.00"),
+            item_id="entry-family-b",
+            source_plan_item_id=family_b,
+            decision_agent_name=decision_lane,
+            filled_at=datetime(2026, 5, 20, 1, 1, tzinfo=UTC),
+        )
+        session.commit()
+
+    older = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-family-a-incumbent",
+            "source": "test-fixture",
+            "market_date": "2026-05-21",
+            "strategy_run_id": "family-a-run",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "source_plan_item_id": source_plan_item_id,
+                    "trigger_price": "90.00",
+                    "quantity_policy": {
+                        "kind": "shares",
+                        "quantity": 5,
+                        "linked_entry_item_key": family_a,
+                    },
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "entry_context": {
+                            "execution_plan_item_id": "entry-family-a",
+                            "source_plan_item_id": family_a,
+                        },
+                    },
+                    "decision_agent_name": decision_lane,
+                    "decision_snapshot_id": "snapshot-family-a",
+                    "decision_run_id": "family-a-run",
+                    "source_market_date": "2026-05-20",
+                }
+            ],
+        },
+    )
+    assert older.status_code == 201
+    incumbent_id = older.json()["persisted_execution_item_ids"][0]
+
+    historical_order_id = "family-a-retry-pending-order"
+    with app.state.db_session_factory() as session:
+        incumbent = session.get(ExecutionPlanItem, incumbent_id)
+        assert incumbent is not None
+        historical_request_metadata = _monitoring_order_request_metadata(
+            app.state.settings,
+            entry_family=family_a,
+            decision_lane=decision_lane,
+        )
+        session.add(
+            BrokerOrder(
+                id=historical_order_id,
+                execution_plan_item_id=incumbent_id,
+                broker_name="kis",
+                mode="paper",
+                idempotency_key="family-a-historical-stop-retry",
+                symbol="000660",
+                side="sell",
+                status="retry_pending",
+                quantity=5,
+                venue="KRX",
+                asset_class="stock",
+                request_metadata=historical_request_metadata,
+                last_error_classification="broker_rejected",
+                last_error_code="KIOK0320",
+                last_error_message="market is not open",
+                last_error_retryable=True,
+            )
+        )
+        session.commit()
+
+    newer = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-family-b-replan",
+            "source": "test-fixture",
+            "market_date": "2026-05-21",
+            "strategy_run_id": "family-b-run",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "source_plan_item_id": source_plan_item_id,
+                    "trigger_price": "94.00",
+                    "quantity_policy": {
+                        "kind": "shares",
+                        "quantity": 5,
+                        "linked_entry_item_key": family_b,
+                    },
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "entry_context": {
+                            "execution_plan_item_id": "entry-family-b",
+                            "source_plan_item_id": family_b,
+                        },
+                    },
+                    "decision_agent_name": decision_lane,
+                    "decision_snapshot_id": "snapshot-family-b",
+                    "decision_run_id": "family-b-run",
+                    "source_market_date": "2026-05-21",
+                }
+            ],
+        },
+    )
+    assert newer.status_code == 201
+    replacement_id = newer.json()["persisted_execution_item_ids"][0]
+    assert replacement_id != incumbent_id
+
+    with app.state.db_session_factory() as session:
+        incumbent = session.get(ExecutionPlanItem, incumbent_id)
+        replacement = session.get(ExecutionPlanItem, replacement_id)
+        historical_order = session.get(BrokerOrder, historical_order_id)
+        assert incumbent is not None
+        assert replacement is not None
+        assert historical_order is not None
+
+        assert plan_item_entry_family_key(incumbent) == "source:family-a"
+        assert incumbent.quantity_policy["linked_entry_item_key"] == family_a
+        assert incumbent.trigger_price == Decimal("90.0000")
+        assert incumbent.decision_snapshot_id == "snapshot-family-a"
+        assert incumbent.status == "stop_sell_monitoring"
+
+        assert plan_item_entry_family_key(replacement) == "source:family-b"
+        assert replacement.trigger_price == Decimal("94.0000")
+        assert replacement.decision_snapshot_id == "snapshot-family-b"
+        assert replacement.status == "stop_sell_monitoring"
+
+        assert historical_order.execution_plan_item_id == incumbent_id
+        assert historical_order.status == "retry_pending"
+        assert historical_order.quantity == 5
+        assert plan_item_entry_family_key(historical_order.plan_item) == (
+            "source:family-a"
+        )
+        assert historical_order.request_metadata["metadata"][
+            "strategy_entry_family_v1"
+        ] == {
+            "policy_version": 1,
+            "entry_family_key": "source:family-a",
+            "decision_lane": decision_lane,
+        }
+        assert historical_order.request_metadata["original_command"]["metadata"][
+            "strategy_entry_family_v1"
+        ] == {
+            "policy_version": 1,
+            "entry_family_key": "source:family-a",
+            "decision_lane": decision_lane,
+        }
+
+    engine.dispose()
+
+
+def test_replanned_sell_monitor_with_inexact_entry_family_fails_closed() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_account_number="12345678",
+            kis_account_product_code="01",
+            account_drawdown_recovery_scope_secret=(
+                "inexact-replan-scope-secret-at-least-32-bytes"
+            ),
+        )
+    )
+    client = TestClient(app)
+    source_plan_item_id = "shared-inexact-core-sell-row"
+
+    older = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-exact-family-incumbent",
+            "source": "test-fixture",
+            "market_date": "2026-05-21",
+            "strategy_run_id": "exact-family-run",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "source_plan_item_id": source_plan_item_id,
+                    "trigger_price": "90.00",
+                    "quantity_policy": {
+                        "kind": "shares",
+                        "quantity": 5,
+                        "linked_entry_item_key": "exact-family",
+                    },
+                    "decision_agent_name": "signal-decider",
+                    "decision_snapshot_id": "snapshot-exact-family",
+                    "decision_run_id": "exact-family-run",
+                    "source_market_date": "2026-05-20",
+                }
+            ],
+        },
+    )
+    assert older.status_code == 201
+    incumbent_id = older.json()["persisted_execution_item_ids"][0]
+
+    newer = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-inexact-family-replan",
+            "source": "test-fixture",
+            "market_date": "2026-05-21",
+            "strategy_run_id": "inexact-family-run",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "source_plan_item_id": source_plan_item_id,
+                    "trigger_price": "94.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "decision_agent_name": "signal-decider",
+                    "decision_snapshot_id": "snapshot-inexact-family",
+                    "decision_run_id": "inexact-family-run",
+                    "source_market_date": "2026-05-21",
+                }
+            ],
+        },
+    )
+    assert newer.status_code == 201
+    replanned_id = newer.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        incumbent = session.get(ExecutionPlanItem, incumbent_id)
+        replanned = session.get(ExecutionPlanItem, replanned_id)
+        assert incumbent is not None
+        assert replanned is not None
+        assert plan_item_entry_family_key(incumbent) == "source:exact-family"
+        assert incumbent.status == "stop_sell_monitoring"
+        assert replanned.status == "manual_review_required"
+        event = replanned.risk_context["last_monitoring_event"]
+        assert event["event"] == "replanned_sell_monitor_identity_inexact"
+        assert event["reason"] == "entry_family_unavailable"
+        assert event["recorded_at"]
+
+    ambiguous = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-ambiguous-family-replan",
+            "source": "test-fixture",
+            "market_date": "2026-05-21",
+            "strategy_run_id": "ambiguous-family-run",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "source_plan_item_id": source_plan_item_id,
+                    "trigger_price": "95.00",
+                    "quantity_policy": {
+                        "kind": "shares",
+                        "quantity": 5,
+                        "linked_entry_item_key": "conflicting-family",
+                    },
+                    "risk_context": {
+                        "entry_context": {
+                            "execution_plan_item_id": "entry-exact-family",
+                            "source_plan_item_id": "exact-family",
+                        }
+                    },
+                    "decision_agent_name": "signal-decider",
+                    "decision_snapshot_id": "snapshot-ambiguous-family",
+                    "decision_run_id": "ambiguous-family-run",
+                    "source_market_date": "2026-05-21",
+                }
+            ],
+        },
+    )
+    assert ambiguous.status_code == 201
+    ambiguous_id = ambiguous.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        incumbent = session.get(ExecutionPlanItem, incumbent_id)
+        ambiguous_item = session.get(ExecutionPlanItem, ambiguous_id)
+        assert incumbent is not None
+        assert ambiguous_item is not None
+        assert incumbent.status == "stop_sell_monitoring"
+        assert incumbent.quantity_policy["linked_entry_item_key"] == "exact-family"
+        assert ambiguous_item.status == "manual_review_required"
+        event = ambiguous_item.risk_context["last_monitoring_event"]
+        assert event["event"] == "replanned_sell_monitor_identity_inexact"
+        assert event["reason"] == "entry_family_ambiguous"
+        assert event["recorded_at"]
+
+    same_payload_conflict = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-same-payload-family-conflict",
+            "source": "test-fixture",
+            "market_date": "2026-05-21",
+            "strategy_run_id": "same-payload-family-conflict-run",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "source_plan_item_id": source_plan_item_id,
+                    "trigger_price": "96.00",
+                    "quantity_policy": {
+                        "kind": "shares",
+                        "quantity": 5,
+                        "linked_entry_item_key": "exact-family",
+                        "entry_context": {
+                            "execution_plan_item_id": "entry-other-family",
+                            "source_plan_item_id": "other-family",
+                        },
+                    },
+                    "decision_agent_name": "signal-decider",
+                    "decision_snapshot_id": "snapshot-same-payload-conflict",
+                    "decision_run_id": "same-payload-family-conflict-run",
+                    "source_market_date": "2026-05-21",
+                }
+            ],
+        },
+    )
+    assert same_payload_conflict.status_code == 201
+    same_payload_conflict_id = same_payload_conflict.json()[
+        "persisted_execution_item_ids"
+    ][0]
+
+    with app.state.db_session_factory() as session:
+        incumbent = session.get(ExecutionPlanItem, incumbent_id)
+        conflicting_item = session.get(
+            ExecutionPlanItem,
+            same_payload_conflict_id,
+        )
+        assert incumbent is not None
+        assert conflicting_item is not None
+        assert incumbent.status == "stop_sell_monitoring"
+        assert incumbent.trigger_price == Decimal("90.0000")
+        assert conflicting_item.status == "manual_review_required"
+        assert plan_item_entry_family_key(conflicting_item) is None
+        event = conflicting_item.risk_context["last_monitoring_event"]
+        assert event["event"] == "replanned_sell_monitor_identity_inexact"
+        assert event["reason"] == "entry_family_ambiguous"
+
+    engine.dispose()
+
+
+def test_replanned_sell_monitor_quarantines_inexact_incumbent() -> None:
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_account_number="12345678",
+            kis_account_product_code="01",
+            account_drawdown_recovery_scope_secret=(
+                "inexact-incumbent-scope-secret-at-least-32-bytes"
+            ),
+        )
+    )
+    client = TestClient(app)
+    source_plan_item_id = "shared-legacy-core-sell-row"
+
+    older = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-inexact-family-incumbent",
+            "source": "test-fixture",
+            "market_date": "2026-05-21",
+            "strategy_run_id": "inexact-incumbent-run",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "source_plan_item_id": source_plan_item_id,
+                    "trigger_price": "90.00",
+                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "decision_agent_name": "signal-decider",
+                    "decision_snapshot_id": "snapshot-inexact-incumbent",
+                    "decision_run_id": "inexact-incumbent-run",
+                    "source_market_date": "2026-05-20",
+                }
+            ],
+        },
+    )
+    assert older.status_code == 201
+    incumbent_id = older.json()["persisted_execution_item_ids"][0]
+    with app.state.db_session_factory() as session:
+        incumbent = session.get(ExecutionPlanItem, incumbent_id)
+        assert incumbent is not None
+        # Simulate a legacy active row accepted before exact family identity
+        # became mandatory for source-preserving replans.
+        incumbent.status = "stop_sell_monitoring"
+        incumbent.risk_context = {
+            key: value
+            for key, value in (incumbent.risk_context or {}).items()
+            if key not in {"last_monitoring_event", "monitoring_events"}
+        }
+        session.commit()
+
+    newer = client.post(
+        "/execution-plans",
+        json={
+            "plan_id": "plan-exact-family-replacement",
+            "source": "test-fixture",
+            "market_date": "2026-05-21",
+            "strategy_run_id": "exact-replacement-run",
+            "items": [
+                {
+                    "symbol": "000660",
+                    "side": "sell",
+                    "intent": "stop_sell",
+                    "source_plan_item_id": source_plan_item_id,
+                    "trigger_price": "94.00",
+                    "quantity_policy": {
+                        "kind": "shares",
+                        "quantity": 5,
+                        "linked_entry_item_key": "exact-replacement-family",
+                    },
+                    "decision_agent_name": "signal-decider",
+                    "decision_snapshot_id": "snapshot-exact-replacement",
+                    "decision_run_id": "exact-replacement-run",
+                    "source_market_date": "2026-05-21",
+                }
+            ],
+        },
+    )
+    assert newer.status_code == 201
+    replacement_id = newer.json()["persisted_execution_item_ids"][0]
+
+    with app.state.db_session_factory() as session:
+        incumbent = session.get(ExecutionPlanItem, incumbent_id)
+        replacement = session.get(ExecutionPlanItem, replacement_id)
+        assert incumbent is not None
+        assert replacement is not None
+        assert plan_item_entry_family_key(incumbent) is None
+        assert incumbent.status == "manual_review_required"
+        assert incumbent.risk_context["last_monitoring_event"]["event"] == (
+            "replanned_sell_monitor_identity_inexact"
+        )
+        assert incumbent.risk_context["last_monitoring_event"]["reason"] == (
+            "incumbent_entry_family_unavailable"
+        )
+        assert plan_item_entry_family_key(replacement) == (
+            "source:exact-replacement-family"
+        )
+        assert replacement.status == "stop_sell_monitoring"
 
     engine.dispose()
 
@@ -3795,7 +4571,20 @@ def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() ->
         )
     )
     client = TestClient(app)
-    broker_adapter = StubMonitoringBrokerAdapter()
+    broker_adapter = StubMonitoringBrokerAdapter(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            observed_at=datetime(2026, 5, 28, 1, 4, 30, tzinfo=UTC),
+            source="stub",
+        )
+    )
+    entry_item_id = "entry-033530-monitor-repair"
+    entry_family = "family-033530-monitor-repair"
+    decision_lane = "signal-decider"
+    entry_context = {
+        "execution_plan_item_id": entry_item_id,
+        "source_plan_item_id": entry_family,
+    }
 
     resume = client.post(
         "/controls/resume",
@@ -3814,9 +4603,19 @@ def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() ->
                     "symbol": "033530",
                     "side": "sell",
                     "intent": "stop_sell",
+                    "provider": "kis",
+                    "venue": "KRX",
+                    "asset_class": "stock",
                     "trigger_price": "8060.00",
-                    "quantity_policy": {"kind": "position_exit_from_entry"},
-                    "risk_context": {"exchange": "KRX"},
+                    "quantity_policy": {
+                        "kind": "position_exit_from_entry",
+                        "linked_entry_item_key": entry_family,
+                    },
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "entry_context": entry_context,
+                    },
+                    "decision_agent_name": decision_lane,
                 }
             ],
         },
@@ -3832,17 +4631,37 @@ def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() ->
                     "symbol": "033530",
                     "side": "sell",
                     "intent": "target_sell",
+                    "provider": "kis",
+                    "venue": "KRX",
+                    "asset_class": "stock",
                     "trigger_price": "9250.00",
-                    "quantity_policy": {"kind": "position_exit_from_entry"},
-                    "risk_context": {"exchange": "KRX"},
+                    "quantity_policy": {
+                        "kind": "position_exit_from_entry",
+                        "linked_entry_item_key": entry_family,
+                    },
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "entry_context": entry_context,
+                    },
+                    "decision_agent_name": decision_lane,
                 },
                 {
                     "symbol": "033530",
                     "side": "sell",
                     "intent": "stop_sell",
+                    "provider": "kis",
+                    "venue": "KRX",
+                    "asset_class": "stock",
                     "trigger_price": "8700.00",
-                    "quantity_policy": {"kind": "position_exit_from_entry"},
-                    "risk_context": {"exchange": "KRX"},
+                    "quantity_policy": {
+                        "kind": "position_exit_from_entry",
+                        "linked_entry_item_key": entry_family,
+                    },
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "entry_context": entry_context,
+                    },
+                    "decision_agent_name": decision_lane,
                 },
             ],
         },
@@ -3853,8 +4672,22 @@ def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() ->
     newer_target_id, newer_stop_id = newer.json()["persisted_execution_item_ids"]
 
     with app.state.db_session_factory() as session:
+        older_stop = session.get(ExecutionPlanItem, older_stop_id)
         newer_stop = session.get(ExecutionPlanItem, newer_stop_id)
+        assert older_stop is not None
         assert newer_stop is not None
+        _add_filled_entry_family(
+            session,
+            settings=app.state.settings,
+            symbol="033530",
+            quantity=58,
+            price=Decimal("8500.00"),
+            item_id=entry_item_id,
+            source_plan_item_id=entry_family,
+            decision_agent_name=decision_lane,
+            filled_at=datetime(2026, 5, 27, 1, 0, tzinfo=UTC),
+            plan=older_stop.plan,
+        )
         newer_stop.status = "broker_order_rejected"
         session.add(
             _scoped_execution_position(
@@ -3864,7 +4697,7 @@ def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() ->
                 quantity=58,
                 average_price=Decimal("8500.00"),
                 updated_from="reconciliation",
-                last_reconciled_at=datetime.now(UTC),
+                last_reconciled_at=datetime(2026, 5, 28, 1, 4, 30, tzinfo=UTC),
             )
         )
         session.commit()
@@ -3887,7 +4720,9 @@ def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() ->
         )
 
         assert result.status_code == 200
-        assert result.payload["submitted_order_count"] == 1
+        assert result.payload["submitted_order_count"] == 1, repr(
+            result.payload["items"]
+        )
         assert result.payload["triggered_item_count"] == 1
         assert broker_adapter.order_calls[0].symbol == "033530"
         assert broker_adapter.order_calls[0].side == "sell"
@@ -3897,10 +4732,12 @@ def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() ->
         repaired_stop = session.get(ExecutionPlanItem, repaired_stop_id)
         assert repaired_stop is not None
         assert repaired_stop.intent == "stop_sell"
-        assert repaired_stop.decision_agent_name == "post-entry-monitor-repair"
+        assert repaired_stop.decision_agent_name == decision_lane
         assert repaired_stop.trigger_price == Decimal("8287.5000")
 
-        orders = session.scalars(select(BrokerOrder)).all()
+        orders = session.scalars(
+            select(BrokerOrder).where(BrokerOrder.side == "sell")
+        ).all()
         assert [order.execution_plan_item_id for order in orders] == [repaired_stop_id]
 
     engine.dispose()
@@ -3931,6 +4768,13 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
             ],
         )
     )
+    entry_item_id = "entry-033530-retry-pending"
+    entry_family = "family-033530-retry-pending"
+    decision_lane = "signal-decider"
+    entry_context = {
+        "execution_plan_item_id": entry_item_id,
+        "source_plan_item_id": entry_family,
+    }
 
     resume = client.post(
         "/controls/resume",
@@ -3949,9 +4793,19 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
                     "symbol": "033530",
                     "side": "sell",
                     "intent": "stop_sell",
+                    "provider": "kis",
+                    "venue": "KRX",
+                    "asset_class": "stock",
                     "trigger_price": "8060.00",
-                    "quantity_policy": {"kind": "position_exit_from_entry"},
-                    "risk_context": {"exchange": "KRX"},
+                    "quantity_policy": {
+                        "kind": "position_exit_from_entry",
+                        "linked_entry_item_key": entry_family,
+                    },
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "entry_context": entry_context,
+                    },
+                    "decision_agent_name": decision_lane,
                 }
             ],
         },
@@ -3967,17 +4821,37 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
                     "symbol": "033530",
                     "side": "sell",
                     "intent": "target_sell",
+                    "provider": "kis",
+                    "venue": "KRX",
+                    "asset_class": "stock",
                     "trigger_price": "9250.00",
-                    "quantity_policy": {"kind": "position_exit_from_entry"},
-                    "risk_context": {"exchange": "KRX"},
+                    "quantity_policy": {
+                        "kind": "position_exit_from_entry",
+                        "linked_entry_item_key": entry_family,
+                    },
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "entry_context": entry_context,
+                    },
+                    "decision_agent_name": decision_lane,
                 },
                 {
                     "symbol": "033530",
                     "side": "sell",
                     "intent": "stop_sell",
+                    "provider": "kis",
+                    "venue": "KRX",
+                    "asset_class": "stock",
                     "trigger_price": "8700.00",
-                    "quantity_policy": {"kind": "position_exit_from_entry"},
-                    "risk_context": {"exchange": "KRX"},
+                    "quantity_policy": {
+                        "kind": "position_exit_from_entry",
+                        "linked_entry_item_key": entry_family,
+                    },
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "entry_context": entry_context,
+                    },
+                    "decision_agent_name": decision_lane,
                 },
             ],
         },
@@ -3992,8 +4866,20 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
         newer_stop = session.get(ExecutionPlanItem, newer_stop_id)
         assert older_stop is not None
         assert newer_stop is not None
+        _add_filled_entry_family(
+            session,
+            settings=app.state.settings,
+            symbol="033530",
+            quantity=58,
+            price=Decimal("8500.00"),
+            item_id=entry_item_id,
+            source_plan_item_id=entry_family,
+            decision_agent_name=decision_lane,
+            filled_at=datetime(2026, 5, 27, 1, 0, tzinfo=UTC),
+            plan=older_stop.plan,
+        )
         older_stop.status = "broker_order_retry_pending"
-        newer_stop.status = "broker_order_rejected"
+        newer_stop.status = "broker_order_failed"
         rejected_order = BrokerOrder(
             execution_plan_item_id=older_stop_id,
             broker_name="kis",
@@ -4004,13 +4890,23 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
             status="retry_pending",
             quantity=58,
             venue="KRX",
-            asset_class="kr_equity",
-            request_metadata=_execution_scope_metadata(app.state.settings),
+            asset_class="stock",
+            request_metadata=_monitoring_order_request_metadata(
+                app.state.settings,
+                entry_family=entry_family,
+                decision_lane=decision_lane,
+            ),
             last_error_code="KIOK0320",
             last_error_message="장운영시간이 아닙니다",
             last_error_retryable=True,
         )
         session.add(rejected_order)
+        session.flush()
+        _add_verified_session_rejection_event(
+            session,
+            order=rejected_order,
+            observed_at=datetime(2026, 5, 28, 1, 4, tzinfo=UTC),
+        )
         session.add(
             _scoped_execution_position(
                 app.state.settings,
@@ -4033,13 +4929,18 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
         )
 
         assert result.status_code == 200
-        assert result.payload["submitted_order_count"] == 1
+        assert result.payload["submitted_order_count"] == 1, repr(
+            result.payload["items"]
+        )
         assert broker_adapter.order_calls[0].symbol == "033530"
         assert broker_adapter.order_calls[0].side == "sell"
         assert broker_adapter.order_calls[0].quantity == 58
         assert broker_adapter.order_calls[0].execution_plan_item_id == older_stop_id
         replacement_order = session.scalar(
-            select(BrokerOrder).where(BrokerOrder.id != rejected_order.id)
+            select(BrokerOrder).where(
+                BrokerOrder.execution_plan_item_id == older_stop_id,
+                BrokerOrder.id != rejected_order.id,
+            )
         )
         assert replacement_order is not None
         assert replacement_order.request_metadata["metadata"]["retry"] == {
@@ -4123,6 +5024,13 @@ def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
             ],
         )
     )
+    entry_item_id = "entry-033530-retry-chain"
+    entry_family = "family-033530-retry-chain"
+    decision_lane = "signal-decider"
+    entry_context = {
+        "execution_plan_item_id": entry_item_id,
+        "source_plan_item_id": entry_family,
+    }
     assert client.post(
         "/controls/resume",
         json={"actor": "ops", "source": "test", "reason": "enable monitoring retry"},
@@ -4138,9 +5046,19 @@ def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
                     "symbol": "033530",
                     "side": "sell",
                     "intent": "stop_sell",
+                    "provider": "kis",
+                    "venue": "KRX",
+                    "asset_class": "stock",
                     "trigger_price": "8700.00",
-                    "quantity_policy": {"kind": "position_exit_from_entry"},
-                    "risk_context": {"exchange": "KRX"},
+                    "quantity_policy": {
+                        "kind": "position_exit_from_entry",
+                        "linked_entry_item_key": entry_family,
+                    },
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "entry_context": entry_context,
+                    },
+                    "decision_agent_name": decision_lane,
                 }
             ],
         },
@@ -4151,6 +5069,18 @@ def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
     with app.state.db_session_factory() as session:
         stop = session.get(ExecutionPlanItem, stop_id)
         assert stop is not None
+        _add_filled_entry_family(
+            session,
+            settings=app.state.settings,
+            symbol="033530",
+            quantity=58,
+            price=Decimal("8500.00"),
+            item_id=entry_item_id,
+            source_plan_item_id=entry_family,
+            decision_agent_name=decision_lane,
+            filled_at=datetime(2026, 5, 27, 1, 0, tzinfo=UTC),
+            plan=stop.plan,
+        )
         stop.status = "broker_order_retry_pending"
         first_rejection = BrokerOrder(
             execution_plan_item_id=stop_id,
@@ -4163,9 +5093,10 @@ def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
             quantity=58,
             venue="KRX",
             asset_class="stock",
-            request_metadata=_execution_scope_metadata(
+            request_metadata=_monitoring_order_request_metadata(
                 app.state.settings,
-                asset_class="stock",
+                entry_family=entry_family,
+                decision_lane=decision_lane,
             ),
             last_error_classification="broker_rejected",
             last_error_code="KIOK0320",
@@ -4173,6 +5104,12 @@ def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
             last_error_retryable=True,
         )
         session.add(first_rejection)
+        session.flush()
+        _add_verified_session_rejection_event(
+            session,
+            order=first_rejection,
+            observed_at=datetime(2026, 5, 28, 1, 4, tzinfo=UTC),
+        )
         session.add(
             _scoped_execution_position(
                 app.state.settings,
@@ -4200,7 +5137,10 @@ def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
         )
         second_rejection = session.scalar(
             select(BrokerOrder)
-            .where(BrokerOrder.id != first_rejection.id)
+            .where(
+                BrokerOrder.execution_plan_item_id == stop_id,
+                BrokerOrder.id != first_rejection.id,
+            )
             .order_by(BrokerOrder.created_at.desc(), BrokerOrder.id.desc())
         )
         assert second_rejection is not None
@@ -4273,7 +5213,17 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
         )
     )
     client = TestClient(app)
-    broker_adapter = StubMonitoringBrokerAdapter()
+    broker_adapter = StubMonitoringBrokerAdapter(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000.00"),
+            observed_at=datetime(2026, 8, 10, 1, 4, 30, tzinfo=UTC),
+            source="stub",
+        )
+    )
+    entry_item_id = "same-symbol-held-entry"
+    entry_family = "same-symbol-held-family"
+    held_decision_lane = "signal-decider"
+    watch_decision_lane = "short-term-decider"
 
     resume = client.post(
         "/controls/resume",
@@ -4295,8 +5245,17 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
     sell_risk_context, sell_quantity_policy = bind_kis_account_route(
         settings=app.state.settings,
         provider="kis",
-        risk_context={"exchange": "KRX"},
-        quantity_policy={"kind": "position_exit_from_entry"},
+        risk_context={
+            "exchange": "KRX",
+            "entry_context": {
+                "execution_plan_item_id": entry_item_id,
+                "source_plan_item_id": entry_family,
+            },
+        },
+        quantity_policy={
+            "kind": "position_exit_from_entry",
+            "linked_entry_item_key": entry_family,
+        },
     )
 
     with app.state.db_session_factory() as session:
@@ -4332,8 +5291,13 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
                     side="buy",
                     intent="intraday_watch_buy",
                     status="watch_monitoring_active",
-                        quantity_policy=buy_quantity_policy,
-                        risk_context=buy_risk_context,
+                    provider="kis",
+                    venue="KRX",
+                    asset_class="stock",
+                    quantity_policy=buy_quantity_policy,
+                    risk_context=buy_risk_context,
+                    decision_agent_name=watch_decision_lane,
+                    source_plan_item_id="same-symbol-watch-family",
                     trigger_price=Decimal("7300.0000"),
                     limit_price=Decimal("7300.0000"),
                     time_in_force="day",
@@ -4346,12 +5310,28 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
                     side="sell",
                     intent="stop_sell",
                     status="stop_sell_monitoring",
-                        quantity_policy=sell_quantity_policy,
+                    provider="kis",
+                    venue="KRX",
+                    asset_class="stock",
+                    quantity_policy=sell_quantity_policy,
                     trigger_price=Decimal("7600.0000"),
                     time_in_force="day",
-                        risk_context=sell_risk_context,
+                    risk_context=sell_risk_context,
+                    decision_agent_name=held_decision_lane,
                 ),
             ]
+        )
+        _add_filled_entry_family(
+            session,
+            settings=app.state.settings,
+            symbol="033530",
+            quantity=1,
+            price=Decimal("8500.0000"),
+            item_id=entry_item_id,
+            source_plan_item_id=entry_family,
+            decision_agent_name=held_decision_lane,
+            filled_at=datetime(2026, 8, 10, 0, 50, tzinfo=UTC),
+            plan=plan,
         )
         session.commit()
 
@@ -4367,6 +5347,7 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
         assert result.status_code == 200
         assert result.payload["submitted_order_count"] == 1
         assert result.payload["deferred_item_count"] == 1
+        assert result.payload["blocked_item_count"] == 0
         assert [request.side for request in broker_adapter.order_calls] == ["sell"]
         assert broker_adapter.order_calls[0].execution_plan_item_id == "same-symbol-protective-stop-second"
 
@@ -4378,6 +5359,142 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
         assert items_by_id["same-symbol-watch-buy-first"]["outcome"] == "deferred"
 
     engine.dispose()
+
+
+def test_same_tick_two_lane_watch_buys_share_aggregate_exposure_without_cross_lane_dedupe() -> None:
+    observed_at = datetime(2026, 10, 23, 1, 5, tzinfo=UTC)
+    broker_adapter = StubMonitoringBrokerAdapter(
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000.00"),
+            buying_power=Decimal("1000.00"),
+            observed_at=observed_at,
+            source="stub:account_snapshot",
+        )
+    )
+    app, engine = build_test_app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            monitoring_max_broker_actions_per_cycle=3,
+            account_drawdown_gate_enabled=False,
+            exec_agent_max_position_allocation_pct=Decimal("1"),
+            exec_agent_max_symbol_exposure_pct=Decimal("1"),
+            exec_agent_max_symbol_total_exposure_pct=Decimal("1"),
+            exec_agent_max_symbol_budget=Decimal("1000"),
+        )
+    )
+    client = TestClient(app)
+    resume = client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "enable two-lane buys"},
+    )
+    assert resume.status_code == 200
+
+    def add_watch_plan(
+        session,
+        *,
+        item_id: str,
+        decision_agent_name: str,
+        accepted_at: datetime,
+    ) -> ExecutionPlanItem:
+        risk_context, quantity_policy = bind_kis_account_route(
+            settings=app.state.settings,
+            provider="kis",
+            risk_context={"exchange": "KRX"},
+            quantity_policy={
+                "kind": "shares",
+                "quantity": 8,
+                "stop_price": "99.0000",
+                "max_budget": "800.0000",
+            },
+        )
+        item = ExecutionPlanItem(
+            id=item_id,
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="watch_monitoring_active",
+            provider="kis",
+            source_plan_item_id=f"{item_id}-family",
+            decision_agent_name=decision_agent_name,
+            quantity_policy=quantity_policy,
+            risk_context=risk_context,
+            trigger_price=Decimal("100.0000"),
+            limit_price=Decimal("100.0000"),
+            time_in_force="day",
+        )
+        session.add(
+            ExecutionPlan(
+                id=f"plan-{item_id}",
+                external_plan_id=f"plan-{item_id}",
+                source="test-fixture",
+                market_date=date(2026, 10, 23),
+                mode="paper",
+                status="accepted",
+                accepted_at=accepted_at,
+                items=[item],
+            )
+        )
+        return item
+
+    try:
+        with app.state.db_session_factory() as session:
+            add_watch_plan(
+                session,
+                item_id="same-tick-signal-old",
+                decision_agent_name="signal-decider",
+                accepted_at=observed_at - timedelta(minutes=3),
+            )
+            newer_signal = add_watch_plan(
+                session,
+                item_id="same-tick-signal-new",
+                decision_agent_name=" SIGNAL-DECIDER ",
+                accepted_at=observed_at - timedelta(minutes=2),
+            )
+            short_term = add_watch_plan(
+                session,
+                item_id="same-tick-short-term",
+                decision_agent_name="short-term-decider",
+                accepted_at=observed_at - timedelta(minutes=1),
+            )
+            session.commit()
+
+            result = run_autonomous_monitoring_cycle(
+                settings=app.state.settings,
+                db=session,
+                adapter=broker_adapter,
+                prices=[
+                    MonitoringPriceRequest(
+                        symbol="005930",
+                        price=Decimal("100.0000"),
+                        observed_at=observed_at,
+                    )
+                ],
+                symbols=["005930"],
+                now=observed_at,
+            )
+
+            assert result.status_code == 200
+            assert result.payload["evaluated_item_count"] == 2
+            assert result.payload["submitted_order_count"] == 2
+            assert {
+                request.execution_plan_item_id
+                for request in broker_adapter.order_calls
+            } == {newer_signal.id, short_term.id}
+            assert sorted(request.quantity for request in broker_adapter.order_calls) == [2, 8]
+            assert sum(
+                Decimal(request.quantity) * Decimal("100")
+                for request in broker_adapter.order_calls
+            ) == Decimal("1000")
+
+            assert newer_signal.status == "watch_buy_submitted"
+            assert short_term.status == "watch_buy_submitted"
+    finally:
+        engine.dispose()
 
 
 def test_autonomous_monitoring_expires_known_flat_pending_sell_monitors() -> None:
@@ -4919,7 +6036,10 @@ def test_monitoring_refreshes_stale_flat_position_before_sell_symbol_selection()
     engine.dispose()
 
 
-def test_autonomous_monitoring_retains_pending_sell_after_unexited_buy_order() -> None:
+@pytest.mark.parametrize("buy_exchange", ["KRX", "NXT"])
+def test_autonomous_monitoring_retains_pending_sell_after_unexited_buy_order(
+    buy_exchange: str,
+) -> None:
     app, engine = build_test_app(
         Settings(
             database_url="sqlite:///:memory:",
@@ -4973,10 +6093,14 @@ def test_autonomous_monitoring_retains_pending_sell_after_unexited_buy_order() -
                 side="buy",
                 status="filled",
                 quantity=1,
-                venue="KRX",
+                venue=buy_exchange,
                 asset_class="kr_equity",
                 limit_price=Decimal("567000.00"),
-                request_metadata=_execution_scope_metadata(app.state.settings),
+                request_metadata=_execution_scope_metadata(
+                    app.state.settings,
+                    exchange=buy_exchange,
+                    venue=buy_exchange,
+                ),
                 submitted_at=datetime(2026, 6, 4, 0, 55, tzinfo=UTC),
             )
         )
@@ -5516,11 +6640,390 @@ def test_post_entry_maintenance_creates_missing_target_sell_monitor() -> None:
     engine.dispose()
 
 
+def test_post_entry_maintenance_caps_each_lane_to_its_fill_family() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        execution_position_account_scope="health-two-lane-post-entry",
+    )
+    app, engine = build_test_app(settings)
+    signal_risk, signal_policy = bind_kis_account_route(
+        settings=app.state.settings,
+        provider="kis",
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "110.00",
+            "stop_loss_price": "95.00",
+            "max_holding_close_policy": {"enabled": False},
+        },
+        quantity_policy={"kind": "shares", "quantity": 2},
+    )
+    short_risk, short_policy = bind_kis_account_route(
+        settings=app.state.settings,
+        provider="kis",
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "121.00",
+            "stop_loss_price": "104.50",
+            "max_holding_close_policy": {
+                "enabled": True,
+                "trading_sessions": 3,
+            },
+        },
+        quantity_policy={"kind": "shares", "quantity": 3},
+    )
+
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="two-lane-post-entry-maintenance",
+            source="test-fixture",
+            market_date=date(2026, 6, 8),
+            mode="paper",
+            status="accepted",
+            accepted_at=datetime(2026, 6, 8, 0, 30, tzinfo=UTC),
+        )
+        signal_entry = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=0,
+            symbol="002380",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="broker_order_submitted",
+            source_plan_item_id="signal-family-entry",
+            decision_agent_name="signal-decider",
+            quantity_policy=signal_policy,
+            risk_context=signal_risk,
+            limit_price=Decimal("100.00"),
+            provider="kis",
+            venue="KRX",
+            asset_class="kr_equity",
+        )
+        short_entry = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=1,
+            symbol="002380",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="broker_order_submitted",
+            source_plan_item_id="short-family-entry",
+            decision_agent_name="short-term-decider",
+            quantity_policy=short_policy,
+            risk_context=short_risk,
+            limit_price=Decimal("110.00"),
+            provider="kis",
+            venue="KRX",
+            asset_class="kr_equity",
+        )
+        old_flattened_entry = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=2,
+            symbol="002380",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="filled",
+            source_plan_item_id="old-flat-family-entry",
+            decision_agent_name="signal-decider",
+            quantity_policy=signal_policy,
+            risk_context=signal_risk,
+            limit_price=Decimal("90.00"),
+            provider="kis",
+            venue="KRX",
+            asset_class="kr_equity",
+        )
+        session.add(plan)
+        session.flush()
+        old_flattened_order = BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            execution_plan_item_id=old_flattened_entry.id,
+            idempotency_key="old-flat-family-buy",
+            symbol="002380",
+            side="buy",
+            status="filled",
+            quantity=1,
+            venue="KRX",
+            asset_class="kr_equity",
+            limit_price=Decimal("90.00"),
+            request_metadata=_execution_scope_metadata(app.state.settings),
+            submitted_at=datetime(2026, 6, 1, 0, 50, tzinfo=UTC),
+        )
+        signal_order = BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            execution_plan_item_id=signal_entry.id,
+            idempotency_key="two-lane-signal-buy",
+            symbol="002380",
+            side="buy",
+            status="filled",
+            quantity=2,
+            venue="KRX",
+            asset_class="kr_equity",
+            limit_price=Decimal("100.00"),
+            request_metadata=_execution_scope_metadata(app.state.settings),
+            submitted_at=datetime(2026, 6, 8, 0, 50, tzinfo=UTC),
+        )
+        short_order = BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            execution_plan_item_id=short_entry.id,
+            idempotency_key="two-lane-short-buy",
+            symbol="002380",
+            side="buy",
+            status="filled",
+            quantity=3,
+            venue="KRX",
+            asset_class="kr_equity",
+            limit_price=Decimal("110.00"),
+            request_metadata=_execution_scope_metadata(app.state.settings),
+            submitted_at=datetime(2026, 6, 8, 0, 55, tzinfo=UTC),
+        )
+        session.add_all([old_flattened_order, signal_order, short_order])
+        session.flush()
+        route_identity = build_position_identity(
+            settings=app.state.settings,
+            provider="kis",
+            exchange="KRX",
+        )
+        session.add_all(
+            [
+                ExecutionFill(
+                    broker_order_pk=old_flattened_order.id,
+                    broker_fill_id="old-flat-family-fill",
+                    symbol="002380",
+                    side="buy",
+                    quantity=1,
+                    price=Decimal("90.00"),
+                    filled_at=datetime(2026, 6, 1, 0, 51, tzinfo=UTC),
+                    payload={"fill_time_precision": "exact"},
+                ),
+                ExecutionFill(
+                    broker_order_pk=signal_order.id,
+                    broker_fill_id="two-lane-signal-fill",
+                    symbol="002380",
+                    side="buy",
+                    quantity=2,
+                    price=Decimal("100.00"),
+                    filled_at=datetime(2026, 6, 8, 0, 51, tzinfo=UTC),
+                    payload={"fill_time_precision": "exact"},
+                ),
+                ExecutionFill(
+                    broker_order_pk=short_order.id,
+                    broker_fill_id="two-lane-short-fill",
+                    symbol="002380",
+                    side="buy",
+                    quantity=3,
+                    price=Decimal("110.00"),
+                    filled_at=datetime(2026, 6, 8, 0, 51, tzinfo=UTC),
+                    payload={"fill_time_precision": "exact"},
+                ),
+                FifoInventoryIsolation(
+                    mode="paper",
+                    provider="kis",
+                    account_scope=route_identity.account_scope,
+                    venue="KRX",
+                    asset_class="kr_equity",
+                    exchange="KRX",
+                    symbol="002380",
+                    residual_quantity=Decimal("1"),
+                    last_local_fill_at=datetime(2026, 6, 1, 0, 51, tzinfo=UTC),
+                    broker_position_id="old-flat-family-position",
+                    broker_position_quantity=Decimal("0"),
+                    broker_reconciled_at=datetime(2026, 6, 7, 0, 0, tzinfo=UTC),
+                    isolated_through_at=datetime(2026, 6, 7, 0, 0, tzinfo=UTC),
+                    evidence_source="broker_flat_reconciliation",
+                    actor="test",
+                    reason="verified flat before current two-lane entries",
+                ),
+            ]
+        )
+        position = _scoped_execution_position(
+            app.state.settings,
+            mode="paper",
+            symbol="002380",
+            quantity=5,
+            average_price=Decimal("106.00"),
+            updated_from="reconciliation",
+            last_reconciled_at=datetime(2026, 6, 8, 1, 0, tzinfo=UTC),
+        )
+        session.add(position)
+        session.commit()
+
+        _maintain_post_entry_exit_monitors(
+            settings=app.state.settings,
+            db=session,
+            positions_by_symbol={"002380": position},
+            prices={
+                "002380": MonitoringPriceRequest(
+                    symbol="002380",
+                    price=Decimal("107.00"),
+                )
+            },
+            triggered_at=datetime(2026, 6, 8, 1, 5, tzinfo=UTC),
+        )
+        session.flush()
+
+        monitors = session.scalars(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "002380",
+                ExecutionPlanItem.side == "sell",
+            )
+        ).all()
+        family_quantities = {
+            (
+                item.decision_agent_name,
+                item.intent,
+            ): item.quantity_policy.get("quantity")
+            for item in monitors
+        }
+        assert family_quantities == {
+            ("signal-decider", "stop_sell"): 2,
+            ("signal-decider", "target_sell"): 2,
+            ("short-term-decider", "stop_sell"): 3,
+            ("short-term-decider", "target_sell"): 3,
+            ("short-term-decider", "max_holding_close_sell"): None,
+        }
+        short_max_holding = next(
+            item
+            for item in monitors
+            if item.decision_agent_name == "short-term-decider"
+            and item.intent == "max_holding_close_sell"
+        )
+        assert short_max_holding.risk_context["entry_context"]["entry_quantity"] == 3
+        assert short_max_holding.risk_context["max_holding_sessions"] == 3
+        assert {
+            item.risk_context["entry_context"]["source_plan_item_id"]
+            for item in monitors
+        } == {"signal-family-entry", "short-family-entry"}
+
+        signal_target = next(
+            item
+            for item in monitors
+            if item.decision_agent_name == "signal-decider"
+            and item.intent == "target_sell"
+        )
+        signal_exit_order = BrokerOrder(
+            broker_name="kis",
+            mode="paper",
+            execution_plan_item_id=signal_target.id,
+            idempotency_key="two-lane-signal-partial-exit",
+            symbol="002380",
+            side="sell",
+            status="filled",
+            quantity=1,
+            venue="KRX",
+            asset_class="kr_equity",
+            limit_price=Decimal("110.00"),
+            request_metadata=_execution_scope_metadata(app.state.settings),
+            submitted_at=datetime(2026, 6, 8, 1, 6, tzinfo=UTC),
+        )
+        session.add(signal_exit_order)
+        session.flush()
+        session.add(
+            ExecutionFill(
+                broker_order_pk=signal_exit_order.id,
+                broker_fill_id="two-lane-signal-partial-exit-fill",
+                symbol="002380",
+                side="sell",
+                quantity=1,
+                price=Decimal("110.00"),
+                filled_at=datetime(2026, 6, 8, 1, 7, tzinfo=UTC),
+                payload={"fill_time_precision": "exact"},
+            )
+        )
+        position.quantity = 4
+        position.last_reconciled_at = datetime(2026, 6, 8, 1, 8, tzinfo=UTC)
+        session.commit()
+
+        _maintain_post_entry_exit_monitors(
+            settings=app.state.settings,
+            db=session,
+            positions_by_symbol={"002380": position},
+            prices={
+                "002380": MonitoringPriceRequest(
+                    symbol="002380",
+                    price=Decimal("107.00"),
+                )
+            },
+            triggered_at=datetime(2026, 6, 8, 1, 9, tzinfo=UTC),
+        )
+        session.flush()
+
+        refreshed_monitors = session.scalars(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "002380",
+                ExecutionPlanItem.side == "sell",
+            )
+        ).all()
+        refreshed_quantities = {
+            (item.decision_agent_name, item.intent): item.quantity_policy.get(
+                "quantity"
+            )
+            for item in refreshed_monitors
+            if item.intent in {"stop_sell", "target_sell"}
+        }
+        assert refreshed_quantities == {
+            ("signal-decider", "stop_sell"): 1,
+            ("signal-decider", "target_sell"): 1,
+            ("short-term-decider", "stop_sell"): 3,
+            ("short-term-decider", "target_sell"): 3,
+        }
+
+        unlinked_exit = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=20,
+            symbol="002380",
+            side="sell",
+            intent="target_sell",
+            status="broker_order_submitted",
+            quantity_policy={"kind": "shares", "quantity": 1},
+            risk_context={"exchange": "KRX"},
+            provider="kis",
+            venue="KRX",
+            asset_class="kr_equity",
+        )
+        session.add(unlinked_exit)
+        session.flush()
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                execution_plan_item_id=unlinked_exit.id,
+                idempotency_key="unlinked-two-lane-exit",
+                symbol="002380",
+                side="sell",
+                status="submitted",
+                quantity=1,
+                venue="KRX",
+                asset_class="kr_equity",
+                request_metadata=_execution_scope_metadata(app.state.settings),
+                submitted_at=datetime(2026, 6, 8, 1, 10, tzinfo=UTC),
+            )
+        )
+        session.flush()
+
+        blocked_family_quantities, blocked_family_entry_prices = (
+            _remaining_quantities_by_entry_family(
+                settings=app.state.settings,
+                db=session,
+                positions_by_symbol={"002380": position},
+                through=datetime(2026, 6, 8, 1, 11, tzinfo=UTC),
+                rearmed_plan_item_ids=set(),
+            )
+        )
+        assert blocked_family_quantities == {("002380", "", None): 0}
+        assert blocked_family_entry_prices == {}
+
+    engine.dispose()
+
+
 def test_post_entry_maintenance_promotes_pending_target_sell_monitor() -> None:
     app, engine = build_test_app(
         Settings(
             database_url="sqlite:///:memory:",
             runtime_mode="paper",
+            execution_position_account_scope="health-target-pending-repair",
         )
     )
     client = TestClient(app)
@@ -5536,6 +7039,7 @@ def test_post_entry_maintenance_promotes_pending_target_sell_monitor() -> None:
                     "symbol": "002380",
                     "side": "buy",
                     "intent": "intraday_watch_buy",
+                    "decision_agent_name": "signal-decider",
                     "source_plan_item_id": "entry-1",
                     "trigger_price": "100.00",
                     "limit_price": "100.00",
@@ -5550,6 +7054,7 @@ def test_post_entry_maintenance_promotes_pending_target_sell_monitor() -> None:
                     "symbol": "002380",
                     "side": "sell",
                     "intent": "target_sell",
+                    "decision_agent_name": "signal-decider",
                     "trigger_price": "110.00",
                     "quantity_policy": {
                         "type": "position_exit_from_entry",
@@ -5642,11 +7147,34 @@ def test_post_entry_maintenance_preserves_active_sell_agent_state(
     agent_status: str,
     intent: str,
 ) -> None:
-    app, engine = build_test_app(
-        Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="health-active-agent-state",
     )
+    app, engine = build_test_app(settings)
 
     with app.state.db_session_factory() as session:
+        entry_risk_context, entry_quantity_policy = bind_kis_account_route(
+            settings=app.state.settings,
+            provider="kis",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "110",
+                "stop_price": "95",
+            },
+            quantity_policy={"kind": "shares", "quantity": 3},
+        )
+        sell_risk_context, sell_quantity_policy = bind_kis_account_route(
+            settings=app.state.settings,
+            provider="kis",
+            risk_context={"exchange": "KRX"},
+            quantity_policy={
+                "kind": "shares",
+                "quantity": 3,
+                "linked_entry_item_key": "entry-family",
+            },
+        )
         entry_item = ExecutionPlanItem(
             id=f"entry-{intent}-{agent_status}",
             plan_item_index=0,
@@ -5655,14 +7183,14 @@ def test_post_entry_maintenance_preserves_active_sell_agent_state(
             intent="intraday_watch_buy",
             status="broker_order_submitted",
             source_plan_item_id="entry-family",
-            quantity_policy={"kind": "shares", "quantity": 3},
+            decision_agent_name="signal-decider",
+            quantity_policy=entry_quantity_policy,
             trigger_price=Decimal("100"),
             limit_price=Decimal("100"),
-            risk_context={
-                "exchange": "KRX",
-                "target_price": "110",
-                "stop_price": "95",
-            },
+            risk_context=entry_risk_context,
+            provider="kis",
+            venue="KRX",
+            asset_class="kr_equity",
         )
         sell_item = ExecutionPlanItem(
             id=f"{intent}-{agent_status}",
@@ -5671,13 +7199,13 @@ def test_post_entry_maintenance_preserves_active_sell_agent_state(
             side="sell",
             intent=intent,
             status=agent_status,
-            quantity_policy={
-                "kind": "shares",
-                "quantity": 3,
-                "linked_entry_item_key": "entry-family",
-            },
+            decision_agent_name="signal-decider",
+            quantity_policy=sell_quantity_policy,
             trigger_price=Decimal("95" if intent == "stop_sell" else "110"),
-            risk_context={"exchange": "KRX"},
+            risk_context=sell_risk_context,
+            provider="kis",
+            venue="KRX",
+            asset_class="kr_equity",
         )
         session.add(
             ExecutionPlan(
@@ -5844,6 +7372,7 @@ def test_cached_autonomous_monitoring_repairs_targets_before_idle_exit() -> None
             database_url="sqlite:///:memory:",
             runtime_mode="paper",
             autonomous_runtime_enabled=True,
+            execution_position_account_scope="health-cached-target-repair",
         ),
         autonomous_runtime_enabled=True,
         monitoring_price_source=price_source,
@@ -5861,6 +7390,7 @@ def test_cached_autonomous_monitoring_repairs_targets_before_idle_exit() -> None
                     "symbol": "002380",
                     "side": "buy",
                     "intent": "intraday_watch_buy",
+                    "decision_agent_name": "signal-decider",
                     "source_plan_item_id": "entry-1",
                     "trigger_price": "100.00",
                     "limit_price": "100.00",
@@ -5875,6 +7405,7 @@ def test_cached_autonomous_monitoring_repairs_targets_before_idle_exit() -> None
                     "symbol": "002380",
                     "side": "sell",
                     "intent": "target_sell",
+                    "decision_agent_name": "signal-decider",
                     "trigger_price": "110.00",
                     "quantity_policy": {
                         "type": "position_exit_from_entry",
@@ -6022,6 +7553,8 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
                 "remaining_quantity": 0,
                 "average_fill_price": "100.00",
                 "filled_at": self.observed_at.isoformat(),
+                "fill_time_precision": "exact",
+                "fill_time_source": "broker_payload",
                 "observed_at": self.observed_at.isoformat(),
             }
 
@@ -6084,6 +7617,8 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
             status="broker_order_submitted",
             trigger_price=Decimal("100.00"),
             limit_price=Decimal("100.00"),
+            decision_agent_name="signal-decider",
+            source_plan_item_id="live-fast-path-reconcile:entry",
             quantity_policy={"kind": "shares", "quantity": 3},
         )
         target_item = ExecutionPlanItem(
@@ -6095,7 +7630,13 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
             status="target_sell_monitoring",
             trigger_price=Decimal("110.00"),
             limit_price=Decimal("110.00"),
-            quantity_policy={"kind": "shares", "quantity": 3},
+            decision_agent_name="signal-decider",
+            source_plan_item_id="live-fast-path-reconcile:target",
+            quantity_policy={
+                "kind": "shares",
+                "quantity": 3,
+                "linked_entry_item_key": "live-fast-path-reconcile:entry",
+            },
         )
         for item in (buy_item, target_item):
             item.risk_context, item.quantity_policy = bind_kis_account_route(
@@ -6123,7 +7664,29 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
                 asset_class="kr_equity",
                 limit_price=Decimal("100.00"),
                 submitted_at=started_at - timedelta(minutes=1),
-                request_metadata=_execution_scope_metadata(app.state.settings),
+                request_metadata={
+                    **_execution_scope_metadata(app.state.settings),
+                    "metadata": {
+                        "strategy_entry_family_v1": {
+                            "policy_version": 1,
+                            "entry_family_key": (
+                                "source:live-fast-path-reconcile:entry"
+                            ),
+                            "decision_lane": "signal-decider",
+                        }
+                    },
+                    "original_command": {
+                        "metadata": {
+                            "strategy_entry_family_v1": {
+                                "policy_version": 1,
+                                "entry_family_key": (
+                                    "source:live-fast-path-reconcile:entry"
+                                ),
+                                "decision_lane": "signal-decider",
+                            }
+                        }
+                    },
+                },
             )
         )
         session.commit()
@@ -6141,8 +7704,10 @@ def test_live_desired_symbol_reconcile_syncs_positions_and_filled_today(tmp_path
     ]
     assert price_source.calls == [["002380"]]
     assert payload["cached_evaluation"] is True
-    assert payload["evaluated_item_count"] == 3
-    assert payload["post_entry_maintenance_count"] == 3
+    # The exact-family target is retained and only its missing sibling stop is
+    # synthesized; family-aware coverage must not clone a duplicate target.
+    assert payload["evaluated_item_count"] == 2, payload
+    assert payload["post_entry_maintenance_count"] == 2, payload
     assert target_item.id in {item["execution_plan_item_id"] for item in payload["items"]}
     assert payload["runtime_snapshot"]["position_count"] == 1
     assert payload["runtime_snapshot"]["filled_today_symbols"] == ["002380"]

@@ -4899,7 +4899,17 @@ def test_v4_intake_rejects_us_equity_before_persisting_unsupported_sizing() -> N
 
 
 def test_v4_watch_buy_normalization_uses_its_exact_linked_exit_family() -> None:
-    app, engine = _build_test_app()
+    app, engine = _build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="mock",
+            kis_account_number="00000000",
+            kis_account_product_code="00",
+            account_drawdown_recovery_scope_secret=(
+                "core-v4-family-route-secret-at-least-32-bytes"
+            ),
+        )
+    )
     client = TestClient(app)
     payload = _plan_payload(plan_id="core-v4-two-families")
 

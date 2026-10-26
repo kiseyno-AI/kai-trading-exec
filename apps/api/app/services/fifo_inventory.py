@@ -50,6 +50,37 @@ class FifoRouteScope:
         }
 
 
+def canonical_fifo_inventory_route_scope(
+    route_scope: FifoRouteScope,
+) -> FifoRouteScope:
+    """Return the physical inventory scope for an already-validated route.
+
+    KIS domestic stock orders can execute through KRX, NXT, or SOR while
+    settling into the same authenticated brokerage-account inventory.  Keep
+    the persisted execution route exact, but collapse those route variants at
+    FIFO/inventory boundaries so a later protective order can consume the lot
+    bought through another domestic route.
+
+    Every non-KIS, non-domestic, or non-stock route remains exact.  Callers
+    must first construct/validate ``FifoRouteScope``; this helper deliberately
+    does not try to repair incomplete or inconsistent persisted scopes.
+    """
+
+    if (
+        route_scope.provider in KIS_BROKER_NAMES
+        and route_scope.asset_class in KRX_ASSET_CLASS_ALIASES
+        and route_scope.exchange in KRX_EXCHANGES
+    ):
+        return FifoRouteScope(
+            provider="kis",
+            account_scope=route_scope.account_scope,
+            venue="KIS",
+            asset_class="stock",
+            exchange="KRX",
+        )
+    return route_scope
+
+
 FifoChronologyBucket = tuple[FifoRouteScope, str, datetime]
 
 
@@ -83,6 +114,20 @@ class FifoIsolationCursor:
         default_factory=dict
     )
 
+    def __post_init__(self) -> None:
+        canonical_boundaries: dict[tuple[FifoRouteScope, str], list[datetime]] = {}
+        for (route_scope, symbol), boundaries in (
+            self.isolated_at_by_route_symbol.items()
+        ):
+            route_symbol = (
+                canonical_fifo_inventory_route_scope(route_scope),
+                str(symbol or "").strip().upper(),
+            )
+            canonical_boundaries.setdefault(route_symbol, []).extend(boundaries)
+        for boundaries in canonical_boundaries.values():
+            boundaries.sort()
+        self.isolated_at_by_route_symbol = canonical_boundaries
+
     def apply_before(
         self,
         *,
@@ -95,7 +140,10 @@ class FifoIsolationCursor:
         observed_at_utc = _as_utc(observed_at)
         if route_scope is None:
             return False
-        route_key = (route_scope, normalized_symbol)
+        route_key = (
+            canonical_fifo_inventory_route_scope(route_scope),
+            normalized_symbol,
+        )
         boundaries = self.isolated_at_by_route_symbol.get(route_key, [])
         index = self._applied_count_by_route_symbol.get(route_key, 0)
         while index < len(boundaries) and boundaries[index] < observed_at_utc:
@@ -125,7 +173,10 @@ class FifoIsolationCursor:
         observed_at_utc = _as_utc(observed_at)
         if route_scope is None:
             return False
-        route_key = (route_scope, normalized_symbol)
+        route_key = (
+            canonical_fifo_inventory_route_scope(route_scope),
+            normalized_symbol,
+        )
         boundaries = self.isolated_at_by_route_symbol.get(route_key, [])
         index = self._applied_count_by_route_symbol.get(route_key, 0)
         while index < len(boundaries) and boundaries[index] <= observed_at_utc:
@@ -176,7 +227,10 @@ class FifoIsolationCursor:
 
         observed_at_utc = _as_utc(observed_at)
         boundaries = self.isolated_at_by_route_symbol.get(
-            (route_scope, str(symbol or "").strip().upper()),
+            (
+                canonical_fifo_inventory_route_scope(route_scope),
+                str(symbol or "").strip().upper(),
+            ),
             [],
         )
         return next(
@@ -196,7 +250,10 @@ class FifoIsolationCursor:
     ) -> datetime | None:
         observed_at_utc = _as_utc(observed_at)
         boundaries = self.isolated_at_by_route_symbol.get(
-            (route_scope, str(symbol or "").strip().upper()),
+            (
+                canonical_fifo_inventory_route_scope(route_scope),
+                str(symbol or "").strip().upper(),
+            ),
             [],
         )
         return next(
@@ -217,8 +274,8 @@ def legacy_kis_krx_event_matches(
 ) -> bool:
     if (
         exact_route_scope is None
-        or exact_route_scope.provider != "kis"
-        or exact_route_scope.exchange != "KRX"
+        or canonical_fifo_inventory_route_scope(exact_route_scope).provider != "kis"
+        or canonical_fifo_inventory_route_scope(exact_route_scope).exchange != "KRX"
         or fifo_route_scope_from_order(order) is not None
     ):
         return False
@@ -329,7 +386,12 @@ def ambiguous_fifo_chronology_buckets(
         if not isinstance(observed_at, datetime):
             continue
         order = getattr(fill, "broker_order", None)
-        route_scope = fifo_route_scope_from_order(order)
+        exact_route_scope = fifo_route_scope_from_order(order)
+        route_scope = (
+            canonical_fifo_inventory_route_scope(exact_route_scope)
+            if exact_route_scope is not None
+            else None
+        )
         symbol = str(getattr(fill, "symbol", "") or "").strip().upper()
         order_symbol = str(getattr(order, "symbol", "") or "").strip().upper()
         side = str(getattr(fill, "side", "") or "").strip().lower()
@@ -396,6 +458,7 @@ def fifo_chronology_ambiguity_reason_at(
     boundary starts a generation that is independent of that bounded fill.
     """
 
+    route_scope = canonical_fifo_inventory_route_scope(route_scope)
     normalized_symbol = str(symbol or "").strip().upper()
     event_at = _as_utc(observed_at)
     event_boundary = (
@@ -567,7 +630,12 @@ def ambiguous_fifo_chronology_fill_count(
     count = 0
     for fill in fills:
         order = getattr(fill, "broker_order", None)
-        route_scope = fifo_route_scope_from_order(order)
+        exact_route_scope = fifo_route_scope_from_order(order)
+        route_scope = (
+            canonical_fifo_inventory_route_scope(exact_route_scope)
+            if exact_route_scope is not None
+            else None
+        )
         symbol = str(getattr(fill, "symbol", "") or "").strip().upper()
         if route_scope is not None and (route_scope, symbol) in ambiguous_routes:
             count += 1
@@ -603,8 +671,13 @@ def ambiguous_fifo_realized_pnl_sell_count(
             continue
         if str(getattr(fill, "side", "") or "").strip().lower() != "sell":
             continue
-        route_scope = fifo_route_scope_from_order(
+        exact_route_scope = fifo_route_scope_from_order(
             getattr(fill, "broker_order", None)
+        )
+        route_scope = (
+            canonical_fifo_inventory_route_scope(exact_route_scope)
+            if exact_route_scope is not None
+            else None
         )
         symbol = str(getattr(fill, "symbol", "") or "").strip().upper()
         if route_scope is None or not symbol:
@@ -665,7 +738,12 @@ def replay_open_long_fill_inventory(
         key=lambda event: fifo_fill_sort_key(event[2]),
     ):
         order = getattr(fill, "broker_order", None)
-        route_scope = fifo_route_scope_from_order(order)
+        exact_route_scope = fifo_route_scope_from_order(order)
+        route_scope = (
+            canonical_fifo_inventory_route_scope(exact_route_scope)
+            if exact_route_scope is not None
+            else None
+        )
         symbol = str(getattr(fill, "symbol", "") or "").strip().upper()
         order_symbol = str(getattr(order, "symbol", "") or "").strip().upper()
         side = str(getattr(fill, "side", "") or "").strip().lower()
@@ -972,9 +1050,12 @@ def load_fifo_isolation_cursor(
                 normalized_boundary
             )
             continue
-        boundaries.setdefault((route_scope, normalized_symbol), []).append(
+        inventory_scope = canonical_fifo_inventory_route_scope(route_scope)
+        boundaries.setdefault((inventory_scope, normalized_symbol), []).append(
             normalized_boundary
         )
+    for route_boundaries in boundaries.values():
+        route_boundaries.sort()
     return FifoIsolationCursor(
         isolated_at_by_route_symbol=boundaries,
         legacy_unscoped_at_by_symbol=legacy_boundaries,

@@ -43,6 +43,7 @@ from app.models.runtime import (
     ExecutionPosition,
     RuntimeRemediationEvent,
 )
+from app.services import broker_orders as broker_orders_service
 from app.services import reconciliation as reconciliation_service
 from app.services import monitoring as monitoring_service
 from app.services.execution_jobs import dispatch_due_execution_jobs
@@ -3076,11 +3077,95 @@ def test_monitoring_reconciles_stale_missing_position_from_broker_holdings_befor
                     "limit_price": "125000",
                     "time_in_force": "day",
                     "source_plan_item_id": "target-1",
+                    "decision_agent_name": "signal-decider",
                 }
             ],
         },
     )
     assert plan.status_code == 201
+
+    entry_risk_context, entry_quantity_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    entry_item = ExecutionPlanItem(
+        id="monitoring-reconcile-entry",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="filled",
+        provider="kis",
+        venue="kis",
+        asset_class="stock",
+        quantity_policy=entry_quantity_policy,
+        risk_context=entry_risk_context,
+        decision_agent_name="signal-decider",
+        source_plan_item_id="entry-1",
+        source_market_date=OBSERVED_AT.date(),
+    )
+    entry_family_identity = broker_orders_service._strategy_entry_family_identity(
+        entry_item
+    )
+    assert entry_family_identity is not None
+    entry_command_metadata = {
+        broker_orders_service.STRATEGY_ENTRY_FAMILY_METADATA_KEY: (
+            entry_family_identity
+        )
+    }
+    entry_order = BrokerOrder(
+        execution_plan_item_id=entry_item.id,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="monitoring-reconcile-entry-order",
+        broker_order_id="monitoring-reconcile-entry-order",
+        symbol="005930",
+        side="buy",
+        status="filled",
+        quantity=1,
+        venue="kis",
+        asset_class="stock",
+        limit_price=Decimal("70000"),
+        request_metadata={
+            "exchange": "KRX",
+            "execution_scope": execution_scope_payload(
+                identity=build_position_identity(
+                    settings=settings,
+                    provider="kis",
+                    exchange="KRX",
+                ),
+                venue="KIS",
+                asset_class="stock",
+            ),
+            "metadata": entry_command_metadata,
+            "original_command": {"metadata": entry_command_metadata},
+        },
+    )
+    entry_fill = ExecutionFill(
+        broker_order=entry_order,
+        broker_fill_id="monitoring-reconcile-entry-fill",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        price=Decimal("70000"),
+        filled_at=OBSERVED_AT - timedelta(days=1),
+        payload={"fill_time_precision": "exact"},
+    )
+    with session_factory() as db:
+        db.add(
+            ExecutionPlan(
+                external_plan_id="plan-monitoring-reconcile-entry",
+                source="test",
+                market_date=OBSERVED_AT.date() - timedelta(days=1),
+                mode="paper",
+                status="accepted",
+                items=[entry_item],
+            )
+        )
+        db.add_all([entry_order, entry_fill])
+        db.commit()
 
     evaluation = client.post(
         "/monitoring/evaluate",

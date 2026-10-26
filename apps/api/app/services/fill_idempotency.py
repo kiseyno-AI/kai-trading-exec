@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
@@ -123,6 +124,32 @@ def execution_fills_have_conflicting_identity(fills: list[ExecutionFill]) -> boo
         groups.setdefault(execution_fill_dedupe_key(fill), []).append(fill)
     return any(
         len(group) > 1 and duplicate_fill_economic_conflict(group)
+        for group in groups.values()
+    )
+
+
+def execution_fills_have_relevant_conflicting_identity(
+    fills: list[ExecutionFill],
+    *,
+    is_relevant: Callable[[ExecutionFill], bool],
+) -> bool:
+    """Whether a conflicting fill identity has any relevant observation.
+
+    Consumers commonly isolate old inventory with a verified-flat boundary or
+    bound a report to a review period.  Filtering rows before grouping is not
+    safe: a broker identity can have one observation before the boundary and a
+    conflicting observation after it.  Group the complete scoped evidence
+    first, then ignore a conflict only when every member is outside the
+    consumer's relevant generation/period.
+    """
+
+    groups: dict[str, list[ExecutionFill]] = {}
+    for fill in fills:
+        groups.setdefault(execution_fill_dedupe_key(fill), []).append(fill)
+    return any(
+        len(group) > 1
+        and duplicate_fill_economic_conflict(group)
+        and any(is_relevant(fill) for fill in group)
         for group in groups.values()
     )
 

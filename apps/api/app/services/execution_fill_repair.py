@@ -18,8 +18,10 @@ from app.models.runtime import (
     RuntimeRemediationEvent,
 )
 from app.services.fifo_inventory import (
+    FifoIsolationCursor,
     FifoRouteScope,
     ambiguous_fifo_chronology_buckets,
+    canonical_fifo_inventory_route_scope,
     fifo_chronology_is_ambiguous_at,
     fifo_fill_sort_key,
     fifo_route_scope_from_order,
@@ -222,6 +224,14 @@ def apply_fifo_inventory_repairs(
                         "broker_reconciliation_timestamp"
                     ],
                     "blocker": item["reason"],
+                    "execution_scope": item.get("execution_scope"),
+                    "inventory_scope": item.get("inventory_scope"),
+                    "exact_execution_scopes": item.get(
+                        "exact_execution_scopes"
+                    ),
+                    "duplicate_fill_conflicts": item.get(
+                        "duplicate_fill_conflicts"
+                    ),
                     "fills_deleted": 0,
                     "fills_fabricated": 0,
                     "orders_submitted": 0,
@@ -368,12 +378,88 @@ def _fifo_inventory_repair_payload(
     }
 
 
+def _fifo_duplicate_conflicts(
+    fills: list[ExecutionFill],
+) -> dict[tuple[FifoRouteScope, str], list[dict[str, object]]]:
+    """Classify raw conflicting identities before the FIFO reader drops them."""
+
+    groups: dict[str, list[ExecutionFill]] = defaultdict(list)
+    for fill in fills:
+        groups[execution_fill_dedupe_key(fill)].append(fill)
+
+    conflicts: dict[
+        tuple[FifoRouteScope, str], list[dict[str, object]]
+    ] = defaultdict(list)
+    for group_key, group in groups.items():
+        if len(group) <= 1 or not duplicate_fill_economic_conflict(group):
+            continue
+        fill_ids = sorted(str(fill.id) for fill in group)
+        conflict = {
+            "duplicate_group_key": duplicate_fill_group_candidate_key(
+                group_key=group_key,
+                fill_ids=fill_ids,
+            ),
+            "fill_ids": fill_ids,
+            "conflicting_fields": duplicate_fill_conflicting_fields(group),
+            "last_fill_at": max(
+                _parse_timestamp(
+                    fill.filled_at,
+                    fallback=datetime.min.replace(tzinfo=UTC),
+                )
+                for fill in group
+            ).isoformat(),
+        }
+        route_symbols: set[tuple[FifoRouteScope, str]] = set()
+        for fill in group:
+            exact_route_scope = fifo_route_scope_from_order(fill.broker_order)
+            symbol = str(fill.symbol or "").strip().upper()
+            if exact_route_scope is None or not symbol:
+                continue
+            route_symbols.add(
+                (
+                    canonical_fifo_inventory_route_scope(exact_route_scope),
+                    symbol,
+                )
+            )
+        for route_symbol in route_symbols:
+            conflicts[route_symbol].append(conflict)
+    return conflicts
+
+
+def _active_fifo_duplicate_conflicts(
+    *,
+    conflicts: dict[tuple[FifoRouteScope, str], list[dict[str, object]]],
+    isolation_cursor: FifoIsolationCursor,
+) -> dict[tuple[FifoRouteScope, str], list[dict[str, object]]]:
+    active: dict[tuple[FifoRouteScope, str], list[dict[str, object]]] = {}
+    through = datetime.max.replace(tzinfo=UTC)
+    for (route_scope, symbol), route_conflicts in conflicts.items():
+        latest_boundary = isolation_cursor.latest_boundary_through(
+            route_scope=route_scope,
+            symbol=symbol,
+            observed_at=through,
+        )
+        active_conflicts = [
+            conflict
+            for conflict in route_conflicts
+            if latest_boundary is None
+            or latest_boundary
+            <= _parse_timestamp(
+                conflict["last_fill_at"],
+                fallback=datetime.max.replace(tzinfo=UTC),
+            )
+        ]
+        if active_conflicts:
+            active[(route_scope, symbol)] = active_conflicts
+    return active
+
+
 def _fifo_inventory_repair_items(
     *,
     db: Session,
     runtime_mode: str,
 ) -> list[dict[str, object]]:
-    fills = dedupe_execution_fills(list(
+    raw_fills = list(
         db.scalars(
             select(ExecutionFill)
             .join(ExecutionFill.broker_order)
@@ -390,9 +476,15 @@ def _fifo_inventory_repair_items(
             )
             .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
         ).all()
-    ))
+    )
+    duplicate_conflicts = _fifo_duplicate_conflicts(raw_fills)
+    fills = dedupe_execution_fills(raw_fills)
     ambiguous_buckets = ambiguous_fifo_chronology_buckets(fills)
     isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=runtime_mode)
+    duplicate_conflicts = _active_fifo_duplicate_conflicts(
+        conflicts=duplicate_conflicts,
+        isolation_cursor=isolation_cursor,
+    )
     lots_by_route_symbol: dict[
         tuple[FifoRouteScope | None, str],
         list[Decimal],
@@ -405,10 +497,50 @@ def _fifo_inventory_repair_items(
     generation_by_route_symbol: dict[
         tuple[FifoRouteScope, str], datetime | None
     ] = {}
+    exact_scopes_by_route_symbol: dict[
+        tuple[FifoRouteScope, str], set[FifoRouteScope]
+    ] = defaultdict(set)
+    for fill in raw_fills:
+        exact_route_scope = fifo_route_scope_from_order(fill.broker_order)
+        if exact_route_scope is None:
+            continue
+        inventory_route_scope = canonical_fifo_inventory_route_scope(
+            exact_route_scope
+        )
+        route_symbol = (
+            inventory_route_scope,
+            str(fill.symbol or "").strip().upper(),
+        )
+        latest_boundary = isolation_cursor.latest_boundary_through(
+            route_scope=inventory_route_scope,
+            symbol=route_symbol[1],
+            observed_at=datetime.max.replace(tzinfo=UTC),
+        )
+        filled_at = _parse_timestamp(
+            fill.filled_at,
+            fallback=datetime.min.replace(tzinfo=UTC),
+        )
+        if latest_boundary is not None and filled_at < latest_boundary:
+            continue
+        exact_scopes_by_route_symbol[route_symbol].add(exact_route_scope)
+    for route_symbol, conflicts in duplicate_conflicts.items():
+        lots_by_route_symbol.setdefault(route_symbol, [])
+        last_fill_at_by_route_symbol[route_symbol] = max(
+            _parse_timestamp(
+                conflict["last_fill_at"],
+                fallback=datetime.min.replace(tzinfo=UTC),
+            )
+            for conflict in conflicts
+        )
     for fill in sorted(fills, key=fifo_fill_sort_key):
-        symbol = fill.symbol
+        symbol = str(fill.symbol or "").strip().upper()
         filled_at = _parse_timestamp(fill.filled_at, fallback=datetime.now(UTC))
-        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        exact_route_scope = fifo_route_scope_from_order(fill.broker_order)
+        route_scope = (
+            canonical_fifo_inventory_route_scope(exact_route_scope)
+            if exact_route_scope is not None
+            else None
+        )
         route_symbol = (route_scope, symbol)
         lots = lots_by_route_symbol.setdefault(route_symbol, [])
         if route_scope is not None:
@@ -443,7 +575,10 @@ def _fifo_inventory_repair_items(
         ):
             lots.clear()
             ambiguous_isolation_scopes.add((route_scope, symbol))
-            last_fill_at_by_route_symbol[route_symbol] = filled_at
+            last_fill_at_by_route_symbol[route_symbol] = max(
+                last_fill_at_by_route_symbol.get(route_symbol, filled_at),
+                filled_at,
+            )
             continue
         if route_scope is not None and not scope_quality_available:
             ambiguous_isolation_scopes.add((route_scope, symbol))
@@ -462,7 +597,10 @@ def _fifo_inventory_repair_items(
                 remaining -= matched
                 if lots[0] <= 0:
                     lots.pop(0)
-        last_fill_at_by_route_symbol[route_symbol] = filled_at
+        last_fill_at_by_route_symbol[route_symbol] = max(
+            last_fill_at_by_route_symbol.get(route_symbol, filled_at),
+            filled_at,
+        )
 
     for (route_scope, symbol), lots in lots_by_route_symbol.items():
         if route_scope is not None:
@@ -505,11 +643,9 @@ def _fifo_inventory_repair_items(
                 legacy_position_candidates[position.symbol].append(position)
             continue
         scoped_position_candidates[
-            (
-                identity.provider,
-                identity.account_scope,
-                identity.exchange,
-                position.symbol,
+            _fifo_position_inventory_key(
+                identity=identity,
+                symbol=position.symbol,
             )
         ].append(position)
         scoped_positions_by_symbol[position.symbol].append(position)
@@ -536,11 +672,17 @@ def _fifo_inventory_repair_items(
         ),
     ):
         residual_quantity = sum(lots, Decimal("0"))
+        route_symbol = (route_scope, symbol)
+        conflicts = (
+            duplicate_conflicts.get(route_symbol, [])
+            if route_scope is not None
+            else []
+        )
         ambiguous_generation = bool(
             route_scope is not None
             and (route_scope, symbol) in ambiguous_isolation_scopes
         )
-        if residual_quantity <= 0 and not ambiguous_generation:
+        if residual_quantity <= 0 and not ambiguous_generation and not conflicts:
             continue
         last_fill_at = last_fill_at_by_route_symbol.get((route_scope, symbol))
         if last_fill_at is None:
@@ -562,6 +704,47 @@ def _fifo_inventory_repair_items(
             if route_position_key is not None
             else legacy_positions or exact_symbol_positions
         )
+        exact_scopes = exact_scopes_by_route_symbol.get(route_symbol, set())
+        scope_audit = _fifo_scope_audit_fields(
+            inventory_scope=route_scope,
+            exact_scopes=exact_scopes,
+        )
+        if conflicts:
+            conflict_position = (
+                ambiguous_positions[0] if len(ambiguous_positions) == 1 else None
+            )
+            items.append(
+                {
+                    "symbol": symbol,
+                    "residual_quantity": _decimal_text(residual_quantity),
+                    "last_local_fill": last_fill_at.isoformat(),
+                    "broker_reconciliation_timestamp": (
+                        _serialize_datetime(conflict_position.last_reconciled_at)
+                        if conflict_position is not None
+                        else None
+                    ),
+                    "broker_position_id": (
+                        conflict_position.id
+                        if conflict_position is not None
+                        else f"duplicate-fill-conflict:{symbol}"
+                    ),
+                    "broker_position_ids": sorted(
+                        position.id for position in ambiguous_positions
+                    ),
+                    "broker_position_quantity": (
+                        _decimal_text(_position_quantity(conflict_position))
+                        if conflict_position is not None
+                        else None
+                    ),
+                    **scope_audit,
+                    "eligible": False,
+                    "repair_action": "skip",
+                    "reason": "duplicate_fill_economic_conflict",
+                    "fifo_history_quality": "conflicting_duplicate_fill_identity",
+                    "duplicate_fill_conflicts": conflicts,
+                }
+            )
+            continue
         if len(ambiguous_positions) > 1:
             items.append(
                 {
@@ -574,9 +757,7 @@ def _fifo_inventory_repair_items(
                         position.id for position in ambiguous_positions
                     ),
                     "broker_position_quantity": None,
-                    "execution_scope": (
-                        route_scope.as_payload() if route_scope is not None else None
-                    ),
+                    **scope_audit,
                     "eligible": False,
                     "repair_action": "skip",
                     "reason": (
@@ -650,10 +831,9 @@ def _fifo_inventory_repair_items(
                 "broker_reconciliation_timestamp": broker_reconciled_at.isoformat(),
                 "broker_position_id": position.id,
                 "broker_position_quantity": _decimal_text(_position_quantity(position)),
-                "execution_scope": (
-                    effective_route_scope.as_payload()
-                    if effective_route_scope is not None
-                    else None
+                **_fifo_scope_audit_fields(
+                    inventory_scope=effective_route_scope,
+                    exact_scopes=exact_scopes,
                 ),
                 "eligible": eligible,
                 "repair_action": "isolate" if eligible else "skip",
@@ -666,6 +846,64 @@ def _fifo_inventory_repair_items(
             }
         )
     return _annotate_fifo_reviews(db=db, runtime_mode=runtime_mode, items=items)
+
+
+def _fifo_scope_audit_fields(
+    *,
+    inventory_scope: FifoRouteScope | None,
+    exact_scopes: set[FifoRouteScope],
+) -> dict[str, object]:
+    if inventory_scope is None:
+        return {"execution_scope": None}
+    ordered_exact_scopes = sorted(
+        exact_scopes,
+        key=lambda scope: (
+            scope.provider,
+            scope.account_scope,
+            scope.venue,
+            scope.asset_class,
+            scope.exchange,
+        ),
+    )
+    reported_scope = (
+        ordered_exact_scopes[0]
+        if len(ordered_exact_scopes) == 1
+        else inventory_scope
+    )
+    payload: dict[str, object] = {
+        "execution_scope": reported_scope.as_payload(),
+    }
+    if len(ordered_exact_scopes) > 1 or any(
+        scope.exchange != inventory_scope.exchange
+        for scope in ordered_exact_scopes
+    ):
+        payload["inventory_scope"] = inventory_scope.as_payload()
+        payload["exact_execution_scopes"] = [
+            scope.as_payload() for scope in ordered_exact_scopes
+        ]
+    return payload
+
+
+def _fifo_position_inventory_key(
+    *,
+    identity: PositionIdentity,
+    symbol: str,
+) -> tuple[str, str, str, str]:
+    inventory_scope = canonical_fifo_inventory_route_scope(
+        FifoRouteScope(
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+            venue=identity.exchange,
+            asset_class="stock",
+            exchange=identity.exchange,
+        )
+    )
+    return (
+        inventory_scope.provider,
+        inventory_scope.account_scope,
+        inventory_scope.exchange,
+        str(symbol or "").strip().upper(),
+    )
 
 
 def _fifo_candidate_key(item: dict[str, object]) -> str:
@@ -695,9 +933,13 @@ def _fifo_position_matches_route(
     identity = _validated_position_identity(position)
     return bool(
         identity is not None
-        and identity.provider == route_scope.provider
-        and identity.account_scope == route_scope.account_scope
-        and identity.exchange == route_scope.exchange
+        and _fifo_position_inventory_key(identity=identity, symbol=position.symbol)
+        == (
+            route_scope.provider,
+            route_scope.account_scope,
+            route_scope.exchange,
+            str(position.symbol or "").strip().upper(),
+        )
     )
 
 

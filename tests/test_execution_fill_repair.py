@@ -1642,6 +1642,62 @@ def _add_fill(
     return fill
 
 
+def _add_exact_scoped_fifo_fill(
+    db,
+    *,
+    symbol: str,
+    side: str,
+    quantity: int,
+    price: str,
+    filled_at: datetime,
+    suffix: str,
+    provider: str = "kis",
+    account_scope: str = FIFO_TEST_ACCOUNT_SCOPE,
+    venue: str | None = None,
+    asset_class: str = "stock",
+    exchange: str = "KRX",
+) -> ExecutionFill:
+    exact_venue = venue or exchange
+    identity = PositionIdentity(
+        provider=provider,
+        account_scope=account_scope,
+        exchange=exchange,
+    )
+    order = BrokerOrder(
+        broker_name=provider,
+        mode="paper",
+        idempotency_key=f"scoped-fifo-{symbol}-{side}-{suffix}",
+        broker_order_id=f"scoped-fifo-order-{suffix}",
+        symbol=symbol,
+        side=side,
+        status="filled",
+        quantity=quantity,
+        submitted_at=filled_at,
+        venue=exact_venue,
+        asset_class=asset_class,
+        request_metadata={
+            "exchange": exchange,
+            "execution_scope": execution_scope_payload(
+                identity=identity,
+                venue=exact_venue,
+                asset_class=asset_class,
+            ),
+        },
+    )
+    db.add(order)
+    db.flush()
+    fill = ExecutionFill(
+        broker_order_pk=order.id,
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        price=Decimal(price),
+        filled_at=filled_at,
+    )
+    db.add(fill)
+    return fill
+
+
 def test_fifo_residual_dry_run_reports_required_broker_flat_evidence() -> None:
     settings = _settings()
     engine, db = _session(settings)
@@ -2337,4 +2393,502 @@ def test_fifo_repair_reports_duplicate_legacy_position_scope_as_ambiguous() -> N
     assert applied["summary"]["applied_isolation_count"] == 0
     assert applied["summary"]["applied_blocker_count"] == 1
     assert db.scalars(select(FifoInventoryIsolation)).all() == []
+    engine.dispose()
+
+
+def test_fifo_repair_folds_nxt_buy_and_krx_sell_into_one_domestic_inventory() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    bought_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    sold_at = bought_at + timedelta(minutes=5)
+    _add_exact_scoped_fifo_fill(
+        db,
+        symbol="005930",
+        side="buy",
+        quantity=3,
+        price="70000",
+        filled_at=bought_at,
+        suffix="nxt-buy-cross-route",
+        exchange="NXT",
+    )
+    _add_exact_scoped_fifo_fill(
+        db,
+        symbol="005930",
+        side="sell",
+        quantity=3,
+        price="71000",
+        filled_at=sold_at,
+        suffix="krx-sell-cross-route",
+        exchange="KRX",
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            provider="kis",
+            account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+            exchange="NXT",
+            symbol="005930",
+            quantity=0,
+            updated_from="reconciliation",
+            last_reconciled_at=sold_at + timedelta(minutes=5),
+            raw_payload=_fifo_position_payload(exchange="NXT"),
+        )
+    )
+    db.commit()
+
+    payload = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+
+    assert payload["summary"]["broker_flat_residual_count"] == 0
+    assert payload["summary"]["eligible_isolation_count"] == 0
+    assert payload["broker_flat_fifo_residuals"] == []
+    engine.dispose()
+
+
+def test_verified_flat_krx_position_clears_nxt_inventory_generation() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    bought_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    flat_at = bought_at + timedelta(hours=1)
+    _add_exact_scoped_fifo_fill(
+        db,
+        symbol="000660",
+        side="buy",
+        quantity=4,
+        price="120000",
+        filled_at=bought_at,
+        suffix="nxt-before-krx-flat",
+        exchange="NXT",
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            provider="kis",
+            account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
+            symbol="000660",
+            quantity=0,
+            updated_from="reconciliation",
+            last_reconciled_at=flat_at,
+            raw_payload=_fifo_position_payload(),
+        )
+    )
+    db.commit()
+
+    dry_run = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+    applied = apply_fifo_inventory_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="canonical KIS domestic flat proof",
+        now=flat_at,
+    )
+    after = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+    isolation = db.scalar(select(FifoInventoryIsolation))
+
+    assert dry_run["summary"]["eligible_isolation_count"] == 1
+    candidate = dry_run["broker_flat_fifo_residuals"][0]
+    assert candidate["execution_scope"] == {
+        "provider": "kis",
+        "account_scope": FIFO_TEST_ACCOUNT_SCOPE,
+        "venue": "NXT",
+        "asset_class": "stock",
+        "exchange": "NXT",
+    }
+    assert candidate["inventory_scope"] == {
+        "provider": "kis",
+        "account_scope": FIFO_TEST_ACCOUNT_SCOPE,
+        "venue": "KIS",
+        "asset_class": "stock",
+        "exchange": "KRX",
+    }
+    assert candidate["exact_execution_scopes"] == [
+        {
+            "provider": "kis",
+            "account_scope": FIFO_TEST_ACCOUNT_SCOPE,
+            "venue": "NXT",
+            "asset_class": "stock",
+            "exchange": "NXT",
+        }
+    ]
+    assert applied["summary"]["applied_isolation_count"] == 1
+    assert after["summary"]["broker_flat_residual_count"] == 0
+    assert isolation is not None
+    assert (isolation.provider, isolation.venue, isolation.asset_class, isolation.exchange) == (
+        "kis",
+        "NXT",
+        "stock",
+        "NXT",
+    )
+    assert isolation.audit_payload["evidence"]["exact_execution_scopes"] == candidate[
+        "exact_execution_scopes"
+    ]
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    (
+        "buy_provider",
+        "sell_provider",
+        "position_provider",
+        "buy_exchange",
+        "sell_exchange",
+        "buy_account_scope",
+        "sell_account_scope",
+        "position_exchange",
+    ),
+    [
+        (
+            "kis",
+            "kis",
+            "kis",
+            "NXT",
+            "KRX",
+            FIFO_TEST_ACCOUNT_SCOPE,
+            FIFO_FOREIGN_ACCOUNT_SCOPE,
+            "KRX",
+        ),
+        (
+            "kis",
+            "kis",
+            "kis",
+            "NASD",
+            "KRX",
+            FIFO_TEST_ACCOUNT_SCOPE,
+            FIFO_TEST_ACCOUNT_SCOPE,
+            "NASD",
+        ),
+        (
+            "alpaca",
+            "kis",
+            "alpaca",
+            "NASD",
+            "KRX",
+            FIFO_TEST_ACCOUNT_SCOPE,
+            FIFO_TEST_ACCOUNT_SCOPE,
+            "NASD",
+        ),
+    ],
+)
+def test_fifo_repair_does_not_fold_foreign_or_different_account_inventory(
+    buy_provider: str,
+    sell_provider: str,
+    position_provider: str,
+    buy_exchange: str,
+    sell_exchange: str,
+    buy_account_scope: str,
+    sell_account_scope: str,
+    position_exchange: str,
+) -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    bought_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    sold_at = bought_at + timedelta(minutes=5)
+    _add_exact_scoped_fifo_fill(
+        db,
+        symbol="SCOPE-TEST",
+        side="buy",
+        quantity=2,
+        price="100",
+        filled_at=bought_at,
+        suffix=f"{buy_provider}-{buy_exchange.lower()}-{buy_account_scope[0]}-buy",
+        provider=buy_provider,
+        account_scope=buy_account_scope,
+        exchange=buy_exchange,
+    )
+    _add_exact_scoped_fifo_fill(
+        db,
+        symbol="SCOPE-TEST",
+        side="sell",
+        quantity=2,
+        price="110",
+        filled_at=sold_at,
+        suffix=(
+            f"{sell_provider}-{sell_exchange.lower()}-"
+            f"{sell_account_scope[0]}-sell"
+        ),
+        provider=sell_provider,
+        account_scope=sell_account_scope,
+        exchange=sell_exchange,
+    )
+    position_identity = PositionIdentity(
+        provider=position_provider,
+        account_scope=buy_account_scope,
+        exchange=position_exchange,
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            provider=position_identity.provider,
+            account_scope=position_identity.account_scope,
+            exchange=position_identity.exchange,
+            symbol="SCOPE-TEST",
+            quantity=0,
+            updated_from="reconciliation",
+            last_reconciled_at=sold_at + timedelta(minutes=5),
+            raw_payload=payload_with_position_identity(None, identity=position_identity),
+        )
+    )
+    db.commit()
+
+    payload = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+
+    assert payload["summary"]["eligible_isolation_count"] == 1
+    candidate = payload["broker_flat_fifo_residuals"][0]
+    assert candidate["residual_quantity"] == "2.0000"
+    assert candidate["execution_scope"]["provider"] == buy_provider
+    assert candidate["execution_scope"]["account_scope"] == buy_account_scope
+    assert candidate["execution_scope"]["exchange"] == buy_exchange
+    if buy_exchange == "NXT":
+        assert candidate["inventory_scope"]["exchange"] == position_exchange
+    else:
+        assert "inventory_scope" not in candidate
+    engine.dispose()
+
+
+def test_conflicting_duplicate_fill_blocks_fifo_isolation_before_dedupe() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    filled_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    flat_at = filled_at + timedelta(hours=1)
+    first = _add_exact_scoped_fifo_fill(
+        db,
+        symbol="035420",
+        side="buy",
+        quantity=1,
+        price="200000",
+        filled_at=filled_at,
+        suffix="conflicting-nxt-fill",
+        exchange="NXT",
+    )
+    first.broker_fill_id = "conflicting-domestic-fill"
+    db.add(
+        ExecutionFill(
+            broker_order_pk=first.broker_order_pk,
+            broker_fill_id="conflicting-domestic-fill",
+            symbol=first.symbol,
+            side=first.side,
+            quantity=1,
+            price=Decimal("201000"),
+            filled_at=filled_at,
+        )
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            provider="kis",
+            account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
+            symbol="035420",
+            quantity=0,
+            updated_from="reconciliation",
+            last_reconciled_at=flat_at,
+            raw_payload=_fifo_position_payload(),
+        )
+    )
+    db.commit()
+
+    dry_run = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+    applied = apply_fifo_inventory_repairs(
+        db=db,
+        runtime_mode="paper",
+        actor="test-operator",
+        reason="conflicting duplicate economics require review",
+        now=flat_at,
+    )
+
+    assert dry_run["summary"]["eligible_isolation_count"] == 0
+    assert dry_run["summary"]["broker_flat_residual_count"] == 1
+    candidate = dry_run["broker_flat_fifo_residuals"][0]
+    assert candidate["eligible"] is False
+    assert candidate["repair_action"] == "skip"
+    assert candidate["reason"] == "duplicate_fill_economic_conflict"
+    assert candidate["duplicate_fill_conflicts"][0]["conflicting_fields"] == [
+        "price"
+    ]
+    assert applied["summary"]["applied_isolation_count"] == 0
+    assert applied["summary"]["applied_blocker_count"] == 1
+    assert db.scalars(select(FifoInventoryIsolation)).all() == []
+    review = db.scalar(
+        select(RuntimeRemediationEvent).where(
+            RuntimeRemediationEvent.candidate_type == "fifo_inventory_residual"
+        )
+    )
+    assert review is not None
+    assert review.outcome == "manual_review_required"
+    assert review.evidence_summary["blocker"] == "duplicate_fill_economic_conflict"
+    engine.dispose()
+
+
+def test_verified_flat_boundary_seals_older_duplicate_conflict_generation() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    old_fill_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    flat_at = old_fill_at + timedelta(hours=1)
+    new_fill_at = flat_at + timedelta(hours=1)
+    reconciled_at = new_fill_at + timedelta(hours=1)
+    old_fill = _add_exact_scoped_fifo_fill(
+        db,
+        symbol="068270",
+        side="buy",
+        quantity=1,
+        price="170000",
+        filled_at=old_fill_at,
+        suffix="old-conflicting-nxt-fill",
+        exchange="NXT",
+    )
+    old_fill.broker_fill_id = "old-conflicting-domestic-fill"
+    db.add(
+        ExecutionFill(
+            broker_order_pk=old_fill.broker_order_pk,
+            broker_fill_id="old-conflicting-domestic-fill",
+            symbol=old_fill.symbol,
+            side=old_fill.side,
+            quantity=1,
+            price=Decimal("171000"),
+            filled_at=old_fill_at,
+        )
+    )
+    db.add(
+        FifoInventoryIsolation(
+            mode="paper",
+            provider="kis",
+            account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+            venue="KRX",
+            asset_class="stock",
+            exchange="KRX",
+            symbol="068270",
+            residual_quantity=Decimal("1"),
+            last_local_fill_at=old_fill_at,
+            broker_position_id="old-conflict-flat-position",
+            broker_position_quantity=Decimal("0"),
+            broker_reconciled_at=flat_at,
+            isolated_through_at=flat_at,
+            evidence_source="broker_flat_reconciliation",
+            actor="test-operator",
+            reason="verified flat closes old conflicting generation",
+        )
+    )
+    _add_exact_scoped_fifo_fill(
+        db,
+        symbol="068270",
+        side="buy",
+        quantity=2,
+        price="172000",
+        filled_at=new_fill_at,
+        suffix="clean-new-sor-fill",
+        exchange="SOR",
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            provider="kis",
+            account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
+            symbol="068270",
+            quantity=0,
+            updated_from="reconciliation",
+            last_reconciled_at=reconciled_at,
+            raw_payload=_fifo_position_payload(),
+        )
+    )
+    db.commit()
+
+    payload = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+
+    assert payload["summary"]["broker_flat_residual_count"] == 1
+    assert payload["summary"]["eligible_isolation_count"] == 1
+    candidate = payload["broker_flat_fifo_residuals"][0]
+    assert candidate["residual_quantity"] == "2.0000"
+    assert candidate["reason"] == "broker_flat_evidence_newer_than_last_local_fill"
+    assert "duplicate_fill_conflicts" not in candidate
+    assert candidate["execution_scope"] == {
+        "provider": "kis",
+        "account_scope": FIFO_TEST_ACCOUNT_SCOPE,
+        "venue": "SOR",
+        "asset_class": "stock",
+        "exchange": "SOR",
+    }
+    assert candidate["inventory_scope"]["exchange"] == "KRX"
+    assert candidate["exact_execution_scopes"] == [candidate["execution_scope"]]
+    engine.dispose()
+
+
+def test_duplicate_conflict_spanning_flat_boundary_stays_fail_closed() -> None:
+    settings = _settings()
+    engine, db = _session(settings)
+    old_fill_at = datetime(2026, 8, 20, 1, 0, tzinfo=UTC)
+    flat_at = old_fill_at + timedelta(hours=1)
+    active_fill_at = flat_at + timedelta(hours=1)
+    first = _add_exact_scoped_fifo_fill(
+        db,
+        symbol="051910",
+        side="buy",
+        quantity=1,
+        price="350000",
+        filled_at=old_fill_at,
+        suffix="boundary-spanning-conflict",
+        exchange="NXT",
+    )
+    first.broker_fill_id = "boundary-spanning-fill"
+    db.add(
+        ExecutionFill(
+            broker_order_pk=first.broker_order_pk,
+            broker_fill_id="boundary-spanning-fill",
+            symbol=first.symbol,
+            side=first.side,
+            quantity=1,
+            price=Decimal("351000"),
+            filled_at=active_fill_at,
+        )
+    )
+    db.add(
+        FifoInventoryIsolation(
+            mode="paper",
+            provider="kis",
+            account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+            venue="KRX",
+            asset_class="stock",
+            exchange="KRX",
+            symbol="051910",
+            residual_quantity=Decimal("1"),
+            last_local_fill_at=old_fill_at,
+            broker_position_id="spanning-conflict-flat-position",
+            broker_position_quantity=Decimal("0"),
+            broker_reconciled_at=flat_at,
+            isolated_through_at=flat_at,
+            evidence_source="broker_flat_reconciliation",
+            actor="test-operator",
+            reason="verified flat splits duplicate observations",
+        )
+    )
+    db.add(
+        ExecutionPosition(
+            mode="paper",
+            provider="kis",
+            account_scope=FIFO_TEST_ACCOUNT_SCOPE,
+            exchange="KRX",
+            symbol="051910",
+            quantity=0,
+            updated_from="reconciliation",
+            last_reconciled_at=active_fill_at + timedelta(hours=1),
+            raw_payload=_fifo_position_payload(),
+        )
+    )
+    db.commit()
+
+    payload = analyze_fifo_inventory_repairs(db=db, runtime_mode="paper")
+
+    assert payload["summary"]["eligible_isolation_count"] == 0
+    assert payload["summary"]["broker_flat_residual_count"] == 1
+    candidate = payload["broker_flat_fifo_residuals"][0]
+    assert candidate["eligible"] is False
+    assert candidate["repair_action"] == "skip"
+    assert candidate["reason"] == "duplicate_fill_economic_conflict"
+    assert set(candidate["duplicate_fill_conflicts"][0]["conflicting_fields"]) == {
+        "filled_at",
+        "price",
+    }
+    assert candidate["last_local_fill"] == active_fill_at.isoformat()
+    assert candidate["execution_scope"]["exchange"] == "NXT"
+    assert candidate["inventory_scope"]["exchange"] == "KRX"
     engine.dispose()

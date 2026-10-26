@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from copy import deepcopy
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -16,6 +17,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.broker.base import (
+    BrokerAccountOpenOrder,
     BrokerAccountSnapshot,
     BrokerAdapterError,
     BrokerConfig,
@@ -28,7 +30,14 @@ from app.api.schemas.execution import MonitoringPriceRequest
 from app.core.config import Settings, load_settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition, MonitoringCheckpoint
+from app.models.runtime import (
+    BrokerOrder,
+    ExecutionFill,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPosition,
+    MonitoringCheckpoint,
+)
 from app.services import monitoring, trigger_time_exec_agent
 from app.services.exec_agent_approval import (
     assess_buy_economics,
@@ -44,10 +53,242 @@ from openclaw_contract_test_support import (
 from test_broker_auth import (
     KIS_PAPER_API_BASE_URL,
     StubBrokerAdapter,
+    _seed_exact_strategy_family_for_sell_items,
+    _seed_exact_strategy_family_in_session,
     build_order_placement,
     build_test_app,
     build_token_grant,
 )
+
+
+_THREAD_COORDINATION_TIMEOUT_SECONDS = 15.0
+
+
+def _trigger_lane_feedback_fixture() -> dict[str, object]:
+    return {
+        "execution_authority": False,
+        "summary": {"aggregate_audit_only": True},
+        "strategy_learning_by_lane": {
+            lane: {
+                "schema_version": "strategy-lane-learning-v1",
+                "status": "ready",
+                "consumer_eligible": True,
+                "execution_authority": True,
+                "decision_lane": lane,
+                "summary": {"lane": lane},
+                "lessons": [{"lesson": f"{lane}-lesson"}],
+                "quality_gate": {
+                    "status": "ready",
+                    "consumer_eligible": True,
+                    "blocked_reasons": [],
+                },
+            }
+            for lane in ("signal-decider", "short-term-decider")
+        },
+        "operational_learning_by_lane": {
+            lane: {
+                "schema_version": "strategy-lane-operational-learning-v1",
+                "status": "ready",
+                "consumer_eligible": True,
+                "decision_lane": lane,
+                "failure_count": 1,
+                "classification_counts": {f"{lane}-failure": 1},
+                "allowed_effects": ["delay", "downsize", "reject"],
+                "prohibited_effects": ["approve", "increase_size"],
+            }
+            for lane in ("signal-decider", "short-term-decider")
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "decision_lane",
+    ("signal-decider", "short-term-decider"),
+)
+def test_trigger_time_request_uses_only_exact_lane_learning(
+    monkeypatch: pytest.MonkeyPatch,
+    decision_lane: str,
+) -> None:
+    item = ExecutionPlanItem(
+        id=f"trigger-feedback-{decision_lane}",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="watch_buy_triggered",
+        decision_agent_name=decision_lane,
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    ExecutionPlan(
+        external_plan_id=f"trigger-feedback-plan-{decision_lane}",
+        market_date=date(2026, 10, 26),
+        items=[item],
+    )
+    monkeypatch.setattr(
+        trigger_time_exec_agent,
+        "load_latest_trade_outcome_feedback_snippet",
+        lambda *_, **__: _trigger_lane_feedback_fixture(),
+    )
+
+    payload = trigger_time_exec_agent._request_payload(
+        settings=Settings(runtime_mode="paper"),
+        item=item,
+        side="buy",
+        market_context={},
+        account_context={
+            "execution_account_scope": {
+                "provider": "kis",
+                "account_scope": "opaque-account",
+            }
+        },
+        peer_context={},
+        intended_quantity=1,
+        remaining_quantity=None,
+    )
+
+    feedback = payload["trade_outcome_feedback"]
+    assert payload["decision_lane"] == decision_lane
+    assert feedback["summary"] == {"lane": decision_lane}
+    assert feedback["lessons"] == [{"lesson": f"{decision_lane}-lesson"}]
+    assert feedback["operational_learning_context"][
+        "classification_counts"
+    ] == {f"{decision_lane}-failure": 1}
+    assert "aggregate_audit_only" not in json.dumps(feedback)
+
+
+def test_trigger_time_never_uses_global_feedback_without_account_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = ExecutionPlanItem(
+        id="trigger-feedback-missing-scope",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="watch_buy_triggered",
+        decision_agent_name="short-term-decider",
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    ExecutionPlan(
+        external_plan_id="trigger-feedback-missing-scope-plan",
+        market_date=date(2026, 10, 26),
+        items=[item],
+    )
+
+    def forbidden_global_load(*_args, **_kwargs):
+        raise AssertionError("unscoped global feedback must not be loaded")
+
+    monkeypatch.setattr(
+        trigger_time_exec_agent,
+        "load_latest_trade_outcome_feedback_snippet",
+        forbidden_global_load,
+    )
+
+    payload = trigger_time_exec_agent._request_payload(
+        settings=Settings(runtime_mode="paper"),
+        item=item,
+        side="buy",
+        market_context={},
+        account_context={},
+        peer_context={},
+        intended_quantity=1,
+        remaining_quantity=None,
+    )
+
+    assert payload["trade_outcome_feedback"]["status"] == "unavailable"
+    assert payload["trade_outcome_feedback"]["reason"] == (
+        "strategy_lane_learning_unavailable"
+    )
+
+
+@pytest.mark.parametrize("signal_action", ("wait", "reject"))
+def test_trigger_time_request_sanitizes_cross_lane_alignment_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    signal_action: str,
+) -> None:
+    base_risk_context: dict[str, object] = {
+        "exchange": "KRX",
+        "target_price": "76000",
+        "stop_price": "69000",
+        "rationale": "short-term breakout",
+        "decider_output": {"action": "buy", "lane": "short-term-decider"},
+        "decider_handoff_context": {"lane": "short-term-decider", "score": 8},
+    }
+    base_quantity_policy: dict[str, object] = {
+        "kind": "shares",
+        "quantity": 7,
+        "max_quantity": 9,
+    }
+    item = ExecutionPlanItem(
+        id=f"trigger-sanitizer-{signal_action}",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="watch_buy_triggered",
+        decision_agent_name="short-term-decider",
+        risk_context=deepcopy(base_risk_context),
+        quantity_policy=deepcopy(base_quantity_policy),
+    )
+    ExecutionPlan(
+        external_plan_id=f"trigger-sanitizer-plan-{signal_action}",
+        market_date=date(2026, 10, 26),
+        items=[item],
+    )
+    monkeypatch.setattr(
+        trigger_time_exec_agent,
+        "load_latest_trade_outcome_feedback_snippet",
+        lambda *_, **__: _trigger_lane_feedback_fixture(),
+    )
+    request_kwargs = {
+        "settings": Settings(runtime_mode="paper"),
+        "item": item,
+        "side": "buy",
+        "market_context": {},
+        "account_context": {
+            "execution_account_scope": {
+                "provider": "kis",
+                "account_scope": "opaque-account",
+            }
+        },
+        "peer_context": {},
+        "intended_quantity": 7,
+        "remaining_quantity": None,
+    }
+    baseline = trigger_time_exec_agent._request_payload(**request_kwargs)
+
+    item.risk_context = {
+        **deepcopy(base_risk_context),
+        "signal_decider_alignment": f"{signal_action}_conflict_block",
+        "alignment_gate": {
+            "signal_decider_action": signal_action,
+            "signal_decider_context": {
+                "data_quality_warnings": ["signal-only warning"]
+            },
+        },
+        "final_enforcement_decision": "report_only_block_candidate",
+        "requested_quantity": 7,
+        "final_quantity": 0,
+        "enforcement_source": "core_wait_conflict_alignment_gate",
+    }
+    item.quantity_policy = {
+        **deepcopy(base_quantity_policy),
+        "final_enforcement_decision": "report_only_block_candidate",
+        "requested_quantity": 7,
+        "final_quantity": 7,
+    }
+    contaminated = trigger_time_exec_agent._request_payload(**request_kwargs)
+
+    assert contaminated["signal_context"] == baseline["signal_context"]
+    assert json_payload_hash(contaminated) == json_payload_hash(baseline)
+    assert item.risk_context["signal_decider_alignment"] == (
+        f"{signal_action}_conflict_block"
+    )
+    assert item.quantity_policy["final_enforcement_decision"] == (
+        "report_only_block_candidate"
+    )
 
 
 def _fresh_normal_core_market_context(*, now: datetime | None) -> dict[str, object]:
@@ -299,6 +540,7 @@ def test_peer_context_only_contains_current_account_and_exchange() -> None:
         status: str,
         risk_context: dict[str, object] | None,
         quantity_policy: dict[str, object] | None,
+        decision_lane: str | None = "short-term-decider",
     ) -> ExecutionPlanItem:
         return ExecutionPlanItem(
             id=item_id,
@@ -309,6 +551,7 @@ def test_peer_context_only_contains_current_account_and_exchange() -> None:
             status=status,
             provider="kis",
             asset_class="stock",
+            decision_agent_name=decision_lane,
             risk_context=risk_context,
             quantity_policy=quantity_policy,
         )
@@ -326,6 +569,14 @@ def test_peer_context_only_contains_current_account_and_exchange() -> None:
         status=trigger_time_exec_agent.AGENT_PENDING_STATUS,
         risk_context=current_risk,
         quantity_policy=current_policy,
+    )
+    opposite_lane_peer = item(
+        item_id="opposite-lane-trigger-peer",
+        symbol="051910",
+        status=trigger_time_exec_agent.AGENT_DELAY_STATUS,
+        risk_context=current_risk,
+        quantity_policy=current_policy,
+        decision_lane="signal-decider",
     )
     foreign_peer = item(
         item_id="foreign-trigger-peer",
@@ -359,6 +610,7 @@ def test_peer_context_only_contains_current_account_and_exchange() -> None:
                     items=[
                         current,
                         current_peer,
+                        opposite_lane_peer,
                         foreign_peer,
                         other_exchange_peer,
                         legacy_peer,
@@ -409,7 +661,7 @@ def _create_intraday_watch_buy(
     plan_id: str,
     max_safe_notional_krw: str = "300000",
     risk_context_extra: dict[str, object] | None = None,
-    decision_agent_name: str | None = None,
+    decision_agent_name: str | None = "signal-decider",
     quantity_policy: dict[str, object] | None = None,
 ) -> str:
     risk_context = {
@@ -966,6 +1218,12 @@ def test_high_volatility_chase_rule_does_not_affect_sell_side_stop(
     )
     assert plan_response.status_code == 201
     stop_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[stop_item_id],
+        quantity=2,
+        entry_price=Decimal("71000"),
+    )
     with app.state.db_session_factory() as session:
         session.add(
                 _scoped_execution_position(
@@ -1014,11 +1272,12 @@ def test_trigger_time_buy_agent_is_bypassed_for_default_entry_line_buy(
             "source": "test-fixture",
             "market_date": "2026-06-05",
             "items": [
-                {
-                    "symbol": "005930",
-                    "side": "buy",
-                    "intent": "intraday_watch_buy",
-                    "quantity_policy": {"kind": "shares", "quantity": 2},
+                    {
+                            "symbol": "005930",
+                            "side": "buy",
+                            "intent": "intraday_watch_buy",
+                            "decision_agent_name": "signal-decider",
+                        "quantity_policy": {"kind": "shares", "quantity": 2},
                     "trigger_price": "71000.00",
                     "chase_limit_price": "71200.00",
                     "time_in_force": "day",
@@ -1754,10 +2013,12 @@ def test_trigger_time_buy_effective_risk_stop_updates_stop_monitor(
             "market_date": "2026-06-05",
             "items": [
                 {
-                    "symbol": "005930",
-                    "side": "buy",
-                    "intent": "intraday_watch_buy",
-                    "quantity_policy": {
+                        "symbol": "005930",
+                        "side": "buy",
+                        "intent": "intraday_watch_buy",
+                        "decision_agent_name": "signal-decider",
+                        "source_plan_item_id": "effective-stop-family",
+                        "quantity_policy": {
                         "type": "trigger_time_exec_agent_sized",
                         "budget_krw": "0",
                         "max_safe_notional_krw": "300000",
@@ -1771,11 +2032,15 @@ def test_trigger_time_buy_effective_risk_stop_updates_stop_monitor(
                         "trigger_direction": "at_or_above",
                     },
                 },
-                {
-                    "symbol": "005930",
-                    "side": "sell",
-                    "intent": "stop_sell",
-                    "quantity_policy": {"kind": "position_exit_from_entry"},
+                    {
+                            "symbol": "005930",
+                            "side": "sell",
+                            "intent": "stop_sell",
+                            "decision_agent_name": "signal-decider",
+                            "quantity_policy": {
+                                "kind": "position_exit_from_entry",
+                                "linked_entry_item_key": "effective-stop-family",
+                            },
                     "trigger_price": "60000.00",
                     "time_in_force": "day",
                     "risk_context": {"exchange": "KRX"},
@@ -2119,6 +2384,12 @@ def test_trigger_time_sell_agent_can_adjust_quantity_limit_and_stop(
     )
     assert plan_response.status_code == 201
     target_item_id, stop_item_id = plan_response.json()["persisted_execution_item_ids"]
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[target_item_id, stop_item_id],
+        quantity=5,
+        entry_price=Decimal("120000.0000"),
+    )
     with app.state.db_session_factory() as session:
         target_item = session.get(ExecutionPlanItem, target_item_id)
         assert target_item is not None
@@ -2265,7 +2536,13 @@ def test_expired_agent_active_target_sell_is_recovered_and_reapproved(
         },
     )
     assert plan_response.status_code == 201
-    target_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    target_item_id, stop_item_id = plan_response.json()["persisted_execution_item_ids"]
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[target_item_id, stop_item_id],
+        quantity=5,
+        entry_price=Decimal("120000.0000"),
+    )
     with app.state.db_session_factory() as session:
         target_item = session.get(ExecutionPlanItem, target_item_id)
         assert target_item is not None
@@ -2429,6 +2706,7 @@ def test_trigger_time_partial_target_rechecks_concurrently_tightened_stop(
                     "symbol": "005930",
                     "side": "sell",
                     "intent": "target_sell",
+                    "decision_agent_name": "signal-decider",
                     "quantity_policy": {"kind": "shares", "quantity": 4},
                     "trigger_price": "75000.00",
                     "time_in_force": "day",
@@ -2441,6 +2719,7 @@ def test_trigger_time_partial_target_rechecks_concurrently_tightened_stop(
                     "symbol": "005930",
                     "side": "sell",
                     "intent": "stop_sell",
+                    "decision_agent_name": "signal-decider",
                     "quantity_policy": {"kind": "shares", "quantity": 5},
                     "trigger_price": "70000.00",
                     "time_in_force": "day",
@@ -2451,6 +2730,12 @@ def test_trigger_time_partial_target_rechecks_concurrently_tightened_stop(
     )
     assert plan_response.status_code == 201
     target_item_id, stop_item_id = plan_response.json()["persisted_execution_item_ids"]
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[target_item_id, stop_item_id],
+        quantity=5,
+        entry_price=Decimal("65000.0000"),
+    )
     with app.state.db_session_factory() as session:
         session.add(
                 _scoped_execution_position(
@@ -2579,6 +2864,12 @@ def test_trigger_time_agent_always_bypasses_protective_stop_without_metadata(
     )
     assert plan_response.status_code == 201
     stop_item_id = plan_response.json()["persisted_execution_item_ids"][0]
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[stop_item_id],
+        quantity=5,
+        entry_price=Decimal("120000.0000"),
+    )
     with app.state.db_session_factory() as session:
         session.add(
                 _scoped_execution_position(
@@ -3128,6 +3419,14 @@ def test_monitoring_materializes_pending_config_stop_before_crossing_is_missed(
         )
         _bind_plan_item_to_app_account(app, plan.items[0])
         session.add(plan)
+        session.flush()
+        _seed_exact_strategy_family_in_session(
+            settings=app.state.settings,
+            session=session,
+            sell_items=[plan.items[0]],
+            quantity=2,
+            entry_price=Decimal("120000.0000"),
+        )
         session.add(
                 _scoped_execution_position(
                     app,
@@ -3156,7 +3455,7 @@ def test_monitoring_materializes_pending_config_stop_before_crossing_is_missed(
     assert response.status_code == 200
     payload = response.json()
     assert payload["protective_stop_coverage"]["status"] == "ok"
-    assert payload["protective_stop_coverage"]["repaired_stop_coverage_count"] == 1
+    assert payload["protective_stop_coverage"]["unprotected_position_count"] == 0
     assert payload["submitted_order_count"] == 1
     assert len(broker_adapter.order_calls) == 1
     assert broker_adapter.order_calls[0].execution_plan_item_id == stop_item_id
@@ -3167,7 +3466,11 @@ def test_monitoring_materializes_pending_config_stop_before_crossing_is_missed(
         assert stop_item is not None
         assert stop_item.status == "broker_order_submitted"
         events = stop_item.risk_context["monitoring_events"]
-        assert any(event["event"] == "unprotected_position_stop_rearmed" for event in events)
+        assert any(
+            event["event"] == "post_entry_stop_monitor_activated"
+            and event["reason"] == "repaired_pending_stop_configuration"
+            for event in events
+        )
 
     engine.dispose()
 
@@ -3443,7 +3746,7 @@ def test_concurrent_terminal_transition_wins_over_trigger_agent_decision(
         assert isinstance(plan, dict)
         assert isinstance(signal_context, dict)
         agent_entered.set()
-        assert release_agent.wait(timeout=3)
+        assert release_agent.wait(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS)
         return {
             "version": trigger_time_exec_agent.TRIGGER_TIME_EXEC_AGENT_VERSION,
             "plan_id": plan["plan_id"],
@@ -3475,7 +3778,7 @@ def test_concurrent_terminal_transition_wins_over_trigger_agent_decision(
 
     thread = Thread(target=evaluate)
     thread.start()
-    assert agent_entered.wait(timeout=3), json.dumps(
+    assert agent_entered.wait(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS), json.dumps(
         {key: value.json() for key, value in response_holder.items()}
     )
     with app.state.db_session_factory() as session:
@@ -3496,7 +3799,7 @@ def test_concurrent_terminal_transition_wins_over_trigger_agent_decision(
         item.risk_context = risk_context
         session.commit()
     release_agent.set()
-    thread.join(timeout=5)
+    thread.join(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS)
     assert not thread.is_alive()
 
     response = response_holder["response"]
@@ -3604,7 +3907,7 @@ def test_concurrent_expiry_wins_over_post_agent_quote_failure(
         assert isinstance(plan, dict)
         assert isinstance(signal_context, dict)
         agent_entered.set()
-        assert release_agent.wait(timeout=3)
+        assert release_agent.wait(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS)
         return {
             "version": trigger_time_exec_agent.TRIGGER_TIME_EXEC_AGENT_VERSION,
             "plan_id": plan["plan_id"],
@@ -3639,7 +3942,7 @@ def test_concurrent_expiry_wins_over_post_agent_quote_failure(
 
     thread = Thread(target=evaluate)
     thread.start()
-    assert agent_entered.wait(timeout=3), json.dumps(
+    assert agent_entered.wait(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS), json.dumps(
         {key: value.json() for key, value in response_holder.items()}
     )
     with app.state.db_session_factory() as session:
@@ -3655,7 +3958,7 @@ def test_concurrent_expiry_wins_over_post_agent_quote_failure(
         item.risk_context = risk_context
         session.commit()
     release_agent.set()
-    thread.join(timeout=5)
+    thread.join(timeout=_THREAD_COORDINATION_TIMEOUT_SECONDS)
     assert not thread.is_alive()
 
     response = response_holder["response"]
@@ -5805,5 +6108,168 @@ def test_trigger_time_account_context_excludes_foreign_local_open_orders() -> No
         "account_scope": current_identity.account_scope,
     }
     assert payload["open_order_count"] == 1
-    assert payload["open_orders"][0]["broker_order_id"] == "trigger-current-open-buy"
+    assert payload["open_orders"][0] == {
+        "symbol": "005930",
+        "side": "buy",
+        "quantity": 1,
+        "remaining_quantity": 1,
+        "remaining_quantity_indeterminate": False,
+        "status": "submitted",
+        "limit_price": "100000.0000",
+    }
+    engine.dispose()
+
+
+def test_trigger_time_account_context_dedupes_partial_local_order_and_hides_other_lane_identity() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="trigger-lane-account",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+    observed_at = datetime.now(UTC)
+
+    with session_factory() as session:
+        short_item = ExecutionPlanItem(
+            id="trigger-short-order-item",
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="broker_order_submitted",
+            provider="kis",
+            venue="KRX",
+            asset_class="stock",
+            decision_agent_name="short-term-decider",
+            source_plan_item_id="trigger-short-family",
+        )
+        signal_item = ExecutionPlanItem(
+            id="trigger-signal-order-item",
+            plan_item_index=1,
+            symbol="000660",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="broker_order_submitted",
+            provider="kis",
+            venue="KRX",
+            asset_class="stock",
+            decision_agent_name="signal-decider",
+            source_plan_item_id="trigger-signal-family",
+        )
+        plan = ExecutionPlan(
+            external_plan_id="trigger-account-lane-plan",
+            source="test",
+            mode="paper",
+            items=[short_item, signal_item],
+        )
+        short_order = BrokerOrder(
+            id="trigger-short-partial-order",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="trigger-short-partial-order",
+            broker_order_id="broker-short-partial",
+            execution_plan_item_id=short_item.id,
+            symbol="005930",
+            side="buy",
+            status="submitted",
+            quantity=5,
+            limit_price=Decimal("100"),
+            venue="KRX",
+            asset_class="stock",
+            request_metadata={
+                "execution_scope": execution_scope_payload(
+                    identity=identity,
+                    venue="KRX",
+                    asset_class="stock",
+                )
+            },
+        )
+        signal_order = BrokerOrder(
+            id="trigger-signal-order",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="trigger-signal-order",
+            broker_order_id="broker-signal-order",
+            execution_plan_item_id=signal_item.id,
+            symbol="000660",
+            side="buy",
+            status="submitted",
+            quantity=2,
+            limit_price=Decimal("200"),
+            venue="KRX",
+            asset_class="stock",
+            request_metadata={
+                "execution_scope": execution_scope_payload(
+                    identity=identity,
+                    venue="KRX",
+                    asset_class="stock",
+                )
+            },
+        )
+        session.add_all([plan, short_order, signal_order])
+        session.flush()
+        session.add(
+            ExecutionFill(
+                broker_order_pk=short_order.id,
+                broker_fill_id="trigger-short-fill",
+                idempotency_key="trigger-short-fill",
+                symbol="005930",
+                side="buy",
+                quantity=2,
+                price=Decimal("100"),
+                filled_at=observed_at - timedelta(seconds=5),
+                payload={"fill_time_precision": "exact"},
+            )
+        )
+        session.commit()
+
+        payload = trigger_time_exec_agent._account_context_payload(
+            settings=settings,
+            db=session,
+            snapshot=BrokerAccountSnapshot(
+                available_cash=Decimal("10000"),
+                buying_power=Decimal("10000"),
+                observed_at=observed_at,
+                source="stub:account_snapshot",
+                open_orders=[
+                    BrokerAccountOpenOrder(
+                        symbol="005930",
+                        side="buy",
+                        quantity=5,
+                        remaining_quantity=3,
+                        status="open",
+                        broker_order_id="broker-short-partial",
+                        idempotency_key="trigger-short-partial-order",
+                        limit_price=Decimal("100"),
+                    )
+                ],
+            ),
+            provider="kis",
+            exchange="KRX",
+            decision_lane="short-term-decider",
+            observed_at=observed_at,
+        )
+
+    assert payload["open_order_count"] == 2
+    same_lane, other_lane = payload["open_orders"]
+    assert same_lane["remaining_quantity"] == 3
+    assert same_lane["decision_agent_name"] == "short-term-decider"
+    assert same_lane["entry_family_key"] == "source:trigger-short-family"
+    assert same_lane["broker_order_id"] == "broker-short-partial"
+    assert other_lane == {
+        "symbol": "000660",
+        "side": "buy",
+        "quantity": 2,
+        "remaining_quantity": 2,
+        "remaining_quantity_indeterminate": False,
+        "status": "submitted",
+        "limit_price": "200.0000",
+    }
     engine.dispose()

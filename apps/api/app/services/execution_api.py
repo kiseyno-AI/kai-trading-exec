@@ -55,6 +55,7 @@ from app.services.runtime_transitions import (
     WATCH_SIZING_PENDING_STATUS,
 )
 from app.services.plan_item_identity import (
+    plan_item_inventory_scope_key,
     select_plan_item_family_members,
     serialize_plan_item_source_identity,
     serialize_symbol_source_identities,
@@ -1694,6 +1695,9 @@ def _sibling_trigger_price(
     *,
     entry_item: ExecutionPlanItem,
 ) -> Decimal | None:
+    entry_route = plan_item_inventory_scope_key(entry_item)
+    if entry_route is None:
+        return None
     candidates = [
         item
         for item in items
@@ -1703,6 +1707,11 @@ def _sibling_trigger_price(
         anchor=entry_item,
         candidates=candidates,
     )
+    selected = [
+        item
+        for item in selected
+        if plan_item_inventory_scope_key(item) == entry_route
+    ]
     return selected[0].trigger_price if selected else None
 
 
