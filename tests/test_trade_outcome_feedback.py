@@ -6,7 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
@@ -19,6 +19,7 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
     ExecutionPosition,
+    FifoInventoryIsolation,
 )
 from app.services.trade_outcome_feedback import (
     FeedbackExecutionScope,
@@ -64,6 +65,10 @@ from app.services import trade_outcome_feedback as feedback_service
 from app.services.execution_lineage import decision_lineage_for_plan_item
 from app.services.fifo_inventory import FifoIsolationCursor, FifoRouteScope
 from app.services.position_identity import PositionIdentity, payload_with_position_identity
+from app.services.plan_item_identity import (
+    plan_item_decision_agent_name,
+    plan_item_entry_family_key,
+)
 from app.services.trigger_time_exec_agent import _request_payload
 from app.services.watch_exec_agent_sizing import _candidate_universe_payload, _sizing_request_payload
 
@@ -75,6 +80,27 @@ COMPLETE_KRW_FILL_ECONOMICS: dict[str, object] = {
     "transaction_cost_source": "test_fixture",
 }
 FEEDBACK_TEST_ACCOUNT_SCOPE = "a" * 24
+STRATEGY_ENTRY_FAMILY_METADATA_KEY = "strategy_entry_family_v1"
+
+
+def _strategy_entry_family_request_metadata(
+    item: ExecutionPlanItem,
+) -> dict[str, object]:
+    family_key = plan_item_entry_family_key(item)
+    decision_lane = plan_item_decision_agent_name(item)
+    assert family_key is not None
+    assert decision_lane is not None
+    identity = {
+        "policy_version": 1,
+        "entry_family_key": family_key,
+        "decision_lane": decision_lane,
+    }
+    return {
+        "metadata": {STRATEGY_ENTRY_FAMILY_METADATA_KEY: dict(identity)},
+        "original_command": {
+            "metadata": {STRATEGY_ENTRY_FAMILY_METADATA_KEY: dict(identity)}
+        },
+    }
 
 
 def test_partial_lineage_is_excluded_from_feedback_profitability_summary() -> None:
@@ -133,6 +159,15 @@ def _write_quality_gated_feedback_artifact(
         "consumer_eligible": True,
         "blocked_reasons": [],
     }
+    effective_prompt_snippet = {
+        **(prompt_snippet or {}),
+        "quality_gate": {
+            "status": "ready",
+            "consumer_eligible": True,
+            "blocked_reasons": [],
+            "instruction": "apply_only_quality_gated_lessons",
+        },
+    }
     payload = attach_artifact_integrity(
         {
             "version": REPORT_VERSION,
@@ -148,18 +183,103 @@ def _write_quality_gated_feedback_artifact(
             "closed_trade_count": 1,
             "summary": {"realized_pnl_krw": "-10000.0000"},
             "quality_gate": quality_gate,
-            "prompt_snippet": {
-                **(prompt_snippet or {}),
-                "quality_gate": {
+            "strategy_learning_by_lane": {
+                "short-term-decider": {
+                    "schema_version": "strategy-lane-learning-v1",
                     "status": "ready",
                     "consumer_eligible": True,
-                    "blocked_reasons": [],
-                    "instruction": "apply_only_quality_gated_lessons",
+                    "execution_authority": True,
+                    "decision_lane": "short-term-decider",
+                    "execution_account_scope": {
+                        "provider": "kis",
+                        "account_scope": account_scope,
+                    },
+                    "quality_gate": quality_gate,
+                    "snippet": effective_prompt_snippet,
                 },
             },
+            "operational_learning_by_lane": {},
+            "prompt_snippet": effective_prompt_snippet,
         }
     )
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_blocked_aggregate_loader_preserves_lane_authority_maps(tmp_path) -> None:
+    strategy_lane = {
+        "schema_version": "strategy-lane-learning-v1",
+        "status": "ready",
+        "consumer_eligible": True,
+        "execution_authority": True,
+        "decision_lane": "signal-decider",
+        "execution_account_scope": {
+            "provider": "kis",
+            "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+        },
+    }
+    operational_lane = {
+        "schema_version": "strategy-lane-operational-learning-v1",
+        "status": "ready",
+        "consumer_eligible": True,
+        "execution_authority": True,
+        "decision_lane": "signal-decider",
+        "execution_account_scope": {
+            "provider": "kis",
+            "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+        },
+    }
+    payload = attach_artifact_integrity(
+        {
+            "version": REPORT_VERSION,
+            "schema_version": REPORT_VERSION,
+            "mode": "paper",
+            "execution_account_scope": {
+                "status": "single",
+                "provider": "kis",
+                "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+            },
+            "generated_at": datetime.now(UTC).isoformat(),
+            "quality_gate": {
+                "schema_version": "trade-outcome-learning-quality-v1",
+                "status": "blocked",
+                "consumer_eligible": False,
+                "blocked_reasons": ["aggregate_audit_only"],
+            },
+            "strategy_learning_by_lane": {"signal-decider": strategy_lane},
+            "operational_learning_by_lane": {
+                "signal-decider": operational_lane
+            },
+            "prompt_snippet": {},
+        }
+    )
+    (tmp_path / "latest.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+    )
+
+    loaded = load_latest_trade_outcome_feedback_snippet(
+        settings,
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+    )
+
+    assert loaded["status"] == "blocked"
+    assert loaded["strategy_learning_by_lane"] == {
+        "signal-decider": strategy_lane
+    }
+    assert loaded["operational_learning_by_lane"] == {
+        "signal-decider": operational_lane
+    }
+    assert loaded["snippet"]["strategy_learning_by_lane"] == {
+        "signal-decider": strategy_lane
+    }
+    assert loaded["snippet"]["operational_learning_by_lane"] == {
+        "signal-decider": operational_lane
+    }
 
 
 class _CapturingPositionSession:
@@ -310,6 +430,7 @@ def _add_closed_trade(
         venue="KRX",
         asset_class="stock",
         request_metadata={
+            **_strategy_entry_family_request_metadata(item),
             "decision_lineage": lineage,
             "provider": "kis",
             "venue": "KRX",
@@ -404,20 +525,27 @@ def _bind_closed_trade_to_execution_scope(
         }
 
 
-def _fifo_test_order(*, row_id: str, side: str) -> BrokerOrder:
+def _fifo_test_order(
+    *,
+    row_id: str,
+    side: str,
+    exchange: str = "KRX",
+    account_scope: str = FEEDBACK_TEST_ACCOUNT_SCOPE,
+    provider: str = "kis",
+) -> BrokerOrder:
     item_id = f"{row_id}-item"
     decision_run_id = f"{row_id}-run"
     return BrokerOrder(
         id=row_id,
         execution_plan_item_id=item_id,
-        broker_name="kis",
+        broker_name=provider,
         mode="paper",
         idempotency_key=row_id,
         symbol="005930",
         side=side,
         status="filled",
         quantity=1,
-        venue="KRX",
+        venue=exchange,
         asset_class="stock",
         request_metadata={
             "decision_lineage": {
@@ -437,11 +565,11 @@ def _fifo_test_order(*, row_id: str, side: str) -> BrokerOrder:
             },
             "execution_scope": {
                 "policy_version": 1,
-                "provider": "kis",
-                "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
-                "venue": "KRX",
+                "provider": provider,
+                "account_scope": account_scope,
+                "venue": exchange,
                 "asset_class": "stock",
-                "exchange": "KRX",
+                "exchange": exchange,
             }
         },
     )
@@ -466,6 +594,221 @@ def _fifo_test_fill(
         **COMPLETE_KRW_FILL_ECONOMICS,
         filled_at=filled_at,
     )
+
+
+def test_feedback_learning_blocks_mixed_valid_and_conflicting_duplicate_fills(
+    tmp_path,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=20,
+    )
+    valid_plan = ExecutionPlan(
+        id="duplicate-quality-valid-plan",
+        external_plan_id="duplicate-quality-valid-plan",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    conflict_plan = ExecutionPlan(
+        id="duplicate-quality-conflict-plan",
+        external_plan_id="duplicate-quality-conflict-plan",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add_all([valid_plan, conflict_plan])
+    _add_closed_trade(
+        session,
+        plan=valid_plan,
+        suffix="duplicate-quality-valid",
+        symbol="VALID",
+        buy_price="100",
+        sell_price="110",
+    )
+    _add_closed_trade(
+        session,
+        plan=conflict_plan,
+        suffix="duplicate-quality-conflict",
+        symbol="CONFLICT",
+        buy_price="100",
+        sell_price="90",
+    )
+    _bind_closed_trade_to_execution_scope(
+        session,
+        suffix="duplicate-quality-valid",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+    )
+    _bind_closed_trade_to_execution_scope(
+        session,
+        suffix="duplicate-quality-conflict",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+    )
+    session.flush()
+    original_conflicting_sell = session.scalar(
+        select(ExecutionFill).where(
+            ExecutionFill.broker_order_pk
+            == "order-sell-duplicate-quality-conflict",
+            ExecutionFill.broker_fill_id
+            == "fill-sell-duplicate-quality-conflict",
+        )
+    )
+    assert original_conflicting_sell is not None
+    original_conflicting_sell.filled_at = datetime(
+        2026, 5, 20, 1, 0, tzinfo=UTC
+    )
+    session.add(
+        ExecutionFill(
+            broker_order_pk="order-sell-duplicate-quality-conflict",
+            broker_fill_id="fill-sell-duplicate-quality-conflict",
+            symbol="CONFLICT",
+            side="sell",
+            quantity=10,
+            price=Decimal("91"),
+            **COMPLETE_KRW_FILL_ECONOMICS,
+            filled_at=datetime(2026, 6, 11, 1, 0, tzinfo=UTC),
+        )
+    )
+    session.add(
+        FifoInventoryIsolation(
+            mode="paper",
+            provider="kis",
+            account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+            venue="KRX",
+            asset_class="stock",
+            exchange="KRX",
+            symbol="CONFLICT",
+            residual_quantity=Decimal("0"),
+            last_local_fill_at=datetime(2026, 5, 20, 1, 0, tzinfo=UTC),
+            broker_position_id="duplicate-quality-later-flat",
+            broker_position_quantity=Decimal("0"),
+            broker_reconciled_at=datetime(2026, 6, 5, tzinfo=UTC),
+            isolated_through_at=datetime(2026, 6, 5, tzinfo=UTC),
+            evidence_source="broker_flat_reconciliation",
+            actor="test",
+            reason="later flat cannot rewrite in-period learning evidence",
+        )
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, tzinfo=UTC),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+    )
+
+    assert report["closed_trade_count"] == 1
+    assert report["quality_gate"]["consumer_eligible"] is False
+    assert "duplicate_fill_economic_conflict" in report["quality_gate"][
+        "blocked_reasons"
+    ]
+
+    session.close()
+    engine.dispose()
+
+
+def test_feedback_learning_ignores_preperiod_conflict_after_verified_flat(
+    tmp_path,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+        trade_outcome_feedback_lookback_days=7,
+    )
+    old_plan = ExecutionPlan(
+        id="old-conflict-plan",
+        external_plan_id="old-conflict-plan",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    clean_plan = ExecutionPlan(
+        id="clean-generation-plan",
+        external_plan_id="clean-generation-plan",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add_all([old_plan, clean_plan])
+    _add_closed_trade(
+        session,
+        plan=old_plan,
+        suffix="old-conflict-generation",
+        symbol="OLD-CONFLICT",
+        buy_price="50",
+        sell_price="60",
+        filled_day=1,
+    )
+    _add_closed_trade(
+        session,
+        plan=clean_plan,
+        suffix="clean-generation",
+        symbol="CLEAN",
+        buy_price="100",
+        sell_price="110",
+        filled_day=18,
+    )
+    session.flush()
+    _bind_closed_trade_to_execution_scope(
+        session,
+        suffix="old-conflict-generation",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="NXT",
+    )
+    _bind_closed_trade_to_execution_scope(
+        session,
+        suffix="clean-generation",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+    )
+    session.add_all(
+        [
+            ExecutionFill(
+                broker_order_pk="order-sell-old-conflict-generation",
+                broker_fill_id="fill-sell-old-conflict-generation",
+                symbol="OLD-CONFLICT",
+                side="sell",
+                quantity=10,
+                price=Decimal("61"),
+                **COMPLETE_KRW_FILL_ECONOMICS,
+                filled_at=datetime(2026, 6, 2, 1, 0, tzinfo=UTC),
+            ),
+            FifoInventoryIsolation(
+                mode="paper",
+                provider="kis",
+                account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+                venue="KRX",
+                asset_class="stock",
+                exchange="KRX",
+                symbol="OLD-CONFLICT",
+                residual_quantity=Decimal("0"),
+                last_local_fill_at=datetime(2026, 6, 2, 1, 0, tzinfo=UTC),
+                broker_position_id="old-conflict-generation-flat",
+                broker_position_quantity=Decimal("0"),
+                broker_reconciled_at=datetime(2026, 6, 5, tzinfo=UTC),
+                isolated_through_at=datetime(2026, 6, 5, tzinfo=UTC),
+                evidence_source="broker_flat_reconciliation",
+                actor="test",
+                reason="verified domestic flat boundary",
+            ),
+        ]
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=datetime(2026, 6, 20, tzinfo=UTC),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+    )
+
+    assert report["closed_trade_count"] == 1
+    assert "duplicate_fill_economic_conflict" not in report["quality_gate"][
+        "blocked_reasons"
+    ]
+    session.close()
+    engine.dispose()
 
 
 def test_fifo_outcome_fails_closed_for_materially_different_same_time_buys() -> None:
@@ -562,6 +905,100 @@ def test_fifo_outcome_accepts_clean_trade_after_exact_route_flat_boundary() -> N
     assert rows[0]["profitability_eligible"] is True
     assert rows[0]["gross_realized_pnl"] == "50.0000"
     assert "fill_chronology_ambiguous" not in rows[0]["outcome_quality_flags"]
+
+
+def test_fifo_outcome_matches_kis_domestic_buy_and_sell_across_execution_routes() -> None:
+    bought_at = datetime(2026, 6, 10, 0, 30, tzinfo=UTC)
+    buy = _fifo_test_order(
+        row_id="domestic-route-buy",
+        side="buy",
+        exchange="NXT",
+    )
+    sell = _fifo_test_order(
+        row_id="domestic-route-sell",
+        side="sell",
+        exchange="KRX",
+    )
+
+    rows = feedback_service._fifo_closed_trades(
+        [
+            _fifo_test_fill(
+                row_id="domestic-route-buy-fill",
+                order=buy,
+                side="buy",
+                price="100",
+                filled_at=bought_at,
+            ),
+            _fifo_test_fill(
+                row_id="domestic-route-sell-fill",
+                order=sell,
+                side="sell",
+                price="110",
+                filled_at=bought_at + timedelta(minutes=1),
+            ),
+        ]
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["gross_realized_pnl"] == "10.0000"
+    assert rows[0]["execution_scope"]["exchange"] == "KRX"
+
+
+def test_fifo_outcome_domestic_flat_boundary_clears_cross_route_lots() -> None:
+    old_at = datetime(2026, 6, 10, 0, 30, tzinfo=UTC)
+    boundary_at = old_at + timedelta(minutes=1)
+    canonical_route = FifoRouteScope(
+        "kis", FEEDBACK_TEST_ACCOUNT_SCOPE, "KRX", "stock", "KRX"
+    )
+    cursor = FifoIsolationCursor(
+        isolated_at_by_route_symbol={(canonical_route, "005930"): [boundary_at]}
+    )
+    old_buy = _fifo_test_order(
+        row_id="domestic-flat-old-buy",
+        side="buy",
+        exchange="NXT",
+    )
+    new_buy = _fifo_test_order(
+        row_id="domestic-flat-new-buy",
+        side="buy",
+        exchange="KRX",
+    )
+    sell = _fifo_test_order(
+        row_id="domestic-flat-sell",
+        side="sell",
+        exchange="NXT",
+    )
+
+    rows = feedback_service._fifo_closed_trades(
+        [
+            _fifo_test_fill(
+                row_id="domestic-flat-old-buy-fill",
+                order=old_buy,
+                side="buy",
+                price="80",
+                filled_at=old_at,
+            ),
+            _fifo_test_fill(
+                row_id="domestic-flat-new-buy-fill",
+                order=new_buy,
+                side="buy",
+                price="100",
+                filled_at=boundary_at + timedelta(seconds=1),
+            ),
+            _fifo_test_fill(
+                row_id="domestic-flat-sell-fill",
+                order=sell,
+                side="sell",
+                price="110",
+                filled_at=boundary_at + timedelta(minutes=1),
+            ),
+        ],
+        isolation_cursor=cursor,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["gross_realized_pnl"] == "10.0000"
+    assert rows[0]["execution_scope"]["exchange"] == "NXT"
 
 
 @pytest.mark.parametrize(
@@ -856,6 +1293,7 @@ def test_generate_trade_outcome_feedback_writes_fifo_report_and_snippet(tmp_path
         venue="KRX",
         asset_class="stock",
         request_metadata={
+            **_strategy_entry_family_request_metadata(item),
             "decision_lineage": lineage,
             "provider": "kis",
             "venue": "KRX",
@@ -3574,7 +4012,11 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
         side="sell",
         intent="stop_sell",
         status="filled",
-        quantity_policy={"kind": "shares", "quantity": 10},
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 10,
+            "linked_entry_item_key": "core-buy-sell-context",
+        },
         risk_context={
             "last_monitoring_event": {
                 "event": "post_entry_review_required",
@@ -3601,6 +4043,7 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
         venue="KRX",
         asset_class="stock",
         request_metadata={
+            **_strategy_entry_family_request_metadata(buy_item),
             "decision_lineage": decision_lineage_for_plan_item(buy_item),
             "provider": "kis",
             "venue": "KRX",
@@ -3626,6 +4069,7 @@ def test_candidate_rule_replay_uses_sell_post_entry_context(tmp_path) -> None:
         venue="KRX",
         asset_class="stock",
         request_metadata={
+            **_strategy_entry_family_request_metadata(sell_item),
             "decision_lineage": decision_lineage_for_plan_item(sell_item),
             "provider": "kis",
             "venue": "KRX",
@@ -3707,6 +4151,7 @@ def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> 
         trigger_price=Decimal("71000"),
         quantity_policy={"kind": "shares", "quantity": 1},
         risk_context={},
+        decision_agent_name="short-term-decider",
     )
     session.add(plan)
     session.commit()
@@ -3714,7 +4159,13 @@ def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> 
     sizing_payload = _sizing_request_payload(
         settings=settings,
         plan=plan,
-        candidates=[{"execution_plan_item_id": item.id, "symbol": item.symbol}],
+        candidates=[
+            {
+                "execution_plan_item_id": item.id,
+                "symbol": item.symbol,
+                "decision_agent_name": "short-term-decider",
+            }
+        ],
         account_context={
             "available": False,
             "execution_account_scope": {
@@ -3751,7 +4202,7 @@ def test_exec_agent_payloads_include_latest_trade_outcome_feedback(tmp_path) -> 
     engine.dispose()
 
 
-def test_blocked_performance_feedback_still_exposes_lineaged_negative_operational_evidence(
+def test_provider_account_and_failure_columns_do_not_grant_operational_authority(
     tmp_path,
 ) -> None:
     engine, session = _session()
@@ -3823,12 +4274,844 @@ def test_blocked_performance_feedback_still_exposes_lineaged_negative_operationa
     assert report["quality_gate"]["status"] == "no_data"
     assert feedback["status"] == "blocked"
     operational = feedback["operational_learning_context"]
-    assert operational["status"] == "ready"
-    assert operational["consumer_eligible"] is True
+    assert operational["status"] == "blocked"
+    assert operational["consumer_eligible"] is False
+    assert operational["execution_authority"] is False
     assert operational["classification_counts"] == {"broker_rejected": 1}
     assert operational["broker_order_status_counts"] == {"rejected": 1}
+    assert operational["failure_items"][0]["strategy_scope"] == {
+        "schema_version": "strategy-feedback-scope-v1",
+        "status": "unavailable",
+        "consumer_eligible": False,
+        "decision_lane": None,
+        "entry_family_key": None,
+        "evidence_status": "immutable_decision_lineage_incomplete",
+    }
+    assert feedback["operational_learning_by_lane"] == {}
     assert operational["prohibited_effects"] == ["approve", "increase_size"]
-    assert operational["instruction"] == "may_apply_negative_operational_lessons_only"
+    assert operational["instruction"] == "do_not_apply_operational_lessons"
+
+    session.close()
+    engine.dispose()
+
+
+def _add_operational_failure(
+    session,
+    *,
+    decision_lane: str,
+    suffix: str,
+    observed_at: datetime,
+    exact_family: bool = True,
+    durable_lineage: bool = True,
+) -> str:
+    plan = ExecutionPlan(
+        id=f"operational-isolation-{suffix}-plan",
+        external_plan_id=f"operational-isolation-{suffix}-external",
+        source="kai-trading-core",
+        market_date=date(2026, 6, 12),
+        strategy_run_id=f"operational-isolation-{suffix}-run",
+        mode="paper",
+        status="accepted",
+    )
+    item = ExecutionPlanItem(
+        id=f"operational-isolation-{suffix}-item",
+        plan=plan,
+        execution_plan_id=plan.id,
+        plan_item_index=0,
+        symbol=f"{100000 + len(suffix):06d}",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="failed",
+        quantity_policy={"kind": "shares", "quantity": 1},
+        decision_agent_name=decision_lane,
+        decision_snapshot_id=f"operational-isolation-{suffix}-snapshot",
+        decision_run_id=plan.strategy_run_id,
+        source_plan_item_id=f"operational-isolation-{suffix}-entry",
+        source_market_date=date(2026, 6, 11),
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+    )
+    lineage = decision_lineage_for_plan_item(item)
+    assert lineage is not None
+    request_metadata: dict[str, object] = {
+        **_strategy_entry_family_request_metadata(item),
+        "provider": "kis",
+        "venue": "KRX",
+        "asset_class": "stock",
+        "exchange": "KRX",
+        "broker_account_scope": {
+            "policy_version": 1,
+            "scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+        },
+    }
+    if durable_lineage:
+        request_metadata["decision_lineage"] = lineage
+    if not exact_family:
+        request_metadata["original_command"] = {"metadata": {}}
+    order = BrokerOrder(
+        id=f"operational-isolation-{suffix}-order",
+        plan_item=item,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=f"operational-isolation-{suffix}-order",
+        broker_order_id=f"operational-isolation-{suffix}-order",
+        symbol=item.symbol,
+        side=item.side,
+        status="rejected",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata=request_metadata,
+    )
+    session.add(
+        ExecutionFailure(
+            id=f"operational-isolation-{suffix}-failure",
+            mode="paper",
+            broker_order=order,
+            execution_plan_id=plan.id,
+            execution_plan_item_id=item.id,
+            strategy_run_id=plan.strategy_run_id,
+            decision_actor=decision_lane,
+            broker_name="kis",
+            idempotency_key=order.idempotency_key,
+            symbol=order.symbol,
+            side=order.side,
+            intent=item.intent,
+            requested_quantity=1,
+            classification="broker_rejected",
+            broker_error_message="redacted test rejection",
+            retryable=False,
+            status="open",
+            first_failed_at=observed_at,
+            latest_failed_at=observed_at,
+        )
+    )
+    return f"source:operational-isolation-{suffix}-entry"
+
+
+@pytest.mark.parametrize(
+    ("exact_lane", "incomplete_lane"),
+    [
+        ("signal-decider", "short-term-decider"),
+        ("short-term-decider", "signal-decider"),
+    ],
+)
+def test_lane_known_incomplete_operational_failure_blocks_only_its_lane(
+    tmp_path,
+    exact_lane: str,
+    incomplete_lane: str,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+    )
+    observed_at = datetime(2026, 6, 12, tzinfo=UTC)
+    _add_operational_failure(
+        session,
+        decision_lane=exact_lane,
+        suffix="exact",
+        observed_at=observed_at,
+    )
+    _add_operational_failure(
+        session,
+        decision_lane=incomplete_lane,
+        suffix="incomplete",
+        observed_at=observed_at + timedelta(seconds=1),
+        exact_family=False,
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=observed_at + timedelta(minutes=1),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+
+    exact_learning = report["operational_learning_by_lane"][exact_lane]
+    incomplete_learning = report["operational_learning_by_lane"][
+        incomplete_lane
+    ]
+    assert exact_learning["status"] == "ready"
+    assert exact_learning["consumer_eligible"] is True
+    assert exact_learning["excluded_unattributed_failure_count"] == 0
+    assert incomplete_learning["status"] == "blocked"
+    assert incomplete_learning["consumer_eligible"] is False
+    assert incomplete_learning["excluded_unattributed_failure_count"] == 1
+    assert "incomplete_strategy_lane_attribution" in incomplete_learning[
+        "blocked_reasons"
+    ]
+
+    session.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "exact_lane",
+    ["signal-decider", "short-term-decider"],
+)
+def test_unknown_operational_lane_blocks_every_present_lane_bucket(
+    tmp_path,
+    exact_lane: str,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+    )
+    observed_at = datetime(2026, 6, 12, tzinfo=UTC)
+    _add_operational_failure(
+        session,
+        decision_lane=exact_lane,
+        suffix="known",
+        observed_at=observed_at,
+    )
+    _add_operational_failure(
+        session,
+        decision_lane=(
+            "short-term-decider"
+            if exact_lane == "signal-decider"
+            else "signal-decider"
+        ),
+        suffix="unknown",
+        observed_at=observed_at + timedelta(seconds=1),
+        durable_lineage=False,
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=observed_at + timedelta(minutes=1),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+
+    assert set(report["operational_learning_by_lane"]) == {exact_lane}
+    exact_learning = report["operational_learning_by_lane"][exact_lane]
+    assert exact_learning["status"] == "blocked"
+    assert exact_learning["consumer_eligible"] is False
+    assert exact_learning["unknown_or_ambiguous_lane_failure_count"] == 1
+    assert "incomplete_strategy_lane_attribution" in exact_learning[
+        "blocked_reasons"
+    ]
+
+    session.close()
+    engine.dispose()
+
+
+def test_foreign_operational_failures_do_not_consume_relevant_scope_limit(
+    tmp_path,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+    )
+    observed_at = datetime(2026, 6, 12, tzinfo=UTC)
+    _add_operational_failure(
+        session,
+        decision_lane="signal-decider",
+        suffix="older-current-scope",
+        observed_at=observed_at,
+    )
+    for index in range(501):
+        order = BrokerOrder(
+            id=f"foreign-operational-order-{index}",
+            broker_name="alpaca",
+            mode="paper",
+            idempotency_key=f"foreign-operational-order-{index}",
+            broker_order_id=f"foreign-operational-order-{index}",
+            symbol="AAPL",
+            side="buy",
+            status="rejected",
+            quantity=1,
+            venue="NASDAQ",
+            asset_class="stock",
+            request_metadata={
+                "provider": "alpaca",
+                "venue": "NASDAQ",
+                "asset_class": "stock",
+                "exchange": "NASDAQ",
+                "broker_account_scope": {
+                    "policy_version": 1,
+                    "scope": "b" * 24,
+                },
+            },
+        )
+        failed_at = observed_at + timedelta(seconds=index + 1)
+        session.add(
+            ExecutionFailure(
+                id=f"foreign-operational-failure-{index}",
+                mode="paper",
+                broker_order=order,
+                broker_name="alpaca",
+                idempotency_key=order.idempotency_key,
+                symbol=order.symbol,
+                side=order.side,
+                requested_quantity=1,
+                classification="broker_rejected",
+                broker_error_message="redacted foreign rejection",
+                retryable=False,
+                status="open",
+                first_failed_at=failed_at,
+                latest_failed_at=failed_at,
+            )
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=observed_at + timedelta(minutes=20),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+
+    aggregate = report["operational_learning_context"]
+    assert aggregate["failure_count"] == 1
+    assert "failure_rows_truncated" not in aggregate["blocked_reasons"]
+    assert "failure_scan_cap_exceeded" not in aggregate["blocked_reasons"]
+    assert report["operational_learning_by_lane"]["signal-decider"][
+        "consumer_eligible"
+    ] is True
+
+    session.close()
+    engine.dispose()
+
+
+def test_only_relevant_operational_failures_trigger_truncation(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+    )
+    observed_at = datetime(2026, 6, 12, tzinfo=UTC)
+    for index in range(501):
+        _add_operational_failure(
+            session,
+            decision_lane="signal-decider",
+            suffix=f"relevant-{index}",
+            observed_at=observed_at + timedelta(seconds=index),
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=observed_at + timedelta(minutes=20),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+
+    aggregate = report["operational_learning_context"]
+    assert aggregate["failure_count"] == 500
+    assert "failure_rows_truncated" in aggregate["blocked_reasons"]
+    assert "failure_scan_cap_exceeded" not in aggregate["blocked_reasons"]
+    assert report["operational_learning_by_lane"]["signal-decider"][
+        "consumer_eligible"
+    ] is False
+
+    session.close()
+    engine.dispose()
+
+
+def test_operational_failure_scope_loading_has_bounded_query_count(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+    )
+    observed_at = datetime(2026, 6, 12, tzinfo=UTC)
+    for index in range(25):
+        _add_operational_failure(
+            session,
+            decision_lane="short-term-decider",
+            suffix=f"query-count-{index}",
+            observed_at=observed_at + timedelta(seconds=index),
+        )
+    session.commit()
+    statements: list[str] = []
+
+    def capture_statement(*args) -> None:
+        statements.append(str(args[2]))
+
+    event.listen(engine, "before_cursor_execute", capture_statement)
+    try:
+        context = feedback_service._operational_learning_context(
+            settings=settings,
+            db=session,
+            started_at=observed_at - timedelta(minutes=1),
+            as_of=observed_at + timedelta(minutes=1),
+            requested_scope=FeedbackExecutionScope(
+                provider="kis",
+                account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+                exchange="KRX",
+            ),
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_statement)
+
+    assert context["failure_count"] == 25
+    assert len(statements) <= 3
+
+    session.close()
+    engine.dispose()
+
+
+def test_operational_failure_scan_cap_overflow_fails_closed(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+    )
+    observed_at = datetime(2026, 6, 12, tzinfo=UTC)
+    for index in range(3):
+        order = BrokerOrder(
+            id=f"scan-cap-order-{index}",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=f"scan-cap-order-{index}",
+            broker_order_id=f"scan-cap-order-{index}",
+            symbol="005930",
+            side="buy",
+            status="rejected",
+            quantity=1,
+            venue="KRX",
+            asset_class="stock",
+            request_metadata={
+                "exchange": "KRX",
+                "broker_account_scope": {
+                    "policy_version": 1,
+                    "scope": "b" * 24,
+                },
+            },
+        )
+        failed_at = observed_at + timedelta(seconds=index)
+        session.add(
+            ExecutionFailure(
+                id=f"scan-cap-failure-{index}",
+                mode="paper",
+                broker_order=order,
+                broker_name="kis",
+                idempotency_key=order.idempotency_key,
+                symbol=order.symbol,
+                side=order.side,
+                requested_quantity=1,
+                classification="broker_rejected",
+                broker_error_message="redacted",
+                retryable=False,
+                status="open",
+                first_failed_at=failed_at,
+                latest_failed_at=failed_at,
+            )
+        )
+    session.commit()
+    monkeypatch.setattr(
+        feedback_service,
+        "MAX_OPERATIONAL_FAILURE_SCAN_ROWS",
+        2,
+    )
+    monkeypatch.setattr(
+        feedback_service,
+        "OPERATIONAL_FAILURE_SCAN_BATCH_SIZE",
+        2,
+    )
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=observed_at + timedelta(minutes=1),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+
+    assert "failure_scan_cap_exceeded" in report[
+        "operational_learning_context"
+    ]["blocked_reasons"]
+    assert report["operational_learning_by_lane"] == {}
+
+    session.close()
+    engine.dispose()
+
+
+def test_operational_failure_scan_cap_blocks_partially_observed_lane(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+    )
+    observed_at = datetime(2026, 6, 12, tzinfo=UTC)
+    _add_operational_failure(
+        session,
+        decision_lane="signal-decider",
+        suffix="scan-cap-current",
+        observed_at=observed_at + timedelta(seconds=3),
+    )
+    for index in range(2):
+        order = BrokerOrder(
+            id=f"scan-cap-foreign-account-order-{index}",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=f"scan-cap-foreign-account-order-{index}",
+            broker_order_id=f"scan-cap-foreign-account-order-{index}",
+            symbol="005930",
+            side="buy",
+            status="rejected",
+            quantity=1,
+            venue="KRX",
+            asset_class="stock",
+            request_metadata={
+                "exchange": "KRX",
+                "broker_account_scope": {
+                    "policy_version": 1,
+                    "scope": "b" * 24,
+                },
+            },
+        )
+        failed_at = observed_at + timedelta(seconds=index + 1)
+        session.add(
+            ExecutionFailure(
+                id=f"scan-cap-foreign-account-failure-{index}",
+                mode="paper",
+                broker_order=order,
+                broker_name="kis",
+                idempotency_key=order.idempotency_key,
+                symbol=order.symbol,
+                side=order.side,
+                requested_quantity=1,
+                classification="broker_rejected",
+                broker_error_message="redacted",
+                retryable=False,
+                status="open",
+                first_failed_at=failed_at,
+                latest_failed_at=failed_at,
+            )
+        )
+    session.commit()
+    monkeypatch.setattr(
+        feedback_service,
+        "MAX_OPERATIONAL_FAILURE_SCAN_ROWS",
+        2,
+    )
+    monkeypatch.setattr(
+        feedback_service,
+        "OPERATIONAL_FAILURE_SCAN_BATCH_SIZE",
+        2,
+    )
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=observed_at + timedelta(minutes=1),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+
+    lane_learning = report["operational_learning_by_lane"]["signal-decider"]
+    assert lane_learning["failure_count"] == 1
+    assert lane_learning["consumer_eligible"] is False
+    assert "failure_scan_cap_exceeded" in lane_learning["blocked_reasons"]
+
+    session.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize("intent", ["target_sell", "stop_sell"])
+def test_replanned_sell_failure_uses_operational_parent_but_new_authority_scope(
+    tmp_path,
+    intent: str,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+    )
+    observed_at = datetime(2026, 6, 12, tzinfo=UTC)
+    suffix = intent.replace("_", "-")
+    operational_plan = ExecutionPlan(
+        id=f"replanned-{suffix}-operational-plan",
+        external_plan_id=f"replanned-{suffix}-old-external",
+        source="kai-trading-core",
+        market_date=date(2026, 6, 11),
+        strategy_run_id=f"replanned-{suffix}-old-run",
+        mode="paper",
+        status="accepted",
+    )
+    item = ExecutionPlanItem(
+        id=f"replanned-{suffix}-item",
+        plan=operational_plan,
+        execution_plan_id=operational_plan.id,
+        plan_item_index=0,
+        symbol="005930",
+        side="sell",
+        intent=intent,
+        status="failed",
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 1,
+            "linked_entry_item_key": "durable-original-entry",
+        },
+        risk_context={
+            "sell_monitor_authority_v1": {
+                "schema_version": "sell-monitor-authority-v2",
+                "execution_plan_id": f"replanned-{suffix}-authority-plan",
+                "external_plan_id": f"replanned-{suffix}-authority-external",
+                "plan_source": "kai-trading-core",
+                "strategy_run_id": f"replanned-{suffix}-authority-run",
+                "target_market_date": "2026-06-12",
+            }
+        },
+        decision_agent_name="signal-decider",
+        decision_snapshot_id=f"replanned-{suffix}-authority-snapshot",
+        decision_run_id=f"replanned-{suffix}-authority-run",
+        source_plan_item_id=f"replanned-{suffix}-exit",
+        source_market_date=date(2026, 6, 11),
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+    )
+    lineage = decision_lineage_for_plan_item(item)
+    assert lineage is not None
+    assert lineage["status"] == "complete"
+    assert lineage["execution_plan_id"] != operational_plan.id
+    assert lineage["operational_execution_plan_id"] == operational_plan.id
+    assert lineage["strategy_run_id"] != operational_plan.strategy_run_id
+    order = BrokerOrder(
+        id=f"replanned-{suffix}-order",
+        plan_item=item,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=f"replanned-{suffix}-order",
+        broker_order_id=f"replanned-{suffix}-order",
+        symbol=item.symbol,
+        side=item.side,
+        status="rejected",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            **_strategy_entry_family_request_metadata(item),
+            "decision_lineage": lineage,
+            "exchange": "KRX",
+            "broker_account_scope": {
+                "policy_version": 1,
+                "scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+            },
+        },
+    )
+    session.add(
+        ExecutionFailure(
+            id=f"replanned-{suffix}-failure",
+            mode="paper",
+            broker_order=order,
+            execution_plan_id=operational_plan.id,
+            execution_plan_item_id=item.id,
+            strategy_run_id=operational_plan.strategy_run_id,
+            decision_actor="signal-decider",
+            broker_name="kis",
+            idempotency_key=order.idempotency_key,
+            symbol=order.symbol,
+            side=order.side,
+            intent=intent,
+            requested_quantity=1,
+            classification="broker_rejected",
+            broker_error_message="redacted replanned rejection",
+            retryable=False,
+            status="open",
+            first_failed_at=observed_at,
+            latest_failed_at=observed_at,
+        )
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=observed_at + timedelta(minutes=1),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+
+    failure_scope = report["operational_learning_context"]["failure_items"][0][
+        "strategy_scope"
+    ]
+    assert failure_scope["status"] == "exact"
+    assert failure_scope["consumer_eligible"] is True
+    assert failure_scope["decision_lane"] == "signal-decider"
+    assert failure_scope["entry_family_key"] == (
+        "source:durable-original-entry"
+    )
+    assert report["operational_learning_by_lane"]["signal-decider"][
+        "consumer_eligible"
+    ] is True
+
+    session.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "decision_lane",
+    ["signal-decider", "short-term-decider"],
+)
+def test_exact_durable_failure_lineage_is_partitioned_by_decision_lane(
+    tmp_path,
+    decision_lane: str,
+) -> None:
+    engine, session = _session()
+    settings = Settings(
+        runtime_mode="paper",
+        trade_outcome_feedback_dir=str(tmp_path),
+    )
+    observed_at = datetime(2026, 6, 12, tzinfo=UTC)
+    suffix = "signal" if decision_lane == "signal-decider" else "short"
+    plan = ExecutionPlan(
+        id=f"operational-{suffix}-plan",
+        external_plan_id=f"operational-{suffix}-external",
+        source="kai-trading-core",
+        market_date=date(2026, 6, 12),
+        strategy_run_id=f"operational-{suffix}-run",
+        mode="paper",
+        status="accepted",
+    )
+    item = ExecutionPlanItem(
+        id=f"operational-{suffix}-item",
+        plan=plan,
+        execution_plan_id=plan.id,
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="failed",
+        quantity_policy={"kind": "shares", "quantity": 1},
+        decision_agent_name=decision_lane,
+        decision_snapshot_id=f"operational-{suffix}-snapshot",
+        decision_run_id=plan.strategy_run_id,
+        source_plan_item_id=f"operational-{suffix}-entry",
+        source_market_date=date(2026, 6, 11),
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+    )
+    lineage = decision_lineage_for_plan_item(item)
+    assert lineage is not None
+    assert lineage["status"] == "complete"
+    order = BrokerOrder(
+        id=f"operational-{suffix}-order",
+        plan_item=item,
+        broker_name="kis",
+        mode="paper",
+        idempotency_key=f"operational-{suffix}-order",
+        broker_order_id=f"operational-{suffix}-order",
+        symbol=item.symbol,
+        side=item.side,
+        status="rejected",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+        request_metadata={
+            **_strategy_entry_family_request_metadata(item),
+            "decision_lineage": lineage,
+            "provider": "kis",
+            "venue": "KRX",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "broker_account_scope": {
+                "policy_version": 1,
+                "scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+            },
+        },
+    )
+    session.add(
+        ExecutionFailure(
+            id=f"operational-{suffix}-failure",
+            mode="paper",
+            broker_order=order,
+            execution_plan_id=plan.id,
+            execution_plan_item_id=item.id,
+            strategy_run_id=plan.strategy_run_id,
+            decision_actor=decision_lane,
+            broker_name="kis",
+            idempotency_key=order.idempotency_key,
+            symbol=order.symbol,
+            side=order.side,
+            intent=item.intent,
+            requested_quantity=1,
+            classification="broker_rejected",
+            broker_error_message="redacted test rejection",
+            retryable=False,
+            status="open",
+            first_failed_at=observed_at,
+            latest_failed_at=observed_at,
+        )
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings,
+        db=session,
+        as_of=observed_at + timedelta(minutes=1),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+    loaded = load_latest_trade_outcome_feedback_snippet(
+        settings,
+        now=observed_at + timedelta(minutes=1),
+        provider="kis",
+        account_scope=FEEDBACK_TEST_ACCOUNT_SCOPE,
+        exchange="KRX",
+    )
+
+    aggregate = report["operational_learning_context"]
+    assert aggregate["status"] == "ready"
+    assert aggregate["consumer_eligible"] is False
+    assert aggregate["execution_authority"] is False
+    failure_scope = aggregate["failure_items"][0]["strategy_scope"]
+    assert failure_scope == {
+        "schema_version": "strategy-feedback-scope-v1",
+        "status": "exact",
+        "consumer_eligible": True,
+        "decision_lane": decision_lane,
+        "entry_family_key": f"source:operational-{suffix}-entry",
+        "evidence_status": "exact_durable_failure_lineage",
+    }
+    assert set(report["operational_learning_by_lane"]) == {decision_lane}
+    lane_learning = report["operational_learning_by_lane"][decision_lane]
+    assert lane_learning["schema_version"] == (
+        "strategy-lane-operational-learning-v1"
+    )
+    assert lane_learning["status"] == "ready"
+    assert lane_learning["consumer_eligible"] is True
+    assert lane_learning["execution_authority"] is True
+    assert lane_learning["execution_account_scope"] == {
+        "provider": "kis",
+        "account_scope": FEEDBACK_TEST_ACCOUNT_SCOPE,
+        "exchange": "KRX",
+    }
+    assert lane_learning["entry_family_keys"] == [
+        f"source:operational-{suffix}-entry"
+    ]
+    assert loaded["status"] == "blocked"
+    assert loaded["operational_learning_by_lane"][decision_lane][
+        "consumer_eligible"
+    ] is True
 
     session.close()
     engine.dispose()

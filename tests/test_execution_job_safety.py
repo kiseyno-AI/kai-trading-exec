@@ -130,6 +130,7 @@ def _next_open_app(tmp_path, *, plan_id: str):
                     "symbol": "005930",
                     "side": "buy",
                     "intent": "next_open_buy",
+                    "decision_agent_name": "signal-decider",
                     "quantity_policy": {"kind": "shares", "quantity": 2},
                     "limit_price": "71000.00",
                     "time_in_force": "day",

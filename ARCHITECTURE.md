@@ -122,6 +122,16 @@ KIS authentication survives process restarts without leaking into
 for runtime state and are intentionally separate from strategy/read ownership in
 `kai-trading-core`.
 
+Entry ownership is lane- and family-specific. Signal-decider and short-term
+entries may coexist for the same broker route and symbol, while another active
+entry in the same normalized decision lane is blocked as a duplicate. Cash,
+account risk, open-buy reservations, and symbol exposure remain aggregate across
+lanes. Target, stop, and max-holding exits are capped to canonical fills
+remaining in their exact entry family; missing, ambiguous, or unreconciled
+lineage fails closed instead of borrowing another family's position. Signal
+entries have no implicit time exit, while short-term entries are capped at three
+inclusive holding sessions (the fill session is session one).
+
 ### Core-owned truth
 - signal-decider decisions
 - factor/screening data

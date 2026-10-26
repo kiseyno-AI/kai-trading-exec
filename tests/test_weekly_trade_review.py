@@ -808,6 +808,80 @@ def test_weekly_fifo_never_pairs_same_symbol_across_execution_routes() -> None:
     engine.dispose()
 
 
+def test_weekly_fifo_matches_kis_domestic_buy_and_sell_across_execution_routes() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 9, 1, tzinfo=UTC)
+    end_at = datetime(2026, 9, 8, tzinfo=UTC)
+    buy = BrokerOrder(
+        id="weekly-domestic-nxt-buy",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="weekly-domestic-nxt-buy",
+        symbol="005930",
+        side="buy",
+        status="filled",
+        quantity=1,
+        venue="NXT",
+        asset_class="stock",
+    )
+    sell = BrokerOrder(
+        id="weekly-domestic-krx-sell",
+        broker_name="kis",
+        mode="paper",
+        idempotency_key="weekly-domestic-krx-sell",
+        symbol="005930",
+        side="sell",
+        status="filled",
+        quantity=1,
+        venue="KRX",
+        asset_class="stock",
+    )
+    _scope_orders(buy, sell)
+    db.add_all(
+        [
+            buy,
+            sell,
+            ExecutionFill(
+                id="weekly-domestic-nxt-buy-fill",
+                broker_order=buy,
+                symbol="005930",
+                side="buy",
+                quantity=1,
+                price=Decimal("100"),
+                filled_at=start_at + timedelta(hours=1),
+            ),
+            ExecutionFill(
+                id="weekly-domestic-krx-sell-fill",
+                broker_order=sell,
+                symbol="005930",
+                side="sell",
+                quantity=1,
+                price=Decimal("110"),
+                filled_at=start_at + timedelta(hours=2),
+            ),
+        ]
+    )
+    db.commit()
+
+    rows, truncated = _weekly_closed_trades(
+        db=db,
+        settings=settings,
+        mode="paper",
+        start_at=start_at,
+        end_at=end_at,
+        max_rows=20,
+    )
+
+    assert truncated is False
+    assert len(rows) == 1
+    assert rows[0]["cost_basis_source"] == "fill_fifo"
+    assert rows[0]["realized_pnl"] == Decimal("10.0000")
+    assert rows[0]["execution_scope"]["exchange"] == "KRX"
+    db.close()
+    engine.dispose()
+
+
 def test_weekly_fifo_starts_clean_generation_after_exact_route_verified_flat() -> None:
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
     engine, db = _build_db(settings)
@@ -1212,7 +1286,10 @@ def test_weekly_trade_review_exports_bounded_read_only_artifact(tmp_path) -> Non
     assert "broker_orders.request_metadata" in selected_sql
     assert "response_metadata" not in selected_sql
     assert "raw_context" not in selected_sql
-    assert "risk_context" not in selected_sql
+    assert "execution_plan_items.risk_context" in selected_sql
+    assert "execution_plan_items.execution_plan_id" in selected_sql
+    assert "execution_plan_items.symbol" in selected_sql
+    assert "execution_plans.raw_payload" not in selected_sql
 
     artifact_path = tmp_path / "2026-07-25_to_2026-08-01_weekly_trade_review.json"
     latest_path = tmp_path / "latest.json"
@@ -1921,6 +1998,300 @@ def test_weekly_trade_review_realized_summary_dedupes_duplicate_broker_sell_fill
     assert report["realized_pnl_summary"]["loss_count"] == 0
     assert report["realized_pnl_summary"]["realized_pnl"] == "50.0000"
     assert report["realized_pnl_summary"]["best_trade"]["sell_fill_id"] == "dedupe-broker-sell-fill-a"
+
+
+def test_weekly_learning_blocks_mixed_valid_and_conflicting_duplicate_fills(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        weekly_trade_review_dir=str(tmp_path),
+    )
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 7, 25, tzinfo=UTC)
+    end_at = datetime(2026, 8, 1, tzinfo=UTC)
+    old_conflict_at = start_at - timedelta(days=10)
+    spanning_boundary_at = start_at - timedelta(days=5)
+    orders = [
+        BrokerOrder(
+            id=f"duplicate-quality-{trade}-{side}-order",
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=f"duplicate-quality-{trade}-{side}-order",
+            symbol=trade.upper(),
+            venue="KRX",
+            side=side,
+            status="filled",
+            quantity=1,
+            submitted_at=start_at + timedelta(hours=index),
+        )
+        for index, (trade, side) in enumerate(
+            (
+                ("valid", "buy"),
+                ("valid", "sell"),
+                ("conflict", "buy"),
+                ("conflict", "sell"),
+            ),
+            start=1,
+        )
+    ]
+    db.add_all(orders)
+    db.flush()
+    _scope_orders(*orders)
+    db.add_all(
+        [
+            ExecutionFill(
+                broker_order_pk="duplicate-quality-valid-buy-order",
+                broker_fill_id="duplicate-quality-valid-buy-fill",
+                symbol="VALID",
+                side="buy",
+                quantity=1,
+                price=Decimal("100"),
+                filled_at=start_at + timedelta(hours=1),
+            ),
+            ExecutionFill(
+                broker_order_pk="duplicate-quality-valid-sell-order",
+                broker_fill_id="duplicate-quality-valid-sell-fill",
+                symbol="VALID",
+                side="sell",
+                quantity=1,
+                price=Decimal("110"),
+                filled_at=start_at + timedelta(hours=2),
+            ),
+            ExecutionFill(
+                broker_order_pk="duplicate-quality-conflict-buy-order",
+                broker_fill_id="duplicate-quality-conflict-buy-fill",
+                symbol="CONFLICT",
+                side="buy",
+                quantity=1,
+                price=Decimal("100"),
+                filled_at=start_at + timedelta(hours=3),
+            ),
+            ExecutionFill(
+                broker_order_pk="duplicate-quality-conflict-sell-order",
+                broker_fill_id="duplicate-quality-conflict-sell-fill",
+                symbol="CONFLICT",
+                side="sell",
+                quantity=1,
+                price=Decimal("90"),
+                filled_at=start_at + timedelta(hours=4),
+            ),
+            ExecutionFill(
+                broker_order_pk="duplicate-quality-conflict-sell-order",
+                broker_fill_id="duplicate-quality-conflict-sell-fill",
+                symbol="CONFLICT",
+                side="sell",
+                quantity=1,
+                price=Decimal("91"),
+                filled_at=start_at + timedelta(hours=4),
+            ),
+            FifoInventoryIsolation(
+                mode="paper",
+                provider="kis",
+                account_scope=WEEKLY_TEST_ACCOUNT_SCOPE,
+                venue="KRX",
+                asset_class="stock",
+                exchange="KRX",
+                symbol="CONFLICT",
+                residual_quantity=Decimal("0"),
+                last_local_fill_at=old_conflict_at,
+                broker_position_id="weekly-conflict-later-flat",
+                broker_position_quantity=Decimal("0"),
+                broker_reconciled_at=spanning_boundary_at,
+                isolated_through_at=spanning_boundary_at,
+                evidence_source="broker_flat_reconciliation",
+                actor="test",
+                reason="later flat cannot rewrite in-period learning evidence",
+            ),
+        ]
+    )
+    db.flush()
+    pre_boundary_conflicting_fill = db.scalar(
+        select(ExecutionFill).where(
+            ExecutionFill.broker_order_pk
+            == "duplicate-quality-conflict-sell-order",
+            ExecutionFill.broker_fill_id
+            == "duplicate-quality-conflict-sell-fill",
+            ExecutionFill.price == Decimal("90"),
+        )
+    )
+    assert pre_boundary_conflicting_fill is not None
+    pre_boundary_conflicting_fill.filled_at = old_conflict_at
+    db.commit()
+
+    try:
+        report = generate_weekly_trade_review(
+            settings=settings,
+            db=db,
+            start_at=start_at,
+            end_at=end_at,
+            max_fills=20,
+        )
+    finally:
+        db.close()
+        engine.dispose()
+
+    assert report["counts"]["closed_trade_count"] == 1
+    performance = report["learning_evidence"]["performance_feedback"]
+    assert performance["consumer_eligible"] is False
+    assert "duplicate_fill_economic_conflict" in performance["blocked_reasons"]
+    strategy = report["learning_evidence"]["strategy_performance_feedback"]
+    assert strategy["consumer_eligible"] is False
+    assert "duplicate_fill_economic_conflict" in strategy["blocked_reasons"]
+    assert any(
+        alert.get("kind") == "duplicate_fill_economic_conflict"
+        for alert in report["stale_fifo_inventory_alerts"]
+    )
+
+
+def test_weekly_learning_ignores_preperiod_conflict_after_domestic_flat(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        weekly_trade_review_dir=str(tmp_path),
+    )
+    engine, db = _build_db(settings)
+    start_at = datetime(2026, 7, 25, tzinfo=UTC)
+    end_at = datetime(2026, 8, 1, tzinfo=UTC)
+    old_at = datetime(2026, 7, 1, tzinfo=UTC)
+    boundary_at = datetime(2026, 7, 5, tzinfo=UTC)
+
+    def order(*, row_id: str, symbol: str, side: str, exchange: str) -> BrokerOrder:
+        row = BrokerOrder(
+            id=row_id,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key=row_id,
+            symbol=symbol,
+            venue=exchange,
+            asset_class="stock",
+            side=side,
+            status="filled",
+            quantity=1,
+        )
+        _scope_orders(row)
+        return row
+
+    old_buy = order(
+        row_id="weekly-old-conflict-nxt-buy",
+        symbol="OLD-CONFLICT",
+        side="buy",
+        exchange="NXT",
+    )
+    old_sell = order(
+        row_id="weekly-old-conflict-nxt-sell",
+        symbol="OLD-CONFLICT",
+        side="sell",
+        exchange="NXT",
+    )
+    clean_buy = order(
+        row_id="weekly-clean-generation-buy",
+        symbol="CLEAN",
+        side="buy",
+        exchange="KRX",
+    )
+    clean_sell = order(
+        row_id="weekly-clean-generation-sell",
+        symbol="CLEAN",
+        side="sell",
+        exchange="KRX",
+    )
+    db.add_all([old_buy, old_sell, clean_buy, clean_sell])
+    db.flush()
+    db.add_all(
+        [
+            ExecutionFill(
+                id="weekly-old-conflict-buy-fill",
+                broker_order=old_buy,
+                broker_fill_id="weekly-old-conflict-buy-fill",
+                symbol="OLD-CONFLICT",
+                side="buy",
+                quantity=1,
+                price=Decimal("50"),
+                filled_at=old_at,
+            ),
+            ExecutionFill(
+                id="weekly-old-conflict-sell-fill-a",
+                broker_order=old_sell,
+                broker_fill_id="weekly-old-conflict-sell-fill",
+                symbol="OLD-CONFLICT",
+                side="sell",
+                quantity=1,
+                price=Decimal("60"),
+                filled_at=old_at + timedelta(hours=1),
+            ),
+            ExecutionFill(
+                id="weekly-old-conflict-sell-fill-b",
+                broker_order=old_sell,
+                broker_fill_id="weekly-old-conflict-sell-fill",
+                symbol="OLD-CONFLICT",
+                side="sell",
+                quantity=1,
+                price=Decimal("61"),
+                filled_at=old_at + timedelta(hours=1),
+            ),
+            ExecutionFill(
+                id="weekly-clean-generation-buy-fill",
+                broker_order=clean_buy,
+                broker_fill_id="weekly-clean-generation-buy-fill",
+                symbol="CLEAN",
+                side="buy",
+                quantity=1,
+                price=Decimal("100"),
+                filled_at=start_at + timedelta(hours=1),
+            ),
+            ExecutionFill(
+                id="weekly-clean-generation-sell-fill",
+                broker_order=clean_sell,
+                broker_fill_id="weekly-clean-generation-sell-fill",
+                symbol="CLEAN",
+                side="sell",
+                quantity=1,
+                price=Decimal("110"),
+                filled_at=start_at + timedelta(hours=2),
+            ),
+            FifoInventoryIsolation(
+                mode="paper",
+                provider="kis",
+                account_scope=WEEKLY_TEST_ACCOUNT_SCOPE,
+                venue="KRX",
+                asset_class="stock",
+                exchange="KRX",
+                symbol="OLD-CONFLICT",
+                residual_quantity=Decimal("0"),
+                last_local_fill_at=old_at + timedelta(hours=1),
+                broker_position_id="weekly-old-conflict-flat",
+                broker_position_quantity=Decimal("0"),
+                broker_reconciled_at=boundary_at,
+                isolated_through_at=boundary_at,
+                evidence_source="broker_flat_reconciliation",
+                actor="test",
+                reason="verified domestic flat boundary",
+            ),
+        ]
+    )
+    db.commit()
+
+    report = generate_weekly_trade_review(
+        settings=settings,
+        db=db,
+        start_at=start_at,
+        end_at=end_at,
+        max_fills=20,
+    )
+
+    assert report["counts"]["closed_trade_count"] == 1
+    performance = report["learning_evidence"]["performance_feedback"]
+    assert "duplicate_fill_economic_conflict" not in performance["blocked_reasons"]
+    assert not any(
+        alert.get("kind") == "duplicate_fill_economic_conflict"
+        for alert in report["stale_fifo_inventory_alerts"]
+    )
+    db.close()
+    engine.dispose()
 
 
 def test_weekly_trade_review_realized_summary_dedupes_fallback_sell_fill_identity(tmp_path) -> None:

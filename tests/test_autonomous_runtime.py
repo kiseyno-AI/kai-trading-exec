@@ -20,7 +20,13 @@ from app.api.schemas.execution import MonitoringPriceRequest
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPosition
+from app.models.runtime import (
+    BrokerOrder,
+    ExecutionFill,
+    ExecutionPlan,
+    ExecutionPlanItem,
+    ExecutionPosition,
+)
 from app.services.autonomous_runtime import (
     AutonomousRuntimeCoordinator,
     CachedMonitoringItem,
@@ -30,6 +36,7 @@ from app.services.autonomous_runtime import (
     _session_active_monitoring_symbols,
     _select_monitoring_symbol_batch,
 )
+from app.services import broker_orders as broker_orders_service
 from app.services.monitoring import list_autonomous_monitoring_symbols
 from app.services.position_identity import (
     build_position_identity,
@@ -3832,6 +3839,25 @@ def test_cached_cycle_tightens_day_two_stop_on_price_crossing_inside_snapshot_tt
 
     try:
         with session_factory() as session:
+            entry_item = ExecutionPlanItem(
+                id="cached-cycle-stop-tightening-entry",
+                plan_item_index=0,
+                symbol="005930",
+                side="buy",
+                intent="intraday_watch_buy",
+                status="broker_order_submitted",
+                quantity_policy=quantity_policy,
+                trigger_price=Decimal("100.0000"),
+                limit_price=Decimal("100.0000"),
+                time_in_force="day",
+                risk_context=risk_context,
+                source_plan_item_id="cached-cycle-stop-tightening-entry",
+                source_market_date=date(2026, 9, 14),
+                provider=identity.provider,
+                venue="KRX",
+                asset_class="stock",
+                decision_agent_name="short-term-decider",
+            )
             plan = ExecutionPlan(
                 id="cached-cycle-stop-tightening-plan",
                 external_plan_id="cached-cycle-stop-tightening-plan",
@@ -3840,28 +3866,14 @@ def test_cached_cycle_tightens_day_two_stop_on_price_crossing_inside_snapshot_tt
                 mode=settings.runtime_mode,
                 status="accepted",
                 accepted_at=started_at - timedelta(days=1),
-                items=[
-                    ExecutionPlanItem(
-                        id="cached-cycle-stop-tightening-entry",
-                        plan_item_index=0,
-                        symbol="005930",
-                        side="buy",
-                        intent="intraday_watch_buy",
-                        status="broker_order_submitted",
-                        quantity_policy=quantity_policy,
-                        trigger_price=Decimal("100.0000"),
-                        limit_price=Decimal("100.0000"),
-                        time_in_force="day",
-                        risk_context=risk_context,
-                        source_plan_item_id="cached-cycle-stop-tightening-entry",
-                        source_market_date=date(2026, 9, 14),
-                        provider=identity.provider,
-                        venue="KRX",
-                        asset_class="stock",
-                    )
-                ],
+                items=[entry_item],
             )
             session.add(plan)
+            session.flush()
+            family_identity = (
+                broker_orders_service._strategy_entry_family_identity(entry_item)
+            )
+            assert family_identity is not None
             session.add(
                 ExecutionPosition(
                     mode=settings.runtime_mode,
@@ -3874,31 +3886,59 @@ def test_cached_cycle_tightens_day_two_stop_on_price_crossing_inside_snapshot_tt
                     updated_from="reconciliation",
                 )
             )
+            entry_order = BrokerOrder(
+                execution_plan_item_id="cached-cycle-stop-tightening-entry",
+                broker_name=identity.provider,
+                mode=settings.runtime_mode,
+                idempotency_key="cached-cycle-stop-tightening-entry-order",
+                broker_order_id="cached-cycle-stop-tightening-entry-order",
+                symbol="005930",
+                side="buy",
+                status="filled",
+                quantity=1,
+                venue="KRX",
+                asset_class="stock",
+                limit_price=Decimal("100.0000"),
+                submitted_at=started_at - timedelta(days=1),
+                request_metadata={
+                    "source": "test-family-fixture",
+                    "exchange": "KRX",
+                    "execution_scope": {
+                        "policy_version": 1,
+                        "provider": identity.provider,
+                        "account_scope": identity.account_scope,
+                        "venue": "KRX",
+                        "asset_class": "stock",
+                        "exchange": identity.exchange,
+                    },
+                    "metadata": {
+                        broker_orders_service.STRATEGY_ENTRY_FAMILY_METADATA_KEY: (
+                            family_identity
+                        ),
+                    },
+                    "original_command": {
+                        "metadata": {
+                            broker_orders_service.STRATEGY_ENTRY_FAMILY_METADATA_KEY: (
+                                family_identity
+                            ),
+                        },
+                    },
+                },
+            )
+            session.add(entry_order)
+            session.flush()
             session.add(
-                BrokerOrder(
-                    execution_plan_item_id="cached-cycle-stop-tightening-entry",
-                    broker_name=identity.provider,
-                    mode=settings.runtime_mode,
-                    idempotency_key="cached-cycle-stop-tightening-entry-order",
-                    broker_order_id="cached-cycle-stop-tightening-entry-order",
+                ExecutionFill(
+                    broker_order_pk=entry_order.id,
+                    broker_fill_id="cached-cycle-stop-tightening-fill",
                     symbol="005930",
                     side="buy",
-                    status="filled",
                     quantity=1,
-                    venue="KRX",
-                    asset_class="stock",
-                    limit_price=Decimal("100.0000"),
-                    submitted_at=started_at - timedelta(days=1),
-                    request_metadata={
-                        "exchange": "KRX",
-                        "execution_scope": {
-                            "policy_version": 1,
-                            "provider": identity.provider,
-                            "account_scope": identity.account_scope,
-                            "venue": "KRX",
-                            "asset_class": "stock",
-                            "exchange": identity.exchange,
-                        },
+                    price=Decimal("100.0000"),
+                    filled_at=started_at - timedelta(days=1),
+                    payload={
+                        "fill_time_precision": "exact",
+                        "fill_time_source": "test_fixture",
                     },
                 )
             )

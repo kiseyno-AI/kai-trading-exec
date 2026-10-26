@@ -20,7 +20,10 @@ from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
 from app.services.execution_account_route import classify_kis_account_route
 from app.services.fifo_inventory import fifo_route_scope_from_order
 from app.services.json_compaction import compact_json_object
-from app.services.plan_item_identity import select_plan_item_family_members
+from app.services.plan_item_identity import (
+    plan_item_inventory_scope_key,
+    select_plan_item_family_members,
+)
 from app.services.position_identity import build_position_identity
 
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
@@ -436,18 +439,35 @@ def _target_stop_context(
         and sibling.side == "sell"
         and sibling.intent in {"target_sell", "stop_sell"}
     ]
-    target_items = select_plan_item_family_members(
-        anchor=item,
-        candidates=[
-            sibling for sibling in sibling_items if sibling.intent == "target_sell"
-        ],
-    )
-    stop_items = select_plan_item_family_members(
-        anchor=item,
-        candidates=[
-            sibling for sibling in sibling_items if sibling.intent == "stop_sell"
-        ],
-    )
+    entry_route = plan_item_inventory_scope_key(item)
+    if entry_route is None:
+        target_items: list[ExecutionPlanItem] = []
+        stop_items: list[ExecutionPlanItem] = []
+    else:
+        target_items = [
+            sibling
+            for sibling in select_plan_item_family_members(
+                anchor=item,
+                candidates=[
+                    sibling
+                    for sibling in sibling_items
+                    if sibling.intent == "target_sell"
+                ],
+            )
+            if plan_item_inventory_scope_key(sibling) == entry_route
+        ]
+        stop_items = [
+            sibling
+            for sibling in select_plan_item_family_members(
+                anchor=item,
+                candidates=[
+                    sibling
+                    for sibling in sibling_items
+                    if sibling.intent == "stop_sell"
+                ],
+            )
+            if plan_item_inventory_scope_key(sibling) == entry_route
+        ]
     return TargetStopContext(
         target_price=_first_decimal_from_item(item, TARGET_PRICE_KEYS),
         stop_price=_first_decimal_from_item(item, STOP_PRICE_KEYS),

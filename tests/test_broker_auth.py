@@ -17,7 +17,11 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.api.schemas.execution import MonitoringPriceRequest, PlaceOrderRequest
+from app.api.schemas.execution import (
+    MonitoringPriceRequest,
+    PlaceOrderRequest,
+    ShortTermWatcherDecisionRequest,
+)
 from app.broker import alpaca as alpaca_module
 from app.broker import kis as kis_module
 from app.broker.base import (
@@ -74,6 +78,8 @@ from app.services import monitoring as monitoring_service
 from app.services import order_intent_serialization as order_intent_serialization_service
 from app.services import plan_judgment_actions
 from app.services import runtime as runtime_service
+from app.services import short_term_watcher as short_term_watcher_service
+from app.services import trigger_time_exec_agent as trigger_time_exec_agent_service
 from app.services.account_drawdown_recovery import recovery_idempotency_key
 from app.services.execution_account_route import (
     KIS_ACCOUNT_ROUTE_FINGERPRINT_LENGTH,
@@ -1898,6 +1904,8 @@ def test_restart_reuses_persisted_broker_session_for_due_job_dispatch(tmp_path) 
                     "quantity_policy": {"kind": "shares", "quantity": 5},
                     "limit_price": "71000.00",
                     "time_in_force": "day",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": "restart-dispatch-session-buy",
                 }
             ],
         },
@@ -2023,6 +2031,8 @@ def test_restart_recovers_stale_running_dispatch_job_after_interrupted_outage(
                     "quantity_policy": {"kind": "shares", "quantity": 5},
                     "limit_price": "71000.00",
                     "time_in_force": "day",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": "restart-recover-running-buy",
                 }
             ],
         },
@@ -2178,6 +2188,13 @@ def test_restart_preserves_reconciliation_positions_for_monitoring_evaluation(
             )
         )
         session.commit()
+
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[plan_item_id],
+        quantity=10,
+        entry_price=Decimal("120000"),
+    )
 
     client.close()
     engine.dispose()
@@ -2906,7 +2923,16 @@ def test_retryable_auth_failure_keeps_protective_stop_rearmable() -> None:
         )
         session.commit()
 
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[item_id],
+        quantity=1,
+        entry_price=Decimal("71000"),
+    )
+
     with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
         command = PlaceOrderRequest(
             idempotency_key=f"monitoring:stop_sell:{item_id}",
             execution_plan_item_id=item_id,
@@ -2920,7 +2946,12 @@ def test_retryable_auth_failure_keeps_protective_stop_rearmable() -> None:
             limit_price=Decimal("71000"),
             time_in_force="day",
             exchange="KRX",
-            metadata={"deterministic_sell_quantity_cap": 1},
+            metadata={
+                "deterministic_sell_quantity_cap": 1,
+                broker_orders_service.STRATEGY_ENTRY_FAMILY_METADATA_KEY: (
+                    broker_orders_service._strategy_entry_family_identity(item)
+                ),
+            },
         )
         result = broker_orders_service.place_broker_order(
             settings=settings,
@@ -3063,6 +3094,16 @@ def test_runtime_safety_fenced_monitoring_sell_rebinds_fresh_command_authority(
             )
         )
         session.flush()
+        session.commit()
+        _seed_exact_strategy_family_for_sell_items(
+            app,
+            sell_item_ids=[item_id],
+            quantity=5,
+            entry_price=Decimal("100"),
+        )
+        session.expire_all()
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
         stale_command = PlaceOrderRequest(
             idempotency_key=f"monitoring:{intent}:{item_id}",
             execution_plan_item_id=item_id,
@@ -5205,6 +5246,24 @@ def test_plan_linked_sell_cannot_overwrite_concurrent_core_revocation(
         order_placement=build_order_placement(
             broker_order_id="must-not-submit-after-core-revocation"
         ),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("1000000"),
+            buying_power=Decimal("1000000"),
+            observed_at=datetime.now(UTC),
+            source="stub:sell-revocation-race",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=2,
+                    sellable_quantity=2,
+                    average_price=Decimal("80000"),
+                )
+            ],
+            holdings_complete=True,
+            open_orders_complete=True,
+            total_asset_value=Decimal("10000000"),
+            previous_total_asset_value=Decimal("10000000"),
+        ),
     )
     app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
     client = TestClient(app)
@@ -5246,6 +5305,19 @@ def test_plan_linked_sell_cannot_overwrite_concurrent_core_revocation(
         )
         session.commit()
 
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[item_id],
+        quantity=2,
+        entry_price=Decimal("80000"),
+    )
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        strategy_family_identity = (
+            broker_orders_service._strategy_entry_family_identity(item)
+        )
+
     command = PlaceOrderRequest(
         idempotency_key=f"monitoring:protective_sell:{item_id}",
         execution_plan_item_id=item_id,
@@ -5259,7 +5331,12 @@ def test_plan_linked_sell_cannot_overwrite_concurrent_core_revocation(
         limit_price=Decimal("70000"),
         time_in_force="day",
         exchange="KRX",
-        metadata={"deterministic_sell_quantity_cap": 2},
+        metadata={
+            "deterministic_sell_quantity_cap": 2,
+            broker_orders_service.STRATEGY_ENTRY_FAMILY_METADATA_KEY: (
+                strategy_family_identity
+            ),
+        },
     )
     result: dict[str, object] = {}
     errors: list[BaseException] = []
@@ -5639,6 +5716,8 @@ def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
                     "quantity_policy": {"kind": "shares", "quantity": 2},
                     "limit_price": "71000.00",
                     "time_in_force": "day",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": "pending-intent-hourly-recovery-buy",
                 }
             ],
         },
@@ -7697,6 +7776,8 @@ def test_dispatch_due_next_open_buy_job_places_broker_order() -> None:
                     "quantity_policy": {"kind": "shares", "quantity": 5},
                     "limit_price": "71000.00",
                     "time_in_force": "day",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": "next-open-duplicate-retry-buy",
                 }
             ],
         },
@@ -7811,6 +7892,8 @@ def test_dispatch_due_next_open_buy_job_keeps_retrying_duplicate_retryable_order
                     "quantity_policy": {"kind": "shares", "quantity": 5},
                     "limit_price": "71000.00",
                     "time_in_force": "day",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": "next-open-duplicate-retry-buy",
                 }
             ],
         },
@@ -7925,6 +8008,8 @@ def test_next_open_drawdown_recovery_uses_new_generation_after_confirmed_health(
                     "quantity_policy": {"kind": "shares", "quantity": 2},
                     "limit_price": "71000.00",
                     "time_in_force": "day",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": "next-open-drawdown-recovery-buy",
                 }
             ],
         },
@@ -8243,6 +8328,8 @@ def test_dispatch_due_next_open_buy_job_recovers_stale_running_job() -> None:
                     "quantity_policy": {"kind": "shares", "quantity": 5},
                     "limit_price": "71000.00",
                     "time_in_force": "day",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": "dispatch-recover-running-buy",
                 }
             ],
         },
@@ -8363,12 +8450,15 @@ def test_execution_plan_items_preserve_cross_decider_identity_without_symbol_dat
 
     short_term_item = items_by_source["core-short-term-item-1"]
     assert short_term_item["symbol"] == "005930"
-    assert short_term_item["status"] == "target_sell_monitoring"
+    assert short_term_item["status"] == "manual_review_required"
     assert short_term_item["decision_agent_name"] == "short-term-decider"
     assert short_term_item["agent_name"] == "short-term-decider"
     assert short_term_item["decision_snapshot_id"] == "short-term-snapshot-1"
     assert short_term_item["decision_run_id"] == "short-term-decision-run-1"
     assert short_term_item["source_market_date"] == "2024-01-03"
+    inexact_event = short_term_item["risk_context"]["last_monitoring_event"]
+    assert inexact_event["event"] == "replanned_sell_monitor_identity_inexact"
+    assert inexact_event["reason"] == "entry_family_unavailable"
 
     symbol_detail_payload = client.get("/symbols/005930").json()
     source_identity_by_item = {
@@ -8495,6 +8585,7 @@ def test_next_open_watch_handoff_normalizes_fixed_quantity_and_sibling_exits() -
         settings=Settings(
             database_url="sqlite:///:memory:",
             runtime_mode="paper",
+            execution_position_account_scope="next-open-handoff-exact-route",
         ),
     )
     client = TestClient(app)
@@ -8877,6 +8968,8 @@ def _build_blocked_next_open_recovery_scenario(
                     "quantity_policy": {"kind": "shares", "quantity": 2},
                     "limit_price": "71000.00",
                     "time_in_force": "day",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": "next-open-drawdown-edge-buy",
                 }
             ],
         },
@@ -10155,15 +10248,50 @@ def test_watch_buy_clamps_budget_excess_to_max_safe_quantity() -> None:
 
 
 def test_nonretryable_target_rejection_suppresses_only_equivalent_target_recreation() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        execution_position_account_scope="target-suppression-exact-route",
+    )
     plan = ExecutionPlan(external_plan_id="target-suppression-plan", source="test", mode="paper")
+    entry_risk, entry_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": 2},
+    )
     entry = ExecutionPlanItem(
+        id="target-suppression-entry",
         plan=plan,
         plan_item_index=0,
         symbol="003550",
         side="buy",
         intent="next_open_buy",
         status="filled",
-        quantity_policy={"kind": "shares", "quantity": 2},
+        decision_agent_name="signal-decider",
+        source_plan_item_id="target-suppression-family",
+        quantity_policy=entry_policy,
+        risk_context=entry_risk,
+        provider="kis",
+        venue="KRX",
+        asset_class="kr_equity",
+    )
+    target_risk, target_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={
+            "exchange": "KRX",
+            "entry_context": {
+                "source_plan_item_id": "target-suppression-family",
+                "execution_plan_item_id": entry.id,
+                "decision_agent_name": "signal-decider",
+            },
+        },
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 2,
+            "linked_entry_item_key": "target-suppression-family",
+        },
     )
     target = ExecutionPlanItem(
         plan=plan,
@@ -10172,7 +10300,12 @@ def test_nonretryable_target_rejection_suppresses_only_equivalent_target_recreat
         side="sell",
         intent="target_sell",
         status="broker_order_rejected",
-        quantity_policy={"kind": "shares", "quantity": 2},
+        decision_agent_name="signal-decider",
+        quantity_policy=target_policy,
+        risk_context=target_risk,
+        provider="kis",
+        venue="KRX",
+        asset_class="kr_equity",
         trigger_price=Decimal("116132.5000"),
         source_plan_item_id=_derived_source_plan_item_id(entry, "post-entry-target"),
     )
@@ -10727,6 +10860,208 @@ def test_no_price_duplicate_sell_retry_follows_durable_order_truth(
         assert checkpoint.details["retried_triggered_symbols"] == ["005930"]
 
     assert placement_intents == expected_placement_intents
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_retryable_stop_block_rotates_bounded_slot_to_due_max_holding_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_cycle_at = datetime(2026, 10, 3, 21, 41, 24, tzinfo=UTC)
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="live",
+            configured=True,
+            api_base_url=KIS_LIVE_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(
+            broker_order_id="must-not-submit-monitoring-slot-rotation"
+        ),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            kis_app_key="live-key",
+            kis_app_secret="live-secret",
+            kis_account_number="12345678",
+            monitoring_max_broker_actions_per_cycle=1,
+            monitoring_watch_buy_retry_cooldown_seconds=5,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    stop_risk, stop_policy = _bound_kis_item_payloads(
+        settings=app.state.settings,
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    max_holding_risk, max_holding_policy = _bound_kis_item_payloads(
+        settings=app.state.settings,
+        risk_context={
+            "exchange": "KRX",
+            "close_exit_date": "2026-10-03",
+        },
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    stop_id = "retryable-stop-slot-head"
+    max_holding_id = "due-max-holding-slot-follower"
+    with app.state.db_session_factory() as session:
+        plan = ExecutionPlan(
+            external_plan_id="plan-monitoring-slot-rotation",
+            source="test",
+            mode="live",
+            market_date=first_cycle_at.astimezone(ZoneInfo("Asia/Seoul")).date(),
+            accepted_at=first_cycle_at,
+            status="accepted",
+        )
+        stop = ExecutionPlanItem(
+            id=stop_id,
+            plan=plan,
+            plan_item_index=0,
+            symbol="005930",
+            side="sell",
+            intent="stop_sell",
+            status="stop_sell_triggered_blocked",
+            provider="kis",
+            venue="krx",
+            asset_class="stock",
+            quantity_policy=stop_policy,
+            risk_context=stop_risk,
+            trigger_price=Decimal("100"),
+            time_in_force="day",
+        )
+        max_holding = ExecutionPlanItem(
+            id=max_holding_id,
+            plan=plan,
+            plan_item_index=1,
+            symbol="005930",
+            side="sell",
+            intent="max_holding_close_sell",
+            status="max_holding_close_sell_triggered_blocked",
+            provider="kis",
+            venue="krx",
+            asset_class="stock",
+            quantity_policy=max_holding_policy,
+            risk_context=max_holding_risk,
+            time_in_force="day",
+        )
+        session.add(plan)
+        session.add_all([stop, max_holding])
+        session.add(
+            ExecutionPosition(
+                mode="live",
+                symbol="005930",
+                quantity=2,
+                average_price=Decimal("101"),
+                updated_from="reconciliation",
+                last_reconciled_at=first_cycle_at,
+                raw_payload={"source": "test"},
+            )
+        )
+        session.flush()
+        _seed_exact_strategy_family_in_session(
+            settings=app.state.settings,
+            session=session,
+            sell_items=[stop],
+            quantity=1,
+            entry_price=Decimal("101"),
+            decision_agent_name="signal-decider",
+        )
+        _seed_exact_strategy_family_in_session(
+            settings=app.state.settings,
+            session=session,
+            sell_items=[max_holding],
+            quantity=1,
+            entry_price=Decimal("101"),
+            decision_agent_name="short-term-decider",
+        )
+        session.commit()
+
+    placement_intents: list[str] = []
+
+    def place_monitoring_order(**kwargs: object) -> SimpleNamespace:
+        item = kwargs["item"]
+        assert isinstance(item, ExecutionPlanItem)
+        placement_intents.append(item.intent)
+        if item.intent == "stop_sell":
+            return SimpleNamespace(
+                status_code=409,
+                payload={
+                    "block_reason": "strategy_family_quantity_unavailable",
+                    "message": "retry after fresh family inventory reconciliation",
+                    "permanent_rejection": False,
+                    "retry_after_at": (
+                        first_cycle_at + timedelta(seconds=5)
+                    ).isoformat(),
+                    "order": {
+                        "status": "rejected",
+                        "quantity": 1,
+                        "last_error_retryable": True,
+                    },
+                },
+            )
+        return SimpleNamespace(
+            status_code=409,
+            payload={
+                "block_reason": "test_max_holding_dispatch_reached",
+                "message": "due max-holding exit reached the broker boundary",
+                "permanent_rejection": True,
+                "order": {
+                    "status": "rejected",
+                    "quantity": 1,
+                    "last_error_retryable": False,
+                },
+            },
+        )
+
+    monkeypatch.setattr(
+        monitoring_service,
+        "_place_monitoring_order",
+        place_monitoring_order,
+    )
+
+    with app.state.db_session_factory() as session:
+        first = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[],
+            symbols=["005930"],
+            now=first_cycle_at,
+        )
+        assert first.payload["deferred_item_count"] == 1
+        first_checkpoint = session.scalar(select(MonitoringCheckpoint))
+        assert first_checkpoint is not None
+        assert first_checkpoint.details["dispatch_action_count"] == 1
+        stop = session.get(ExecutionPlanItem, stop_id)
+        assert stop is not None
+        assert stop.risk_context["last_monitoring_event"]["event"] == (
+            "sell_monitor_dispatch_deferred"
+        )
+
+        second = run_autonomous_monitoring_cycle(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            prices=[],
+            symbols=["005930"],
+            now=first_cycle_at + timedelta(seconds=1),
+        )
+        second_items = {
+            item["execution_plan_item_id"]: item for item in second.payload["items"]
+        }
+        second_checkpoint = session.scalar(select(MonitoringCheckpoint))
+        assert second_checkpoint is not None
+        assert second_checkpoint.details["dispatch_action_count"] == 1
+        assert second_items[stop_id]["block_reason"] == "retry_cooldown"
+        assert second_items[max_holding_id]["block_reason"] == (
+            "test_max_holding_dispatch_reached"
+        )
+
+    assert placement_intents == ["stop_sell", "max_holding_close_sell"]
     assert broker_adapter.order_calls == []
     engine.dispose()
 
@@ -13568,6 +13903,7 @@ def test_watch_buy_cycle_reserves_orderable_cash_before_broker_submission() -> N
         buying_power=Decimal("1000000.00"),
         observed_at=datetime.now(UTC),
         source="stub:account_snapshot",
+        total_asset_value=Decimal("10000000.00"),
         open_orders=[
             BrokerAccountOpenOrder(
                 symbol="066570",
@@ -13957,6 +14293,52 @@ def test_short_term_watcher_preview_rejects_insufficient_cash_existing_holding_a
     engine.dispose()
 
 
+def test_short_term_watcher_allows_other_lane_while_capping_aggregate_exposure() -> None:
+    context = {
+        "symbol": "005930",
+        "reference_price": "70000",
+        "resolved_quantity": 1,
+        "requested_notional": "70000",
+        "available_cash": "10000000",
+        "runtime_position_quantity": 100,
+        "account_holding_quantity": 100,
+        "same_lane_position_quantity": 0,
+        "open_buy_order_count": 1,
+        "same_lane_open_buy_order_count": 0,
+        "existing_symbol_exposure": "9800000",
+        "market_regime_context": {},
+        "market_date": "2026-10-23",
+    }
+    command = ShortTermWatcherDecisionRequest.model_validate(
+        _short_term_decision_payload("short-term-candidate")
+    )
+    command.agent_output.max_notional = Decimal("10000000")
+
+    assert short_term_watcher_service._validate_account_context(
+        context=context
+    ) is None
+    envelope = short_term_watcher_service._allowed_action_envelope(
+        settings=Settings(runtime_mode="paper"),
+        context=context,
+        command=command,
+    )
+    assert "existing_holding" not in envelope["hard_reject_reasons"]
+    assert "duplicate_open_buy_order" not in envelope["hard_reject_reasons"]
+    assert "no_buyable_quantity" in envelope["hard_reject_reasons"]
+    assert envelope["allowed_actions"] == ["hold", "reject"]
+    assert envelope["max_quantity"] == 0
+    assert envelope["max_notional_krw"] == "0.0000"
+
+    context["same_lane_position_quantity"] = 1
+    context["same_lane_open_buy_order_count"] = 1
+    assert short_term_watcher_service._validate_account_context(
+        context=context
+    ) == (
+        "existing_holding",
+        "candidate already has a holding/runtime position",
+    )
+
+
 def test_short_term_watcher_rejects_quantity_above_allowed_action_envelope() -> None:
     app, engine = build_test_app(
         settings=Settings(database_url="sqlite:///:memory:", runtime_mode="paper"),
@@ -13980,6 +14362,102 @@ def test_short_term_watcher_rejects_quantity_above_allowed_action_envelope() -> 
     assert body["reason_code"] == "allowed_action_envelope_exceeded"
     assert body["context"]["allowed_action_envelope"]["max_quantity"] == 5
     engine.dispose()
+
+
+def test_short_term_watcher_counts_only_unfilled_local_order_quantity() -> None:
+    candidate = ExecutionPlanItem(
+        id="short-partial-candidate",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="short_term_watcher_pending",
+        decision_agent_name="short-term-decider",
+        source_plan_item_id="shared-partial-source",
+    )
+    other_lane = ExecutionPlanItem(
+        id="signal-partial-entry",
+        plan_item_index=1,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="broker_order_submitted",
+        decision_agent_name="signal-decider",
+        source_plan_item_id="shared-partial-source",
+    )
+    plan = ExecutionPlan(
+        external_plan_id="short-watcher-partial-order",
+        market_date=date(2026, 10, 26),
+        mode="paper",
+        items=[candidate, other_lane],
+    )
+    order = BrokerOrder(
+        id="signal-partial-order",
+        broker_name="kis",
+        mode="paper",
+        execution_plan_item_id=other_lane.id,
+        plan_item=other_lane,
+        idempotency_key="signal-partial-order",
+        broker_order_id="signal-partial-order",
+        symbol="005930",
+        side="buy",
+        status="partially_filled",
+        quantity=10,
+        limit_price=Decimal("100"),
+        venue="KRX",
+        asset_class="stock",
+    )
+    order.fills = [
+        ExecutionFill(
+            broker_order_pk=order.id,
+            broker_fill_id="signal-partial-fill",
+            symbol="005930",
+            side="buy",
+            quantity=4,
+            price=Decimal("100"),
+            filled_at=datetime(2026, 10, 26, 0, 1, tzinfo=UTC),
+            payload={"fill_time_precision": "exact"},
+        )
+    ]
+
+    total_count, same_lane_count, notional = (
+        short_term_watcher_service._open_buy_order_context(
+            item=candidate,
+            local_orders=[order],
+            request_open_order_symbols=[],
+            broker_account_snapshot=None,
+            reference_price=Decimal("100"),
+        )
+    )
+
+    assert total_count == 1
+    assert same_lane_count == 0
+    assert notional == Decimal("600.0000")
+    broker_snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("10000"),
+        observed_at=datetime(2026, 10, 26, 0, 2, tzinfo=UTC),
+        source="test",
+        open_orders=[
+            BrokerAccountOpenOrder(
+                symbol="005930",
+                side="buy",
+                quantity=10,
+                remaining_quantity=6,
+                status="partially_filled",
+                broker_order_id="signal-partial-order",
+                limit_price=Decimal("100"),
+            )
+        ],
+    )
+    deduplicated = short_term_watcher_service._open_buy_order_context(
+        item=candidate,
+        local_orders=[order],
+        request_open_order_symbols=[],
+        broker_account_snapshot=broker_snapshot,
+        reference_price=Decimal("100"),
+    )
+    assert deduplicated == (1, 0, Decimal("600.0000"))
+    assert plan.items == [candidate, other_lane]
 
 
 def test_short_term_watcher_rejects_invalid_free_form_agent_output() -> None:
@@ -14066,6 +14544,22 @@ def test_short_term_watcher_market_intent_submits_bounded_ioc_limit_and_material
         )
         assert buy_order is not None
         buy_order.status = "filled"
+        session.add(
+            ExecutionFill(
+                broker_order_pk=buy_order.id,
+                broker_fill_id="fill-short-term-route-e2e",
+                symbol="005930",
+                side="buy",
+                quantity=5,
+                price=Decimal("70000.00"),
+                filled_at=datetime.now(UTC) - timedelta(minutes=1),
+                payload={
+                    "source": "test",
+                    "fill_time_precision": "exact",
+                    "fill_time_source": "test_fixture",
+                },
+            )
+        )
         session.add(
             ExecutionPosition(
                 mode="paper",
@@ -14467,10 +14961,14 @@ def test_orders_monitoring_fills_and_positions_retain_decider_identity() -> None
                     "symbol": "005930",
                     "side": "sell",
                     "intent": "target_sell",
-                    "quantity_policy": {"kind": "shares", "quantity": 5},
+                    "quantity_policy": {
+                        "kind": "shares",
+                        "quantity": 5,
+                        "linked_entry_item_key": "core-signal-order-1",
+                    },
                     "trigger_price": "76000.00",
                     "time_in_force": "day",
-                    "decision_agent_name": "short-term-decider",
+                    "decision_agent_name": "signal-decider",
                     "decision_snapshot_id": "short-monitor-snapshot-1",
                     "decision_run_id": "short-monitor-run-1",
                     "source_plan_item_id": "core-short-monitor-1",
@@ -14499,7 +14997,11 @@ def test_orders_monitoring_fills_and_positions_retain_decider_identity() -> None
                 quantity=5,
                 price=Decimal("71000.0000"),
                 filled_at=datetime(2026, 5, 1, 9, 5, tzinfo=UTC),
-                payload={"source": "broker"},
+                payload={
+                    "source": "broker",
+                    "fill_time_precision": "exact",
+                    "fill_time_source": "test_fixture",
+                },
             )
         )
         session.add(
@@ -14526,9 +15028,9 @@ def test_orders_monitoring_fills_and_positions_retain_decider_identity() -> None
     assert monitoring_response.status_code == 200
     monitoring_item = monitoring_response.json()["items"][0]
     assert monitoring_item["execution_plan_item_id"] == sell_item_id
-    assert monitoring_item["source_identity"]["decision_agent_name"] == "short-term-decider"
+    assert monitoring_item["source_identity"]["decision_agent_name"] == "signal-decider"
     assert monitoring_item["source_identity"]["source_plan_item_id"] == "core-short-monitor-1"
-    assert monitoring_item["order"]["source_identity"]["decision_agent_name"] == "short-term-decider"
+    assert monitoring_item["order"]["source_identity"]["decision_agent_name"] == "signal-decider"
     assert monitoring_item["order"]["source_identity"]["decision_snapshot_id"] == "short-monitor-snapshot-1"
 
     orders_payload = client.get("/orders").json()
@@ -14538,7 +15040,7 @@ def test_orders_monitoring_fills_and_positions_retain_decider_identity() -> None
     }
     assert orders_by_item_id[buy_item_id]["source_identity"]["decision_agent_name"] == "signal-decider"
     assert orders_by_item_id[buy_item_id]["source_identity"]["source_plan_item_id"] == "core-signal-order-1"
-    assert orders_by_item_id[sell_item_id]["source_identity"]["decision_agent_name"] == "short-term-decider"
+    assert orders_by_item_id[sell_item_id]["source_identity"]["decision_agent_name"] == "signal-decider"
     assert orders_by_item_id[sell_item_id]["source_identity"]["source_plan_item_id"] == "core-short-monitor-1"
 
     fills_payload = client.get("/executions").json()
@@ -14553,9 +15055,9 @@ def test_orders_monitoring_fills_and_positions_retain_decider_identity() -> None
         for identity in positions_payload[0]["source_identities"]
     }
     assert position_identity_by_source == {
-        "existing-position-005930-stop_sell": "post-entry-monitor-repair",
-        "core-short-monitor-1": "short-term-decider",
+        "core-short-monitor-1": "signal-decider",
         "core-signal-order-1": "signal-decider",
+        "core-signal-order-1:post-entry-stop": "signal-decider",
     }
 
     symbol_detail_payload = client.get("/symbols/005930").json()
@@ -14630,6 +15132,13 @@ def test_monitoring_evaluate_triggers_target_sell_order_from_position_and_price_
             )
         )
         session.commit()
+
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[plan_item_id],
+        quantity=10,
+        entry_price=Decimal("120000"),
+    )
 
     response = client.post(
         "/monitoring/evaluate",
@@ -14714,7 +15223,15 @@ def _create_filled_buy_position(
     fill_time_precision: str = "exact",
     order_status: str = "filled",
     canonical_fill_quantity: int | None = None,
+    decision_agent_name: str = "short-term-decider",
+    max_holding_close_policy: dict[str, object] | bool | None = None,
 ) -> str:
+    risk_context: dict[str, object] = {
+        "exchange": "KRX",
+        "stop_price": stop_price,
+    }
+    if max_holding_close_policy is not None:
+        risk_context["max_holding_close_policy"] = max_holding_close_policy
     item_payload: dict[str, object] = {
         "provider": "kis",
         "venue": "krx",
@@ -14725,9 +15242,9 @@ def _create_filled_buy_position(
         "quantity_policy": {"kind": "shares", "quantity": quantity},
         "limit_price": entry_price,
         "time_in_force": "day",
-        "risk_context": {"exchange": "KRX", "stop_price": stop_price},
+        "risk_context": risk_context,
         "source_plan_item_id": source_plan_item_id,
-        "decision_agent_name": "short-term-decider",
+        "decision_agent_name": decision_agent_name,
         "decision_snapshot_id": f"{plan_id}-snapshot",
         "decision_run_id": f"{plan_id}-run",
     }
@@ -14749,6 +15266,15 @@ def _create_filled_buy_position(
         buy_item = session.get(ExecutionPlanItem, buy_item_id)
         assert buy_item is not None
         buy_item.status = order_status
+        family_identity = broker_orders_service._strategy_entry_family_identity(
+            buy_item
+        )
+        assert family_identity is not None
+        command_metadata = {
+            broker_orders_service.STRATEGY_ENTRY_FAMILY_METADATA_KEY: (
+                family_identity
+            ),
+        }
         broker_order = BrokerOrder(
             execution_plan_item_id=buy_item_id,
             broker_name="kis",
@@ -14767,13 +15293,21 @@ def _create_filled_buy_position(
                 "source": "test",
                 "exchange": "KRX",
                 "execution_scope": _test_kis_execution_scope(app.state.settings),
+                "metadata": command_metadata,
+                "original_command": {"metadata": command_metadata},
             },
             response_metadata={"source": "test"},
             raw_broker_payload={"source": "test"},
         )
         session.add(broker_order)
         session.flush()
-        fill_times = [filled_at] if isinstance(filled_at, str) else filled_at or []
+        fill_times = (
+            [filled_at]
+            if isinstance(filled_at, str)
+            else filled_at
+            if filled_at is not None
+            else [f"{market_date}T00:45:00+00:00"]
+        )
         fill_quantity = canonical_fill_quantity or (
             quantity
             if len(fill_times) <= 1
@@ -14792,6 +15326,7 @@ def _create_filled_buy_position(
                     payload={
                         "source": "test",
                         "fill_time_precision": fill_time_precision,
+                        "fill_time_source": "test_fixture",
                     },
                 )
             )
@@ -14808,6 +15343,351 @@ def _create_filled_buy_position(
         session.commit()
 
     return buy_item_id
+
+
+def _seed_exact_strategy_family_for_sell_items(
+    app,
+    *,
+    sell_item_ids: list[str],
+    quantity: int,
+    entry_price: Decimal,
+    decision_agent_name: str = "signal-decider",
+) -> str:
+    """Give an exit test exact buy/fill lineage without inventing production data."""
+
+    with app.state.db_session_factory() as session:
+        sell_items = [session.get(ExecutionPlanItem, item_id) for item_id in sell_item_ids]
+        assert all(item is not None for item in sell_items)
+        entry_item_id = _seed_exact_strategy_family_in_session(
+            settings=app.state.settings,
+            session=session,
+            sell_items=[item for item in sell_items if item is not None],
+            quantity=quantity,
+            entry_price=entry_price,
+            decision_agent_name=decision_agent_name,
+        )
+        session.commit()
+    return entry_item_id
+
+
+def _seed_exact_strategy_family_in_session(
+    *,
+    settings: Settings,
+    session: Session,
+    sell_items: list[ExecutionPlanItem],
+    quantity: int,
+    entry_price: Decimal,
+    decision_agent_name: str = "signal-decider",
+) -> str:
+    """Attach exact family lineage using the caller's transaction/session."""
+
+    assert sell_items
+    family_token = sha256(
+        "|".join(sorted(item.id for item in sell_items)).encode()
+    ).hexdigest()[:16]
+    entry_item_id = f"fixture-entry-{family_token}"
+    source_plan_item_id = f"fixture-source-{family_token}"
+    symbols = {item.symbol for item in sell_items}
+    assert len(symbols) == 1
+    symbol = next(iter(symbols))
+    venues = {str(item.venue or "krx").strip().lower() for item in sell_items}
+    assert len(venues) == 1
+    venue = next(iter(venues))
+    plan_ids = {item.execution_plan_id for item in sell_items}
+    assert len(plan_ids) == 1
+    plan = session.get(ExecutionPlan, next(iter(plan_ids)))
+    assert plan is not None
+    entry_risk_context: dict[str, object] = {"exchange": "KRX"}
+    target_prices = [
+        item.trigger_price
+        for item in sell_items
+        if item.intent == "target_sell" and item.trigger_price is not None
+    ]
+    stop_prices = [
+        item.trigger_price
+        for item in sell_items
+        if item.intent == "stop_sell" and item.trigger_price is not None
+    ]
+    if target_prices:
+        entry_risk_context["target_price"] = str(max(target_prices))
+    if stop_prices:
+        entry_risk_context["stop_price"] = str(max(stop_prices))
+    risk_context, quantity_policy = _bound_kis_item_payloads(
+        settings=settings,
+        risk_context=entry_risk_context,
+        quantity_policy={"kind": "shares", "quantity": quantity},
+    )
+    entry_item = ExecutionPlanItem(
+        id=entry_item_id,
+        plan=plan,
+        plan_item_index=max(item.plan_item_index for item in plan.items) + 1,
+        symbol=symbol,
+        side="buy",
+        intent="watch_buy",
+        status="filled",
+        provider="kis",
+        venue=venue,
+        asset_class="stock",
+        quantity_policy=quantity_policy,
+        limit_price=entry_price,
+        time_in_force="day",
+        risk_context=risk_context,
+        decision_agent_name=decision_agent_name,
+        source_plan_item_id=source_plan_item_id,
+    )
+    session.add(entry_item)
+    session.flush()
+    family_identity = broker_orders_service._strategy_entry_family_identity(entry_item)
+    assert family_identity is not None
+    entry_order = BrokerOrder(
+        execution_plan_item_id=entry_item.id,
+        broker_name="kis",
+        mode=settings.runtime_mode,
+        idempotency_key=f"fixture-family-buy:{family_token}",
+        broker_order_id=f"fixture-family-broker-{family_token}",
+        symbol=symbol,
+        side="buy",
+        status="filled",
+        quantity=quantity,
+        limit_price=entry_price,
+        venue=venue,
+        asset_class="stock",
+        request_metadata={
+            "source": "test-family-fixture",
+            "exchange": "KRX",
+            "execution_scope": _test_kis_execution_scope(settings, venue=venue),
+            "metadata": {
+                broker_orders_service.STRATEGY_ENTRY_FAMILY_METADATA_KEY: (
+                    family_identity
+                ),
+            },
+            "original_command": {
+                "metadata": {
+                    broker_orders_service.STRATEGY_ENTRY_FAMILY_METADATA_KEY: (
+                        family_identity
+                    ),
+                }
+            },
+        },
+    )
+    session.add(entry_order)
+    session.flush()
+    session.add(
+        ExecutionFill(
+            broker_order_pk=entry_order.id,
+            broker_fill_id=f"fixture-family-fill-{family_token}",
+            symbol=symbol,
+            side="buy",
+            quantity=quantity,
+            price=entry_price,
+            filled_at=datetime(2020, 1, 2, 1, 0, tzinfo=UTC),
+            payload={"fill_time_precision": "exact"},
+        )
+    )
+    for item in sell_items:
+        item_risk_context = dict(item.risk_context or {})
+        item_risk_context["entry_context"] = {
+            "source_plan_item_id": source_plan_item_id,
+        }
+        item.risk_context = item_risk_context
+        item.decision_agent_name = decision_agent_name
+        item.provider = item.provider or "kis"
+        item.venue = item.venue or "krx"
+        item.asset_class = item.asset_class or "stock"
+    session.flush()
+    return entry_item_id
+
+
+def test_post_entry_max_holding_defaults_are_decision_lane_safe() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        exec_agent_max_holding_trading_sessions=7,
+    )
+
+    def entry(
+        decision_agent_name: str | None,
+        policy: dict[str, object] | bool | None = None,
+    ) -> ExecutionPlanItem:
+        risk_context = {"exchange": "KRX"}
+        if policy is not None:
+            risk_context["max_holding_close_policy"] = policy
+        return ExecutionPlanItem(
+            symbol="005930",
+            side="buy",
+            intent="next_open_buy",
+            decision_agent_name=decision_agent_name,
+            risk_context=risk_context,
+        )
+
+    assert monitoring_service._post_entry_max_holding_sessions(
+        settings=settings,
+        entry_item=entry("signal-decider"),
+    ) is None
+    assert monitoring_service._post_entry_max_holding_sessions(
+        settings=settings,
+        entry_item=entry("short-term-decider"),
+    ) == 3
+    assert monitoring_service._post_entry_max_holding_sessions(
+        settings=settings,
+        entry_item=entry(
+            "short-term-decider",
+            {"enabled": True, "trading_sessions": 9},
+        ),
+    ) == 3
+    assert monitoring_service._post_entry_max_holding_sessions(
+        settings=settings,
+        entry_item=entry(
+            "signal-decider",
+            {"enabled": True, "trading_sessions": 4},
+        ),
+    ) == 4
+    assert monitoring_service._post_entry_max_holding_sessions(
+        settings=settings,
+        entry_item=entry(None),
+    ) == 7
+
+
+@pytest.mark.parametrize(
+    ("active_order", "expected_status"),
+    [
+        (False, "superseded"),
+        (True, "manual_review_required"),
+    ],
+)
+def test_signal_policy_removal_reconciles_legacy_max_holding_monitor(
+    active_order: bool,
+    expected_status: str,
+) -> None:
+    broker_adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+    )
+    app, engine = build_test_app(
+        settings=Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="paper",
+            kis_app_key="paper-key",
+            kis_app_secret="paper-secret",
+            kis_account_number="12345678",
+            exec_agent_max_holding_trading_sessions=7,
+            account_drawdown_gate_enabled=False,
+        ),
+        broker_adapter=broker_adapter,
+    )
+    client = TestClient(app)
+    buy_item_id = _create_filled_buy_position(
+        app,
+        client,
+        plan_id=f"signal-policy-removal-{active_order}",
+        market_date="2026-06-10",
+        source_plan_item_id=f"signal-policy-removal-{active_order}:entry",
+        decision_agent_name="signal-decider",
+        max_holding_close_policy={"enabled": True, "trading_sessions": 3},
+    )
+
+    created = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "create legacy signal max holding monitor",
+            "observed_at": "2026-06-10T01:00:00Z",
+            "prices": [{"symbol": "005930", "price": "101000.00"}],
+        },
+    )
+    assert created.status_code == 200
+
+    with app.state.db_session_factory() as session:
+        entry_item = session.get(ExecutionPlanItem, buy_item_id)
+        assert entry_item is not None
+        entry_item.risk_context = {
+            key: value
+            for key, value in entry_item.risk_context.items()
+            if key != "max_holding_close_policy"
+        }
+        max_holding_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "max_holding_close_sell",
+            )
+        )
+        assert max_holding_item is not None
+        assert max_holding_item.status == "max_holding_close_sell_monitoring"
+        if active_order:
+            session.add(
+                BrokerOrder(
+                    execution_plan_item_id=max_holding_item.id,
+                    broker_name="kis",
+                    mode="paper",
+                    idempotency_key=f"legacy-signal-max:{max_holding_item.id}",
+                    broker_order_id=f"legacy-signal-max-{max_holding_item.id}",
+                    symbol="005930",
+                    side="sell",
+                    status="open",
+                    quantity=10,
+                    venue="krx",
+                    asset_class="stock",
+                    request_metadata={"source": "test"},
+                    response_metadata={"source": "test"},
+                    raw_broker_payload={"source": "test"},
+                )
+            )
+        session.flush()
+        position = session.scalar(
+            select(ExecutionPosition).where(ExecutionPosition.symbol == "005930")
+        )
+        assert position is not None
+
+        maintenance_count, _ = monitoring_service._maintain_post_entry_exit_monitors(
+            settings=app.state.settings,
+            db=session,
+            adapter=broker_adapter,
+            krx_trading_day=lambda _market_date: True,
+            positions_by_symbol={"005930": position},
+            prices={},
+            triggered_at=datetime(2026, 6, 10, 1, 1, tzinfo=UTC),
+        )
+        session.flush()
+
+        assert maintenance_count == 1
+        assert max_holding_item.status == expected_status
+        assert max_holding_item.risk_context["last_monitoring_event"]["event"] == (
+            "max_holding_close_policy_disabled_manual_review"
+            if active_order
+            else "max_holding_close_policy_disabled"
+        )
+        if active_order:
+            order = session.scalar(
+                select(BrokerOrder).where(
+                    BrokerOrder.execution_plan_item_id == max_holding_item.id
+                )
+            )
+            assert order is not None
+            assert order.status == "open"
+
+        stop_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "stop_sell",
+            )
+        )
+        target_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "target_sell",
+            )
+        )
+        assert stop_item is not None
+        assert stop_item.status == "stop_sell_monitoring"
+        assert target_item is not None
+        assert target_item.status == "target_sell_monitoring"
+
+    engine.dispose()
 
 
 def test_monitoring_creates_post_entry_protective_monitors_after_buy_fill() -> None:
@@ -14881,7 +15761,7 @@ def test_monitoring_creates_post_entry_protective_monitors_after_buy_fill() -> N
         assert max_holding_item.status == "max_holding_close_sell_monitoring"
         assert max_holding_item.quantity_policy == {"kind": "position_exit_from_entry"}
         assert max_holding_item.source_plan_item_id == "core-post-entry-create:post-entry-max-holding"
-        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-15"
+        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-12"
         assert max_holding_item.risk_context["post_entry_managed"] is True
         assert max_holding_item.provider == entry_item.provider
         assert max_holding_item.venue == entry_item.venue
@@ -15035,11 +15915,23 @@ def test_monitoring_creates_default_exit_monitors_for_existing_position_without_
     )
 
     assert triggered.status_code == 200, triggered.text
-    assert triggered.json()["submitted_order_count"] == 1
-    assert len(broker_adapter.order_calls) == 1
-    assert broker_adapter.order_calls[0].side == "sell"
-    assert broker_adapter.order_calls[0].exchange == "KRX"
-
+    assert triggered.json()["submitted_order_count"] == 0
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        stop_item = session.scalar(
+            select(ExecutionPlanItem).where(
+                ExecutionPlanItem.symbol == "005930",
+                ExecutionPlanItem.intent == "stop_sell",
+            )
+        )
+        assert stop_item is not None
+        assert stop_item.status == "manual_review_required", str(triggered.json())
+        assert stop_item.risk_context["last_monitoring_event"]["event"] == (
+            "sell_monitor_manual_review"
+        )
+        assert stop_item.risk_context["last_monitoring_event"]["reason"] == (
+            "partial_entry_family_identity"
+        )
     engine.dispose()
 
 
@@ -15296,19 +16188,28 @@ def test_monitoring_rebases_invalid_post_entry_stop_above_entry() -> None:
         stop_price="149280.00",
         quantity=1,
     )
-    stop_risk, stop_policy = _bound_kis_item_payloads(
-        settings=app.state.settings,
-        risk_context={
-            "exchange": "KRX",
-            "deterministic_emergency_stop": True,
-            "post_entry_managed": True,
-        },
-        quantity_policy={"kind": "shares", "quantity": 1},
-    )
     with app.state.db_session_factory() as session:
         buy_item = session.get(ExecutionPlanItem, buy_item_id)
         assert buy_item is not None
         assert buy_item.plan is not None
+        stop_risk, stop_policy = _bound_kis_item_payloads(
+            settings=app.state.settings,
+            risk_context={
+                "exchange": "KRX",
+                "deterministic_emergency_stop": True,
+                "post_entry_managed": True,
+                "entry_context": {
+                    "source_plan_item_id": buy_item.source_plan_item_id,
+                    "execution_plan_item_id": buy_item.id,
+                    "decision_agent_name": buy_item.decision_agent_name,
+                },
+            },
+            quantity_policy={
+                "kind": "shares",
+                "quantity": 1,
+                "linked_entry_item_key": buy_item.source_plan_item_id,
+            },
+        )
         session.add(
             ExecutionPlanItem(
                 plan=buy_item.plan,
@@ -15654,7 +16555,14 @@ def test_monitoring_does_not_age_post_entry_review_on_krx_holiday() -> None:
     engine.dispose()
 
 
-def test_monitoring_submits_post_entry_max_holding_close_sell() -> None:
+@pytest.mark.parametrize(
+    "agent_outcome",
+    ("error", "invalid", "reject", "keep_watching"),
+)
+def test_monitoring_submits_post_entry_max_holding_close_sell(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_outcome: str,
+) -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
             provider="kis",
@@ -15674,6 +16582,9 @@ def test_monitoring_submits_post_entry_max_holding_close_sell() -> None:
             kis_account_number="12345678",
             exec_agent_stop_loss_pct=Decimal("0.04"),
             exec_agent_max_holding_trading_sessions=3,
+            exec_agent_enabled=True,
+            exec_agent_trigger_time_enabled=True,
+            exec_agent_trigger_time_sell_enabled=True,
             account_drawdown_gate_enabled=False,
         ),
         broker_adapter=broker_adapter,
@@ -15684,6 +16595,29 @@ def test_monitoring_submits_post_entry_max_holding_close_sell() -> None:
         json={"actor": "ops", "source": "console", "reason": "enable automation"},
     )
     assert resume.status_code == 200
+
+    agent_calls: list[str] = []
+
+    def forbidden_agent_call(**_kwargs: object) -> dict[str, object]:
+        agent_calls.append(agent_outcome)
+        if agent_outcome == "error":
+            raise RuntimeError("fixture agent outage")
+        if agent_outcome == "invalid":
+            return {"decision": "not-a-decision"}
+        return {
+            "decision": agent_outcome,
+            "side": "sell",
+            "quantity": None,
+            "reason": f"fixture {agent_outcome}",
+            "risk_notes": [],
+            "context_staleness_ok": True,
+        }
+
+    monkeypatch.setattr(
+        trigger_time_exec_agent_service,
+        "_request_exec_agent_decision",
+        forbidden_agent_call,
+    )
 
     _create_filled_buy_position(
         app,
@@ -15718,6 +16652,7 @@ def test_monitoring_submits_post_entry_max_holding_close_sell() -> None:
     assert max_holding_items[0]["outcome"] == "submitted", max_holding_items[0]
     assert payload["submitted_order_count"] == 1
     assert len(broker_adapter.order_calls) == 1
+    assert agent_calls == []
     assert broker_adapter.order_calls[0].side == "sell"
     assert broker_adapter.order_calls[0].quantity == 10
     assert broker_adapter.order_calls[0].order_type == "market"
@@ -15962,7 +16897,7 @@ def test_monitoring_preserves_trading_session_max_holding_close_date_over_weeken
             )
         )
         assert max_holding_item is not None
-        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-17"
+        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-16"
 
     monday_response = client.post(
         "/monitoring/evaluate",
@@ -15987,7 +16922,7 @@ def test_monitoring_preserves_trading_session_max_holding_close_date_over_weeken
             )
         )
         assert max_holding_item is not None
-        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-17"
+        assert max_holding_item.risk_context["close_exit_date"] == "2026-06-16"
         order = session.scalar(
             select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == max_holding_item.id)
         )
@@ -16022,7 +16957,7 @@ def test_monitoring_anchors_max_holding_to_first_fill_and_skips_krx_holiday() ->
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
-            exec_agent_max_holding_trading_sessions=2,
+            exec_agent_max_holding_trading_sessions=3,
             account_drawdown_gate_enabled=False,
         ),
         broker_adapter=broker_adapter,
@@ -16111,7 +17046,7 @@ def test_monitoring_anchors_max_holding_to_first_fill_and_skips_krx_holiday() ->
     engine.dispose()
 
 
-def test_monitoring_keeps_provisional_entry_and_cleans_legacy_calendar_state() -> None:
+def test_monitoring_fails_closed_when_entry_fill_time_is_not_exact() -> None:
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
             provider="kis",
@@ -16165,125 +17100,39 @@ def test_monitoring_keeps_provisional_entry_and_cleans_legacy_calendar_state() -
 
     assert response.status_code == 200
     with app.state.db_session_factory() as session:
-        item = session.scalar(
+        exit_items = session.scalars(
             select(ExecutionPlanItem).where(
                 ExecutionPlanItem.symbol == "005930",
-                ExecutionPlanItem.intent == "max_holding_close_sell",
+                ExecutionPlanItem.intent.in_(
+                    ("target_sell", "stop_sell", "max_holding_close_sell")
+                ),
             )
-        )
-        assert item is not None
-        assert item.source_market_date == date(2026, 10, 1)
-        assert item.risk_context["entry_market_date"] == "2026-10-02"
-        assert item.risk_context["entry_market_date_status"] == "provisional"
-        assert item.risk_context["entry_market_date_precision"] == (
-            "upper_bound_or_unknown"
-        )
-        assert item.risk_context["close_exit_date_status"] == (
-            "entry_date_provisional"
-        )
-        assert item.risk_context["close_exit_calendar_resolution_status"] == (
-            "authoritative"
-        )
-        for write_only_key in (
-            "close_exit_calendar_attempt_count",
-            "close_exit_calendar_last_attempt_at",
-            "close_exit_calendar_last_outcome",
-            "close_exit_calendar_retry_pending",
-        ):
-            assert write_only_key not in item.risk_context
-        initial_audit_count = len(
-            session.scalars(
-                select(ExecutionPlanItemAudit).where(
-                    ExecutionPlanItemAudit.execution_plan_item_id == item.id,
-                )
-            ).all()
-        )
-        initial_update_event_count = sum(
-            event.get("event") == "post_entry_max_holding_monitor_updated"
-            for event in item.risk_context["monitoring_events"]
-        )
-        item.risk_context = {
-            **item.risk_context,
-            "close_exit_calendar_attempt_count": 9,
-            "close_exit_calendar_last_attempt_at": "2026-10-01T00:00:00+00:00",
-            "close_exit_calendar_last_outcome": "weekday_provisional",
-            "close_exit_calendar_retry_pending": True,
-        }
-        flag_modified(item, "risk_context")
-        session.commit()
+        ).all()
+        assert exit_items == []
 
     repeated_response = client.post(
         "/monitoring/evaluate",
         json={
             "actor": "ops",
             "source": "test",
-            "reason": "authoritative calendar needs no retry for provisional entry",
+            "reason": "inexact fill chronology remains family-indeterminate",
             "observed_at": "2026-10-05T02:00:01Z",
             "prices": [{"symbol": "005930", "price": "101000.00"}],
         },
     )
     assert repeated_response.status_code == 200
     with app.state.db_session_factory() as session:
-        item = session.scalar(
+        exit_items = session.scalars(
             select(ExecutionPlanItem).where(
                 ExecutionPlanItem.symbol == "005930",
-                ExecutionPlanItem.intent == "max_holding_close_sell",
+                ExecutionPlanItem.intent.in_(
+                    ("target_sell", "stop_sell", "max_holding_close_sell")
+                ),
             )
-        )
-        assert item is not None
-        assert item.risk_context["close_exit_calendar_resolution_status"] == (
-            "authoritative"
-        )
-        for legacy_key in (
-            "close_exit_calendar_attempt_count",
-            "close_exit_calendar_last_attempt_at",
-            "close_exit_calendar_last_outcome",
-            "close_exit_calendar_retry_pending",
-        ):
-            assert legacy_key not in item.risk_context
-        assert len(
-            session.scalars(
-                select(ExecutionPlanItemAudit).where(
-                    ExecutionPlanItemAudit.execution_plan_item_id == item.id,
-                )
-            ).all()
-        ) == initial_audit_count
-        cleaned_update_event_count = sum(
-            event.get("event") == "post_entry_max_holding_monitor_updated"
-            for event in item.risk_context["monitoring_events"]
-        )
-        assert cleaned_update_event_count == initial_update_event_count + 1
+        ).all()
+        assert exit_items == []
 
-    unchanged_response = client.post(
-        "/monitoring/evaluate",
-        json={
-            "actor": "ops",
-            "source": "test",
-            "reason": "cleaned calendar metadata stays transition-deduplicated",
-            "observed_at": "2026-10-05T02:00:02Z",
-            "prices": [{"symbol": "005930", "price": "101000.00"}],
-        },
-    )
-    assert unchanged_response.status_code == 200
-    with app.state.db_session_factory() as session:
-        item = session.scalar(
-            select(ExecutionPlanItem).where(
-                ExecutionPlanItem.symbol == "005930",
-                ExecutionPlanItem.intent == "max_holding_close_sell",
-            )
-        )
-        assert item is not None
-        assert sum(
-            event.get("event") == "post_entry_max_holding_monitor_updated"
-            for event in item.risk_context["monitoring_events"]
-        ) == cleaned_update_event_count
-        assert len(
-            session.scalars(
-                select(ExecutionPlanItemAudit).where(
-                    ExecutionPlanItemAudit.execution_plan_item_id == item.id,
-                )
-            ).all()
-        ) == initial_audit_count
+    assert broker_adapter.order_calls == []
 
     engine.dispose()
 
@@ -16369,7 +17218,7 @@ def test_us_max_holding_monitor_records_weekday_calendar_policy() -> None:
 
     assert maintenance_count == 1
     assert added == [monitor]
-    assert monitor.risk_context["close_exit_date"] == "2026-10-06"
+    assert monitor.risk_context["close_exit_date"] == "2026-10-05"
     assert monitor.risk_context["close_exit_date_status"] == "weekday_schedule"
     assert monitor.risk_context["close_exit_calendar_policy"] == "weekday_calendar"
 
@@ -16497,18 +17346,17 @@ def test_monitoring_rejects_exact_anchor_when_fill_inventory_disagrees_with_posi
 
     assert response.status_code == 200
     with app.state.db_session_factory() as session:
-        item = session.scalar(
+        exit_items = session.scalars(
             select(ExecutionPlanItem).where(
                 ExecutionPlanItem.symbol == "005930",
-                ExecutionPlanItem.intent == "max_holding_close_sell",
+                ExecutionPlanItem.intent.in_(
+                    ("target_sell", "stop_sell", "max_holding_close_sell")
+                ),
             )
-        )
-        assert item is not None
-        assert item.risk_context["entry_market_date"] == "2026-10-02"
-        assert item.risk_context["entry_market_date_status"] == "provisional"
-        assert item.risk_context["entry_market_date_precision"] == (
-            "upper_bound_or_unknown"
-        )
+        ).all()
+        assert exit_items == []
+
+    assert broker_adapter.order_calls == []
 
     engine.dispose()
 
@@ -16688,7 +17536,7 @@ def test_monitoring_audits_weekday_provisional_and_retries_krx_calendar() -> Non
             )
         )
         assert item is not None
-        assert item.risk_context["close_exit_date"] == "2026-10-06"
+        assert item.risk_context["close_exit_date"] == "2026-10-05"
         assert item.risk_context["close_exit_date_status"] == "weekday_provisional"
         assert item.risk_context["close_exit_calendar_resolution_status"] == (
             "weekday_provisional"
@@ -16783,7 +17631,7 @@ def test_monitoring_audits_weekday_provisional_and_retries_krx_calendar() -> Non
             )
         )
         assert item is not None
-        assert item.risk_context["close_exit_date"] == "2026-10-07"
+        assert item.risk_context["close_exit_date"] == "2026-10-06"
         assert item.risk_context["close_exit_date_status"] == "authoritative"
         assert item.risk_context["close_exit_calendar_resolution_status"] == (
             "authoritative"
@@ -16879,7 +17727,7 @@ def test_monitoring_closes_on_weekday_provisional_when_krx_calendar_stays_unknow
             )
         )
         assert item is not None
-        assert item.risk_context["close_exit_date"] == "2026-10-06"
+        assert item.risk_context["close_exit_date"] == "2026-10-05"
         assert item.risk_context["close_exit_date_status"] == "weekday_provisional"
 
     engine.dispose()
@@ -16937,7 +17785,7 @@ def test_monitoring_revalidates_authoritative_future_krx_deadline() -> None:
             )
         )
         assert item is not None
-        assert item.risk_context["close_exit_date"] == "2026-10-06"
+        assert item.risk_context["close_exit_date"] == "2026-10-05"
 
     broker_adapter.krx_market_open = None
     broker_adapter.krx_market_open_by_date = {
@@ -16964,7 +17812,7 @@ def test_monitoring_revalidates_authoritative_future_krx_deadline() -> None:
             )
         )
         assert item is not None
-        assert item.risk_context["close_exit_date"] == "2026-10-07"
+        assert item.risk_context["close_exit_date"] == "2026-10-06"
         assert item.risk_context["close_exit_date_status"] == "authoritative"
 
     engine.dispose()
@@ -17047,6 +17895,13 @@ def test_monitoring_rearms_stop_to_breakeven_after_partial_take_profit() -> None
         )
         session.commit()
 
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[target_item_id, stop_item_id],
+        quantity=10,
+        entry_price=Decimal("100000"),
+    )
+
     response = client.post(
         "/monitoring/evaluate",
         json={
@@ -17061,8 +17916,10 @@ def test_monitoring_rearms_stop_to_breakeven_after_partial_take_profit() -> None
     payload = response.json()
     assert payload["triggered_item_count"] == 1
     assert payload["submitted_order_count"] == 1
-    assert payload["items"][0]["execution_plan_item_id"] == target_item_id
-    assert payload["items"][0]["outcome"] == "submitted"
+    submitted_item = next(
+        item for item in payload["items"] if item["outcome"] == "submitted"
+    )
+    assert submitted_item["execution_plan_item_id"] == target_item_id
 
     assert len(broker_adapter.order_calls) == 1
     assert broker_adapter.order_calls[0].execution_plan_item_id == target_item_id
@@ -17339,6 +18196,7 @@ def test_monitoring_keeps_broker_ack_when_partial_take_profit_stop_rearm_fails(
             kis_app_key="paper-key",
             kis_app_secret="paper-secret",
             kis_account_number="12345678",
+            exec_agent_stop_loss_pct=Decimal("0.03"),
             breakeven_stop_buffer_pct=Decimal("0.2"),
         ),
         broker_adapter=broker_adapter,
@@ -17390,11 +18248,6 @@ def test_monitoring_keeps_broker_ack_when_partial_take_profit_stop_rearm_fails(
     assert plan_response.status_code == 201
     target_item_id, stop_item_id = plan_response.json()["persisted_execution_item_ids"]
     with app.state.db_session_factory() as session:
-        initial_stop_item = session.get(ExecutionPlanItem, stop_item_id)
-        assert initial_stop_item is not None
-        initial_stop_risk_context = dict(initial_stop_item.risk_context or {})
-
-    with app.state.db_session_factory() as session:
         session.add(
             ExecutionPosition(
                 mode="paper",
@@ -17406,6 +18259,19 @@ def test_monitoring_keeps_broker_ack_when_partial_take_profit_stop_rearm_fails(
             )
         )
         session.commit()
+
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[target_item_id, stop_item_id],
+        quantity=10,
+        entry_price=Decimal("100000"),
+    )
+    with app.state.db_session_factory() as session:
+        initial_stop_item = session.get(ExecutionPlanItem, stop_item_id)
+        assert initial_stop_item is not None
+        initial_stop_price = initial_stop_item.trigger_price
+        initial_stop_quantity_policy = dict(initial_stop_item.quantity_policy or {})
+        initial_stop_risk_context = dict(initial_stop_item.risk_context or {})
 
     def fail_stop_rearm(**_: object) -> None:
         raise RuntimeError("simulated stop rearm persistence failure")
@@ -17433,9 +18299,12 @@ def test_monitoring_keeps_broker_ack_when_partial_take_profit_stop_rearm_fails(
         assert target_item is not None
         assert stop_item is not None
         assert target_item.status == "broker_order_submitted"
-        assert stop_item.trigger_price == Decimal("97000.0000")
-        assert stop_item.quantity_policy == {"kind": "shares", "quantity": 10}
-        assert stop_item.risk_context == initial_stop_risk_context
+        assert stop_item.trigger_price == initial_stop_price
+        assert stop_item.quantity_policy == initial_stop_quantity_policy
+        assert stop_item.risk_context["entry_context"]["source_plan_item_id"] == (
+            initial_stop_risk_context["entry_context"]["source_plan_item_id"]
+        )
+        assert stop_item.risk_context.get("breakeven_rearmed") is None
         order = session.scalar(
             select(BrokerOrder).where(BrokerOrder.execution_plan_item_id == target_item_id)
         )
@@ -17528,6 +18397,13 @@ def test_monitoring_evaluate_triggers_profit_protection_after_peak_giveback() ->
             )
         )
         session.commit()
+
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[plan_item_id],
+        quantity=7,
+        entry_price=Decimal("100000"),
+    )
 
     first = client.post(
         "/monitoring/evaluate",
@@ -17681,6 +18557,19 @@ def test_autonomous_retry_preserves_profit_protection_trigger_metadata(
         )
         session.commit()
 
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[first_item_id],
+        quantity=1,
+        entry_price=Decimal("150000"),
+    )
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[profit_item_id],
+        quantity=7,
+        entry_price=Decimal("100000"),
+    )
+
     evaluation = client.post(
         "/monitoring/evaluate",
         json={
@@ -17811,7 +18700,11 @@ def test_autonomous_retry_preserves_profit_protection_trigger_metadata(
         assert retry.payload["submitted_order_count"] == 1
         assert retry.payload["triggered_item_count"] == 1
 
-        orders = session.scalars(select(BrokerOrder).order_by(BrokerOrder.created_at.asc())).all()
+        orders = session.scalars(
+            select(BrokerOrder)
+            .where(BrokerOrder.side == "sell")
+            .order_by(BrokerOrder.created_at.asc())
+        ).all()
         assert [order.execution_plan_item_id for order in orders] == [
             first_item_id,
             profit_item_id,
@@ -17885,7 +18778,12 @@ def test_monitoring_evaluate_preserves_stop_precedence_over_profit_protection() 
                     "intent": "stop_sell",
                     "quantity_policy": {"kind": "position_exit_from_entry"},
                     "trigger_price": "101800.00",
-                    "risk_context": {"exchange": "KRX"},
+                    "risk_context": {
+                        "exchange": "KRX",
+                        "breakeven_rearmed": {
+                            "source": "partial_take_profit",
+                        },
+                    },
                 },
             ],
         },
@@ -17905,6 +18803,13 @@ def test_monitoring_evaluate_preserves_stop_precedence_over_profit_protection() 
             )
         )
         session.commit()
+
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[target_item_id, stop_item_id],
+        quantity=7,
+        entry_price=Decimal("100000"),
+    )
 
     response = client.post(
         "/monitoring/evaluate",
@@ -17936,7 +18841,7 @@ def test_monitoring_evaluate_preserves_stop_precedence_over_profit_protection() 
         stop_item = session.get(ExecutionPlanItem, stop_item_id)
         assert target_item is not None
         assert stop_item is not None
-        assert target_item.status == "target_sell_pending_config"
+        assert target_item.status == "target_sell_monitoring"
         assert stop_item.status == "broker_order_submitted"
 
     engine.dispose()
@@ -18245,6 +19150,13 @@ def test_monitoring_evaluate_submits_protective_stop_while_entries_are_blocked(
             )
         )
         session.commit()
+
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[plan_item_id],
+        quantity=10,
+        entry_price=Decimal("70950.5"),
+    )
 
     response = client.post(
         "/monitoring/evaluate",
@@ -18771,6 +19683,13 @@ def test_monitoring_recovers_stale_agent_pending_stop_and_submits() -> None:
         )
         session.commit()
 
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[item_id],
+        quantity=10,
+        entry_price=Decimal("33000"),
+    )
+
     response = client.post(
         "/monitoring/evaluate",
         json={
@@ -18868,6 +19787,13 @@ def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() ->
         )
         session.commit()
 
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[first_item_id, second_item_id],
+        quantity=10,
+        entry_price=Decimal("120000"),
+    )
+
     response = client.post(
         "/monitoring/evaluate",
         json={
@@ -18888,12 +19814,12 @@ def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() ->
     assert payload["evaluated_item_count"] == 3
     assert payload["triggered_item_count"] == 2
     assert payload["submitted_order_count"] == 1
-    assert payload["blocked_item_count"] == 0
+    assert payload["blocked_item_count"] == 1
     assert len(payload["items"]) == 3
 
     items_by_outcome = {item["outcome"]: item for item in payload["items"]}
     submitted_item = items_by_outcome["submitted"]
-    no_position_item = items_by_outcome["no_position"]
+    blocked_item = items_by_outcome["blocked"]
 
     assert submitted_item["execution_plan_item_id"] in {first_item_id, second_item_id}
     assert submitted_item["symbol"] == "005930"
@@ -18902,15 +19828,14 @@ def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() ->
     assert submitted_item["observed_price"] == "125100.0000"
     assert submitted_item["order"]["quantity"] == 6
 
-    assert no_position_item["execution_plan_item_id"] == (
+    assert blocked_item["execution_plan_item_id"] == (
         second_item_id if submitted_item["execution_plan_item_id"] == first_item_id else first_item_id
     )
-    assert no_position_item["symbol"] == "005930"
-    assert no_position_item["intent"] == "target_sell"
-    assert no_position_item["trigger_price"] == "125000.0000"
-    assert no_position_item["observed_price"] == "125100.0000"
-    assert no_position_item["outcome"] == "no_position"
-    assert no_position_item["message"] == "no sellable execution position is available for this trigger"
+    assert blocked_item["symbol"] == "005930"
+    assert blocked_item["intent"] == "target_sell"
+    assert blocked_item["trigger_price"] == "125000.0000"
+    assert blocked_item["observed_price"] == "125100.0000"
+    assert blocked_item["outcome"] == "blocked"
 
     assert broker_adapter.authenticate_calls == 1
     assert len(broker_adapter.order_calls) == 1
@@ -18926,11 +19851,14 @@ def test_monitoring_evaluate_tracks_remaining_shares_across_triggered_items() ->
         assert first_item is not None
         assert second_item is not None
         assert first_item.status == "broker_order_submitted"
-        assert second_item.status == "target_sell_monitoring"
+        assert second_item.status == "target_sell_triggered_blocked"
 
         orders = session.scalars(
             select(BrokerOrder)
-            .where(BrokerOrder.symbol == "005930")
+            .where(
+                BrokerOrder.symbol == "005930",
+                BrokerOrder.side == "sell",
+            )
             .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
         ).all()
         assert len(orders) == 1
@@ -19204,6 +20132,19 @@ def test_monitoring_evaluate_round_robins_symbols_when_dispatch_capacity_is_boun
         )
         session.commit()
 
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[first_item_id, second_item_id],
+        quantity=2,
+        entry_price=Decimal("120000"),
+    )
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[third_item_id],
+        quantity=1,
+        entry_price=Decimal("88000"),
+    )
+
     response = client.post(
         "/monitoring/evaluate",
         json={
@@ -19373,6 +20314,25 @@ def test_monitoring_evaluate_limits_loaded_symbols_per_cycle() -> None:
             ]
         )
         session.commit()
+
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[first_item_id],
+        quantity=1,
+        entry_price=Decimal("120000"),
+    )
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[second_item_id],
+        quantity=1,
+        entry_price=Decimal("88000"),
+    )
+    _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[third_item_id],
+        quantity=1,
+        entry_price=Decimal("175000"),
+    )
 
     response = client.post(
         "/monitoring/evaluate",
@@ -20024,6 +20984,21 @@ def test_monitoring_evaluate_persists_insufficient_sellable_quantity_execution_f
         )
         session.commit()
 
+    entry_item_id = _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=[plan_item_id],
+        quantity=10,
+        entry_price=Decimal("70950.5"),
+        decision_agent_name="stop-guard",
+    )
+    with app.state.db_session_factory() as session:
+        entry_item = session.get(ExecutionPlanItem, entry_item_id)
+        assert entry_item is not None
+        entry_risk_context = dict(entry_item.risk_context or {})
+        entry_risk_context["max_holding_close_policy"] = False
+        entry_item.risk_context = entry_risk_context
+        session.commit()
+
     response = client.post(
         "/monitoring/evaluate",
         json={
@@ -20420,6 +21395,8 @@ def test_live_mode_cycle_exposes_symbol_readback_and_daily_board_views() -> None
                     "quantity_policy": {"kind": "shares", "quantity": 3},
                     "limit_price": "71000.00",
                     "time_in_force": "day",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": "live-readback-cycle-buy",
                     "risk_context": {
                         "exchange": "KRX",
                         "target_price": "76000.00",
@@ -20679,6 +21656,8 @@ def test_autonomous_dispatch_loop_progresses_due_plan_without_manual_dispatch(
                         "quantity_policy": {"kind": "shares", "quantity": 5},
                         "limit_price": "71000.00",
                         "time_in_force": "day",
+                        "decision_agent_name": "signal-decider",
+                        "source_plan_item_id": "autonomous-dispatch-buy",
                         "risk_context": {"exchange": "KRX"},
                     }
                 ],
@@ -20788,6 +21767,13 @@ def test_autonomous_monitoring_loop_triggers_target_sell_from_price_source() -> 
             )
             session.commit()
 
+        _seed_exact_strategy_family_for_sell_items(
+            app,
+            sell_item_ids=[plan_item_id],
+            quantity=1,
+            entry_price=Decimal("120000"),
+        )
+
         wait_for(
             lambda: len(broker_adapter.order_calls) == 1
             and app.state.autonomous_runtime.snapshot()["monitoring"]["last_success_at"]
@@ -20804,17 +21790,37 @@ def test_autonomous_monitoring_loop_triggers_target_sell_from_price_source() -> 
         assert autonomous["last_success_at"] is not None
         assert price_source.calls
 
-        with app.state.db_session_factory() as session:
-            plan_item = session.get(ExecutionPlanItem, plan_item_id)
-            order = session.scalar(select(BrokerOrder))
-            checkpoint = session.scalar(select(MonitoringCheckpoint))
-            assert plan_item is not None
-            assert order is not None
-            assert checkpoint is not None
-            assert plan_item.status == "broker_order_submitted"
-            assert order.broker_order_id == "kis-auto-monitor-1"
-            assert checkpoint.status == "degraded"
-            assert checkpoint.details["protective_stop_coverage"]["missing_quantities"] == {}
+        observed_state: dict[str, object] = {}
+
+        def load_persisted_monitoring_state() -> bool:
+            try:
+                with app.state.db_session_factory() as session:
+                    plan_item = session.get(ExecutionPlanItem, plan_item_id)
+                    order = session.scalar(
+                        select(BrokerOrder).where(BrokerOrder.side == "sell")
+                    )
+                    checkpoint = session.scalar(select(MonitoringCheckpoint))
+                    if plan_item is None or order is None or checkpoint is None:
+                        return False
+                    observed_state.update(
+                        plan_item_status=plan_item.status,
+                        broker_order_id=order.broker_order_id,
+                        checkpoint_status=checkpoint.status,
+                        missing_quantities=checkpoint.details[
+                            "protective_stop_coverage"
+                        ]["missing_quantities"],
+                    )
+                    return True
+            except DBAPIError:
+                return False
+
+        wait_for(load_persisted_monitoring_state)
+        assert observed_state == {
+            "plan_item_status": "broker_order_submitted",
+            "broker_order_id": "kis-auto-monitor-1",
+            "checkpoint_status": "degraded",
+            "missing_quantities": {},
+        }
 
     engine.dispose()
 
@@ -20969,6 +21975,25 @@ def test_autonomous_monitoring_prices_same_symbols_selected_for_evaluation() -> 
                 current_market_date=datetime(2026, 6, 8, tzinfo=UTC).date(),
             )
             assert symbols == ["035420", "005930", "000660"]
+
+        _seed_exact_strategy_family_for_sell_items(
+            app,
+            sell_item_ids=[first_item_id],
+            quantity=1,
+            entry_price=Decimal("175000"),
+        )
+        _seed_exact_strategy_family_for_sell_items(
+            app,
+            sell_item_ids=[second_item_id],
+            quantity=1,
+            entry_price=Decimal("120000"),
+        )
+        _seed_exact_strategy_family_for_sell_items(
+            app,
+            sell_item_ids=[third_item_id],
+            quantity=1,
+            entry_price=Decimal("88000"),
+        )
 
         payload = app.state.autonomous_runtime._monitoring_cycle_sync(
             datetime(2026, 6, 8, 0, 3, tzinfo=UTC)
@@ -21167,6 +22192,13 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_
         )
         session.commit()
 
+    _seed_exact_strategy_family_for_sell_items(
+        first_app,
+        sell_item_ids=[first_item_id, second_item_id],
+        quantity=2,
+        entry_price=Decimal("120000"),
+    )
+
     evaluation = first_client.post(
         "/monitoring/evaluate",
         json={
@@ -21257,7 +22289,11 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_
         with restarted_app.state.db_session_factory() as session:
             first_item = session.get(ExecutionPlanItem, first_item_id)
             second_item = session.get(ExecutionPlanItem, second_item_id)
-            orders = session.scalars(select(BrokerOrder).order_by(BrokerOrder.created_at.asc())).all()
+            orders = session.scalars(
+                select(BrokerOrder)
+                .where(BrokerOrder.side == "sell")
+                .order_by(BrokerOrder.created_at.asc())
+            ).all()
             checkpoint = session.scalar(select(MonitoringCheckpoint))
             assert first_item is not None
             assert second_item is not None
@@ -22104,6 +23140,8 @@ def test_manual_review_us_holding_does_not_override_krx_buy_boundary_guards(
             status="watch_buy_triggered",
             provider="kis",
             asset_class="stock",
+            decision_agent_name="signal-decider",
+            source_plan_item_id=f"boundary-source-{case_key}"[:36],
             trigger_price=Decimal("70000"),
             quantity_policy={
                 "kind": "shares",
@@ -22270,6 +23308,8 @@ def test_live_automated_krx_buy_uses_the_route_recomputed_at_the_final_boundary(
             status="watch_buy_triggered",
             provider="kis",
             asset_class="stock",
+            decision_agent_name="signal-decider",
+            source_plan_item_id="final-route-market-evidence-source",
             trigger_price=Decimal("70000"),
             quantity_policy=quantity_policy,
             risk_context={**risk_context, "trigger_direction": "at_or_above"},
@@ -22445,6 +23485,8 @@ def test_final_broker_command_is_durable_before_process_loss_at_broker_boundary(
             status="watch_buy_triggered",
             provider="kis",
             asset_class="stock",
+            decision_agent_name="signal-decider",
+            source_plan_item_id="durable-final-route-source",
             trigger_price=Decimal("70000"),
             quantity_policy=quantity_policy,
             risk_context={**risk_context, "trigger_direction": "at_or_above"},
@@ -22657,6 +23699,14 @@ def test_live_monitoring_sell_rechecks_executable_bid_after_position_reservation
             )
         )
         db.commit()
+        _seed_exact_strategy_family_in_session(
+            settings=settings,
+            session=db,
+            sell_items=[item],
+            quantity=5,
+            entry_price=Decimal("90"),
+        )
+        db.commit()
         stale_item = ExecutionPlanItem(
             id=item.id,
             symbol=item.symbol,
@@ -22671,7 +23721,9 @@ def test_live_monitoring_sell_rechecks_executable_bid_after_position_reservation
             ),
             time_in_force="day",
             quantity_policy=quantity_policy,
-            risk_context=risk_context,
+            risk_context=dict(item.risk_context or {}),
+            decision_agent_name=item.decision_agent_name,
+            source_plan_item_id=item.source_plan_item_id,
         )
         stale_command = PlaceOrderRequest(
             idempotency_key=f"monitoring:{intent}:{item.id}",
@@ -22873,6 +23925,14 @@ def test_live_krx_single_price_protective_sell_binds_final_bid() -> None:
                 status="accepted",
                 items=[item],
             )
+        )
+        session.commit()
+        _seed_exact_strategy_family_in_session(
+            settings=settings,
+            session=session,
+            sell_items=[item],
+            quantity=5,
+            entry_price=Decimal("105"),
         )
         session.commit()
         result = monitoring_service._place_monitoring_order(
@@ -23710,6 +24770,11 @@ def test_final_target_sell_boundary_rejects_agent_stop_relaxation() -> None:
             quantity_policy=target_policy,
             risk_context=target_risk,
         )
+        stop_risk, stop_policy = _bound_kis_item_payloads(
+            settings=settings,
+            risk_context={"exchange": "KRX"},
+            quantity_policy={"kind": "shares", "quantity": 5},
+        )
         stop = ExecutionPlanItem(
             id="final-stop-integrity-stop",
             plan_item_index=1,
@@ -23721,8 +24786,8 @@ def test_final_target_sell_boundary_rejects_agent_stop_relaxation() -> None:
             venue="kis",
             asset_class="stock",
             trigger_price=Decimal("70000"),
-            quantity_policy={"kind": "shares", "quantity": 5},
-            risk_context={"exchange": "KRX"},
+            quantity_policy=stop_policy,
+            risk_context=stop_risk,
         )
         db.add(
             ExecutionPlan(
@@ -23733,6 +24798,14 @@ def test_final_target_sell_boundary_rejects_agent_stop_relaxation() -> None:
                 status="accepted",
                 items=[target, stop],
             )
+        )
+        db.commit()
+        _seed_exact_strategy_family_in_session(
+            settings=settings,
+            session=db,
+            sell_items=[target, stop],
+            quantity=5,
+            entry_price=Decimal("65000"),
         )
         db.commit()
         result = monitoring_service._place_monitoring_order(
@@ -24031,6 +25104,8 @@ def test_live_buy_cancellation_and_pause_during_market_evidence_load_are_preserv
             status="watch_monitoring_active",
             provider="kis",
             asset_class="stock",
+            decision_agent_name="signal-decider",
+            source_plan_item_id="cancel-during-market-evidence-source",
             quantity_policy=quantity_policy,
             risk_context=risk_context,
         )
@@ -24601,6 +25676,8 @@ def test_transient_krx_calendar_failure_retries_then_submits_within_grace() -> N
                     "intent": "next_open_buy",
                     "quantity_policy": {"kind": "shares", "quantity": 2},
                     "limit_price": "71000",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": "calendar-transient-recovery-buy",
                 }
             ],
         },
@@ -24685,6 +25762,8 @@ def test_same_cycle_next_open_jobs_share_one_authoritative_calendar_lookup() -> 
                     "intent": "next_open_buy",
                     "quantity_policy": {"kind": "shares", "quantity": 1},
                     "limit_price": "71000",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": f"calendar-cache-{symbol}",
                 }
                 for symbol in ("005930", "000660")
             ],
@@ -25146,6 +26225,8 @@ def test_verified_agent_next_open_job_requires_fresh_entry_geometry(
                     "quantity_policy": {"kind": "shares", "quantity": 2},
                     "limit_price": "71000",
                     "time_in_force": "day",
+                    "decision_agent_name": "signal-decider",
+                    "source_plan_item_id": "verified-next-open-buy",
                     "risk_context": {
                         "exchange": "KRX",
                         "target_price": "76000",
@@ -26145,6 +27226,8 @@ def test_live_watch_buy_market_evidence_retry_honors_broker_cooldown(
             status="watch_monitoring_active",
             provider="kis",
             asset_class="stock",
+            decision_agent_name="signal-decider",
+            source_plan_item_id="live-market-evidence-cooldown-source",
             trigger_price=Decimal("71000"),
             limit_price=Decimal("71200"),
             time_in_force="day",
@@ -27367,6 +28450,10 @@ def test_monitoring_ignores_foreign_stop_and_submits_matching_protection() -> No
         risk_context={"exchange": "KRX"},
         quantity_policy={"kind": "shares", "quantity": 2},
     )
+    matching_risk = {
+        **matching_risk,
+        "breakeven_rearmed": {"source": "partial_take_profit"},
+    }
     identity = build_position_identity(
         settings=app.state.settings,
         provider="kis",
@@ -27458,6 +28545,20 @@ def test_monitoring_ignores_foreign_stop_and_submits_matching_protection() -> No
                 ),
             ]
         )
+        session.commit()
+
+    entry_item_id = _seed_exact_strategy_family_for_sell_items(
+        app,
+        sell_item_ids=["matching-account-monitoring-stop"],
+        quantity=2,
+        entry_price=Decimal("50"),
+    )
+    with app.state.db_session_factory() as session:
+        entry_item = session.get(ExecutionPlanItem, entry_item_id)
+        assert entry_item is not None
+        entry_risk_context = dict(entry_item.risk_context or {})
+        entry_risk_context["target_price"] = "120"
+        entry_item.risk_context = entry_risk_context
         session.commit()
 
     foreign_evaluation = client.post(

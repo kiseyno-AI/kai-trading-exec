@@ -12,7 +12,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, load_only, selectinload
 
 from app.core.config import Settings, load_settings
@@ -29,7 +29,11 @@ from app.services.artifact_integrity import (
     attach_artifact_integrity,
     load_strict_json_object,
 )
-from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fill_idempotency import (
+    dedupe_execution_fills,
+    duplicate_fill_economic_conflict,
+    execution_fill_dedupe_key,
+)
 from app.services.fill_economics import (
     closed_trade_economics,
     effective_fill_quantity,
@@ -38,6 +42,7 @@ from app.services.fifo_inventory import (
     FifoIsolationCursor,
     FifoRouteScope,
     ambiguous_fifo_chronology_buckets,
+    canonical_fifo_inventory_route_scope,
     fifo_chronology_ambiguity_reason_at,
     fifo_fill_sort_key,
     fifo_route_scope_from_order,
@@ -72,11 +77,27 @@ from app.services.portfolio_risk import (
     infer_settlement_currency,
     load_symbol_settlement_currency_hints,
 )
+from app.services.strategy_family_attribution import (
+    ACCOUNT_FIFO_PNL_BASIS,
+    STRATEGY_FAMILY_PNL_BASIS,
+    StrategyFamilyLedger,
+    _persisted_order_strategy_family_identity,
+    legacy_single_lane_agents_by_route_symbol,
+    strategy_family_outcome_fields,
+)
 
 REPORT_VERSION = "trade-outcome-feedback-v3"
 LEARNING_QUALITY_GATE_VERSION = "trade-outcome-learning-quality-v1"
+STRATEGY_SCOPE_VERSION = "strategy-feedback-scope-v1"
+STRATEGY_LANE_LEARNING_VERSION = "strategy-lane-learning-v1"
+STRATEGY_LANE_OPERATIONAL_VERSION = "strategy-lane-operational-learning-v1"
+ACTIONABLE_DECISION_LANES = frozenset(
+    {"signal-decider", "short-term-decider"}
+)
 MIN_CANDIDATE_RULE_SAMPLE_SIZE = 3
 MAX_OPERATIONAL_LEARNING_FAILURES = 500
+OPERATIONAL_FAILURE_SCAN_BATCH_SIZE = 200
+MAX_OPERATIONAL_FAILURE_SCAN_ROWS = 5000
 BROKER_BALANCE_OUTPUT2_FIELDS = (
     "tot_evlu_amt",
     "nass_amt",
@@ -174,10 +195,18 @@ def generate_trade_outcome_feedback(
     now = _normalize_utc(as_of or datetime.now(UTC))
     days = max(1, int(lookback_days or settings.trade_outcome_feedback_lookback_days))
     started_at = now - timedelta(days=days)
-    fills = _load_fills(
+    fifo_isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=settings.runtime_mode,
+        through=now,
+    )
+    fills, duplicate_fill_conflict_evidence = _load_fills(
         settings=settings,
         db=db,
         requested_scope=requested_scope,
+        review_start=started_at,
+        review_end=now,
+        isolation_cursor=fifo_isolation_cursor,
     )
     execution_account_scope = _report_execution_account_scope(
         settings=settings,
@@ -186,7 +215,7 @@ def generate_trade_outcome_feedback(
         requested_scope=requested_scope,
     )
     scoped_sell_routes = {
-        (route_scope, fill.symbol)
+        (canonical_fifo_inventory_route_scope(route_scope), fill.symbol)
         for fill in fills
         if (route_scope := fifo_route_scope_from_order(fill.broker_order)) is not None
         if str(fill.side or "").lower() == "sell"
@@ -201,13 +230,22 @@ def generate_trade_outcome_feedback(
         for trade in _fifo_closed_trades(
             fills,
             legacy_sell_cost_basis=legacy_sell_cost_basis,
+            isolation_cursor=fifo_isolation_cursor,
+        )
+        if _parse_datetime(str((trade.get("sell") or {}).get("filled_at"))) >= started_at
+    ]
+    strategy_closed_trades = [
+        _with_strategy_scope(trade)
+        for trade in _strategy_family_closed_trades(
+            fills,
             isolation_cursor=load_fifo_isolation_cursor(
                 db=db,
                 runtime_mode=settings.runtime_mode,
                 through=now,
             ),
         )
-        if _parse_datetime(str((trade.get("sell") or {}).get("filled_at"))) >= started_at
+        if _parse_datetime(str((trade.get("sell") or {}).get("filled_at")))
+        >= started_at
     ]
     broker_asset_performance = _broker_asset_performance(
         settings=settings,
@@ -218,8 +256,17 @@ def generate_trade_outcome_feedback(
         as_of=now,
         requested_scope=requested_scope,
     )
-    summary = _summary(closed_trades, broker_asset_performance=broker_asset_performance)
-    lessons = _lessons(closed_trades, max_lessons=settings.trade_outcome_feedback_max_lessons)
+    summary = _summary(
+        closed_trades,
+        broker_asset_performance=broker_asset_performance,
+    )
+    strategy_summary = _summary(strategy_closed_trades)
+    summary["execution_authority"] = False
+    strategy_summary["execution_authority"] = False
+    lessons = _lessons(
+        strategy_closed_trades,
+        max_lessons=settings.trade_outcome_feedback_max_lessons,
+    )
     portfolio_risk = _portfolio_risk(
         settings=settings,
         db=db,
@@ -232,10 +279,31 @@ def generate_trade_outcome_feedback(
         db=db,
         as_of=now,
     )
-    candidate_rule_replay = _candidate_rule_replay(settings=settings, closed_trades=closed_trades)
+    candidate_rule_replay = _candidate_rule_replay(
+        settings=settings,
+        closed_trades=strategy_closed_trades,
+    )
     quality_gate = _feedback_learning_quality_gate(
-        closed_trades=closed_trades,
+        closed_trades=strategy_closed_trades,
         candidate_rule_replay=candidate_rule_replay,
+        duplicate_fill_economic_conflict=(
+            duplicate_fill_conflict_evidence["conflict_group_count"] > 0
+        ),
+    )
+    quality_gate["execution_authority"] = False
+    candidate_rule_replay = _candidate_rule_replay_with_scope(
+        candidate_rule_replay,
+        strategy_scope=_unavailable_strategy_scope(
+            evidence_status="cross_scope_aggregate"
+        ),
+        execution_authority=False,
+    )
+    strategy_learning_by_lane = _strategy_learning_by_lane(
+        settings=settings,
+        closed_trades=strategy_closed_trades,
+        max_lessons=settings.trade_outcome_feedback_max_lessons,
+        duplicate_fill_conflict_evidence=duplicate_fill_conflict_evidence,
+        report_execution_account_scope=execution_account_scope,
     )
     operational_learning_context = _operational_learning_context(
         settings=settings,
@@ -244,8 +312,11 @@ def generate_trade_outcome_feedback(
         as_of=now,
         requested_scope=requested_scope,
     )
+    operational_learning_by_lane = _operational_learning_by_lane(
+        operational_learning_context=operational_learning_context,
+    )
     snippet = _snippet(
-        summary=summary,
+        summary=strategy_summary,
         lessons=lessons,
         portfolio_risk=portfolio_risk,
         candidate_rule_replay=candidate_rule_replay,
@@ -253,7 +324,13 @@ def generate_trade_outcome_feedback(
         account_drawdown_gate=account_drawdown_gate,
     )
     snippet["quality_gate"] = _quality_gate_prompt_context(quality_gate)
+    snippet["execution_authority"] = False
+    snippet["strategy_learning_by_lane"] = strategy_learning_by_lane
+    snippet["duplicate_fill_conflict_evidence"] = (
+        duplicate_fill_conflict_evidence
+    )
     snippet["operational_learning_context"] = operational_learning_context
+    snippet["operational_learning_by_lane"] = operational_learning_by_lane
     report_date = now.astimezone(UTC).date()
     report: dict[str, object] = {
         "version": REPORT_VERSION,
@@ -281,14 +358,22 @@ def generate_trade_outcome_feedback(
         "started_at": started_at.isoformat(),
         "closed_trade_count": len(closed_trades),
         "summary": summary,
+        "account_fifo_pnl_basis": ACCOUNT_FIFO_PNL_BASIS,
+        "strategy_closed_trade_count": len(strategy_closed_trades),
+        "strategy_pnl_basis": STRATEGY_FAMILY_PNL_BASIS,
+        "strategy_summary": strategy_summary,
         "broker_asset_performance": broker_asset_performance,
         "portfolio_risk": portfolio_risk,
         "account_drawdown_gate": account_drawdown_gate,
         "closed_trades": closed_trades,
+        "strategy_closed_trades": strategy_closed_trades,
         "lessons": lessons,
         "candidate_rule_replay": candidate_rule_replay,
         "quality_gate": quality_gate,
+        "duplicate_fill_conflict_evidence": duplicate_fill_conflict_evidence,
+        "strategy_learning_by_lane": strategy_learning_by_lane,
         "operational_learning_context": operational_learning_context,
+        "operational_learning_by_lane": operational_learning_by_lane,
         "prompt_snippet": snippet,
     }
     target_dir = output_dir or Path(settings.trade_outcome_feedback_dir)
@@ -333,6 +418,14 @@ def load_latest_trade_outcome_feedback_snippet(
     quality_gate = payload.get("quality_gate")
     if not isinstance(quality_gate, dict):
         return _unavailable_feedback_context(reason="quality_gate_missing")
+    strategy_learning_by_lane = _validated_lane_learning_map(
+        payload.get("strategy_learning_by_lane"),
+        schema_version=STRATEGY_LANE_LEARNING_VERSION,
+    )
+    operational_learning_by_lane = _validated_lane_learning_map(
+        payload.get("operational_learning_by_lane"),
+        schema_version=STRATEGY_LANE_OPERATIONAL_VERSION,
+    )
     operational_learning_context = _validated_operational_learning_context(
         payload.get("operational_learning_context")
     )
@@ -354,15 +447,22 @@ def load_latest_trade_outcome_feedback_snippet(
             "execution_account_scope": payload.get("execution_account_scope"),
             "generated_at": generated_at.isoformat(),
             "quality_gate": quality_gate,
+            "strategy_learning_by_lane": strategy_learning_by_lane,
+            "operational_learning_by_lane": operational_learning_by_lane,
             "operational_learning_context": operational_learning_context,
             "snippet": {
                 "quality_gate": _quality_gate_prompt_context(quality_gate),
+                "strategy_learning_by_lane": strategy_learning_by_lane,
+                "operational_learning_by_lane": operational_learning_by_lane,
                 "operational_learning_context": operational_learning_context,
             },
         }
     snippet = payload.get("prompt_snippet")
     if not isinstance(snippet, dict):
         return _unavailable_feedback_context(reason="prompt_snippet_missing")
+    snippet = dict(snippet)
+    snippet["strategy_learning_by_lane"] = strategy_learning_by_lane
+    snippet["operational_learning_by_lane"] = operational_learning_by_lane
     return {
         "status": "ready",
         "consumer_eligible": True,
@@ -374,6 +474,8 @@ def load_latest_trade_outcome_feedback_snippet(
         "closed_trade_count": payload.get("closed_trade_count"),
         "summary": payload.get("summary") if isinstance(payload.get("summary"), dict) else {},
         "quality_gate": quality_gate,
+        "strategy_learning_by_lane": strategy_learning_by_lane,
+        "operational_learning_by_lane": operational_learning_by_lane,
         "operational_learning_context": operational_learning_context,
         "snippet": snippet,
     }
@@ -395,12 +497,44 @@ def _unavailable_feedback_context(*, reason: str) -> dict[str, object]:
         "reason": reason,
         "version": REPORT_VERSION,
         "quality_gate": quality_gate,
+        "strategy_learning_by_lane": {},
+        "operational_learning_by_lane": {},
         "operational_learning_context": operational_learning_context,
         "snippet": {
             "quality_gate": _quality_gate_prompt_context(quality_gate),
+            "strategy_learning_by_lane": {},
+            "operational_learning_by_lane": {},
             "operational_learning_context": operational_learning_context,
         },
     }
+
+
+def _validated_lane_learning_map(
+    value: object,
+    *,
+    schema_version: str,
+) -> dict[str, dict[str, object]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, dict[str, object]] = {}
+    for raw_lane, raw_bucket in value.items():
+        lane = _normalized_decision_lane(raw_lane)
+        if (
+            lane not in ACTIONABLE_DECISION_LANES
+            or not isinstance(raw_bucket, dict)
+            or raw_bucket.get("schema_version") != schema_version
+            or _normalized_decision_lane(raw_bucket.get("decision_lane")) != lane
+        ):
+            continue
+        execution_scope = raw_bucket.get("execution_account_scope")
+        if (
+            not isinstance(execution_scope, dict)
+            or _nonempty_text(execution_scope.get("provider")) is None
+            or _nonempty_text(execution_scope.get("account_scope")) is None
+        ):
+            continue
+        result[lane] = dict(raw_bucket)
+    return result
 
 
 def _quality_gate_prompt_context(
@@ -627,8 +761,11 @@ def _load_fills(
     settings: Settings,
     db: Session,
     requested_scope: FeedbackExecutionScope | None = None,
-) -> list[ExecutionFill]:
-    fills = dedupe_execution_fills(list(
+    review_start: datetime,
+    review_end: datetime,
+    isolation_cursor: FifoIsolationCursor,
+) -> tuple[list[ExecutionFill], dict[str, object]]:
+    raw_fills = list(
         db.scalars(
             select(ExecutionFill)
             .join(ExecutionFill.broker_order)
@@ -670,6 +807,7 @@ def _load_fills(
                 .selectinload(BrokerOrder.plan_item)
                 .load_only(
                     ExecutionPlanItem.id,
+                    ExecutionPlanItem.side,
                     ExecutionPlanItem.intent,
                     ExecutionPlanItem.source_plan_item_id,
                     ExecutionPlanItem.decision_run_id,
@@ -680,17 +818,147 @@ def _load_fills(
             )
             .order_by(ExecutionFill.symbol.asc(), ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
         )
-    ))
-    if requested_scope is None:
-        return fills
-    return [
-        fill
-        for fill in fills
-        if _order_matches_feedback_scope(
-            fill.broker_order,
-            requested_scope,
+    )
+    scoped_raw_fills = (
+        raw_fills
+        if requested_scope is None
+        else [
+            fill
+            for fill in raw_fills
+            if _order_matches_feedback_scope(
+                fill.broker_order,
+                requested_scope,
+            )
+        ]
+    )
+    def conflict_is_relevant(fill: ExecutionFill) -> bool:
+        fill_time = _normalize_utc(fill.filled_at)
+        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        latest_boundary = (
+            isolation_cursor.latest_boundary_through(
+                route_scope=route_scope,
+                symbol=fill.symbol,
+                observed_at=review_end,
+            )
+            if route_scope is not None
+            else None
         )
+        return (
+            fill_time >= review_start
+            or latest_boundary is None
+            or fill_time > latest_boundary
+        )
+
+    return (
+        dedupe_execution_fills(scoped_raw_fills),
+        _duplicate_fill_conflict_evidence(
+            scoped_raw_fills,
+            is_relevant=conflict_is_relevant,
+        ),
+    )
+
+
+def _exact_fill_strategy_identity(
+    fill: ExecutionFill,
+) -> dict[str, object] | None:
+    order = fill.broker_order
+    if order is None:
+        return None
+    lineage_evidence = resolve_decision_lineage_evidence(
+        order=order,
+        fill_payload=fill.payload,
+    )
+    lineage = lineage_evidence.get("lineage")
+    if lineage_evidence.get("status") != "complete" or not isinstance(
+        lineage,
+        dict,
+    ):
+        return None
+    lane = _normalized_decision_lane(lineage.get("decision_agent_name"))
+    if lane not in ACTIONABLE_DECISION_LANES:
+        return None
+    persisted_identity, persisted_error = (
+        _persisted_order_strategy_family_identity(order)
+    )
+    if persisted_error is not None or not isinstance(persisted_identity, dict):
+        return None
+    persisted_lane = _normalized_decision_lane(
+        persisted_identity.get("decision_lane")
+    )
+    entry_family_key = _nonempty_text(
+        persisted_identity.get("entry_family_key")
+    )
+    route_scope = fifo_route_scope_from_order(order)
+    if (
+        persisted_lane != lane
+        or entry_family_key is None
+        or route_scope is None
+    ):
+        return None
+    return {
+        "decision_lane": lane,
+        "entry_family_key": entry_family_key,
+        "execution_account_scope": route_scope.as_payload(),
+    }
+
+
+def _duplicate_fill_conflict_evidence(
+    fills: list[ExecutionFill],
+    *,
+    is_relevant: Callable[[ExecutionFill], bool],
+) -> dict[str, object]:
+    groups: dict[str, list[ExecutionFill]] = {}
+    for fill in fills:
+        groups.setdefault(execution_fill_dedupe_key(fill), []).append(fill)
+    group_evidence: list[dict[str, object]] = []
+    for group in groups.values():
+        if (
+            len(group) <= 1
+            or not duplicate_fill_economic_conflict(group)
+            or not any(is_relevant(fill) for fill in group)
+        ):
+            continue
+        identities = [_exact_fill_strategy_identity(fill) for fill in group]
+        exact_identity = identities[0] if identities else None
+        if (
+            exact_identity is not None
+            and all(identity == exact_identity for identity in identities)
+        ):
+            group_evidence.append(
+                {
+                    "evidence_status": "exact",
+                    **exact_identity,
+                }
+            )
+        else:
+            group_evidence.append(
+                {
+                    "evidence_status": "ambiguous",
+                    "decision_lane": None,
+                    "entry_family_key": None,
+                    "execution_account_scope": None,
+                }
+            )
+    exact_groups = [
+        group
+        for group in group_evidence
+        if group.get("evidence_status") == "exact"
     ]
+    ambiguous_count = len(group_evidence) - len(exact_groups)
+    return {
+        "schema_version": "strategy-duplicate-fill-conflict-v1",
+        "status": "conflict" if group_evidence else "clear",
+        "conflict_group_count": len(group_evidence),
+        "exact_attributed_conflict_group_count": len(exact_groups),
+        "ambiguous_conflict_group_count": ambiguous_count,
+        "decision_lanes": sorted(
+            {
+                str(group["decision_lane"])
+                for group in exact_groups
+            }
+        ),
+        "groups": group_evidence,
+    }
 
 
 def _report_execution_account_scope(
@@ -1074,12 +1342,13 @@ def _fifo_closed_trades(
                     )
                 )
             continue
-        route_symbol = (route_scope, fill.symbol)
+        inventory_route_scope = canonical_fifo_inventory_route_scope(route_scope)
+        route_symbol = (inventory_route_scope, fill.symbol)
         lots = lots_by_route_symbol.setdefault(route_symbol, [])
         scope_quality_available = True
         if isolation_cursor is not None:
             scope_quality_available = isolation_cursor.apply_before(
-                route_scope=route_scope,
+                route_scope=inventory_route_scope,
                 symbol=fill.symbol,
                 observed_at=_normalize_utc(fill.filled_at),
                 lots=lots,
@@ -1087,7 +1356,7 @@ def _fifo_closed_trades(
         chronology_reason = fifo_chronology_ambiguity_reason_at(
             ambiguous_buckets=ambiguous_buckets,
             isolation_cursor=isolation_cursor,
-            route_scope=route_scope,
+            route_scope=inventory_route_scope,
             symbol=fill.symbol,
             observed_at=_normalize_utc(fill.filled_at),
         )
@@ -1162,6 +1431,115 @@ def _fifo_closed_trades(
     return closed
 
 
+def _strategy_family_closed_trades(
+    fills: list[ExecutionFill],
+    *,
+    isolation_cursor: FifoIsolationCursor | None = None,
+) -> list[dict[str, object]]:
+    """Attribute sells to their exact virtual entry family for learning only.
+
+    This intentionally runs beside, rather than replacing, route+symbol broker
+    FIFO.  Broker FIFO remains account-level evidence; this projection is the
+    fail-closed decision lineage used by decider learning.
+    """
+
+    closed: list[dict[str, object]] = []
+    ambiguous_buckets = ambiguous_fifo_chronology_buckets(fills)
+    ledger = StrategyFamilyLedger(
+        legacy_agents_by_route_symbol=legacy_single_lane_agents_by_route_symbol(
+            fills
+        )
+    )
+    scope_probe_lots: dict[tuple[FifoRouteScope, str], list[object]] = {}
+    for fill in sorted(
+        fills,
+        key=lambda row: (
+            row.symbol,
+            *fifo_fill_sort_key(row),
+        ),
+    ):
+        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        fill_time = _normalize_utc(fill.filled_at)
+        inventory_route_scope = (
+            canonical_fifo_inventory_route_scope(route_scope)
+            if route_scope is not None
+            else None
+        )
+        route_symbol = (
+            (inventory_route_scope, str(fill.symbol or "").strip().upper())
+            if route_scope is not None
+            else None
+        )
+        evidence_available = route_scope is not None
+        generation_boundary = None
+        if isolation_cursor is not None and route_scope is not None:
+            assert route_symbol is not None
+            evidence_available = isolation_cursor.apply_before(
+                route_scope=inventory_route_scope,
+                symbol=fill.symbol,
+                observed_at=fill_time,
+                lots=scope_probe_lots.setdefault(route_symbol, []),
+            )
+            generation_boundary = isolation_cursor.latest_boundary_before(
+                route_scope=inventory_route_scope,
+                symbol=fill.symbol,
+                observed_at=fill_time,
+            )
+        chronology_reason = (
+            fifo_chronology_ambiguity_reason_at(
+                ambiguous_buckets=ambiguous_buckets,
+                isolation_cursor=isolation_cursor,
+                route_scope=inventory_route_scope,
+                symbol=fill.symbol,
+                observed_at=fill_time,
+            )
+            if route_scope is not None
+            else None
+        )
+        outcome = ledger.observe(
+            fill=fill,
+            route_scope=route_scope,
+            evidence_available=evidence_available,
+            chronology_reason=chronology_reason,
+            generation_boundary=generation_boundary,
+        )
+        if outcome is None:
+            continue
+        if outcome.learning_eligible:
+            assert route_scope is not None
+            for allocation in outcome.allocations:
+                trade = _closed_trade(
+                    lot=OpenLot(
+                        quantity=allocation.quantity,
+                        price=Decimal(allocation.fill.price),
+                        filled_at=_normalize_utc(allocation.fill.filled_at),
+                        fill=allocation.fill,
+                    ),
+                    sell_fill=fill,
+                    quantity=allocation.quantity,
+                    route_scope=route_scope,
+                )
+                trade.update(strategy_family_outcome_fields(outcome))
+                closed.append(trade)
+            continue
+
+        trade = _legacy_sell_estimate_trade(
+            sell_fill=fill,
+            quantity=outcome.requested_quantity,
+            cost_basis=None,
+            route_scope=route_scope,
+            scope_quality_available=route_scope is not None,
+            quality_flag=f"strategy_family_{outcome.status}",
+        )
+        trade.update(strategy_family_outcome_fields(outcome))
+        trade["profitability_eligible"] = False
+        trade["realized_pnl_krw"] = None
+        trade["net_realized_pnl_krw"] = None
+        trade["outcome_bucket"] = "unavailable"
+        closed.append(trade)
+    return closed
+
+
 def _closed_trade(
     *,
     lot: OpenLot,
@@ -1210,6 +1588,7 @@ def _closed_trade(
         "symbol": sell_fill.symbol,
         "execution_scope": route_scope.as_payload(),
         "quantity": _quantity_value(quantity),
+        "pnl_attribution_basis": ACCOUNT_FIFO_PNL_BASIS,
         "buy": _fill_payload(fill=lot.fill, order=buy_order, item=buy_item, quantity=quantity),
         "sell": _fill_payload(fill=sell_fill, order=sell_order, item=sell_item, quantity=quantity),
         "realized_pnl_krw": _decimal_text(analysis_pnl)
@@ -1331,6 +1710,7 @@ def _legacy_sell_estimate_trade(
             route_scope.as_payload() if route_scope is not None else None
         ),
         "quantity": quantity,
+        "pnl_attribution_basis": ACCOUNT_FIFO_PNL_BASIS,
         "buy": {
             "filled_at": cost_basis.observed_at.isoformat()
             if cost_basis is not None and cost_basis.observed_at is not None
@@ -2860,7 +3240,13 @@ def _monday_pre_market_checks(
     return checks
 
 
-def _lessons(closed_trades: list[dict[str, object]], *, max_lessons: int) -> dict[str, object]:
+def _lessons(
+    closed_trades: list[dict[str, object]],
+    *,
+    max_lessons: int,
+    strategy_scope: dict[str, object] | None = None,
+    execution_authority: bool = False,
+) -> dict[str, object]:
     eligible_trades = [
         trade for trade in closed_trades if trade.get("profitability_eligible") is True
     ]
@@ -2877,20 +3263,349 @@ def _lessons(closed_trades: list[dict[str, object]], *, max_lessons: int) -> dic
         reason = str(decision.get("reason_code") or "unknown")
         profile_stats.setdefault(profile, []).append(pnl)
         reason_stats.setdefault(reason, []).append(pnl)
+    aggregate_scope = strategy_scope or _unavailable_strategy_scope(
+        evidence_status="cross_scope_aggregate"
+    )
+    negative_profiles = _negative_patterns(
+        profile_stats,
+        max_lessons=max_lessons,
+    )
+    positive_profiles = _positive_patterns(
+        profile_stats,
+        max_lessons=max_lessons,
+    )
+    negative_reasons = _negative_patterns(
+        reason_stats,
+        max_lessons=max_lessons,
+    )
+    for pattern in negative_profiles + positive_profiles + negative_reasons:
+        pattern["strategy_scope"] = dict(aggregate_scope)
     return {
         "worst_losses": [_lesson_trade(row) for row in worst_losses],
-        "patterns_to_downsize_or_reject": _negative_patterns(profile_stats, max_lessons=max_lessons),
-        "positive_expectancy_patterns": _positive_patterns(profile_stats, max_lessons=max_lessons),
-        "negative_reason_codes": _negative_patterns(reason_stats, max_lessons=max_lessons),
+        "patterns_to_downsize_or_reject": negative_profiles,
+        "positive_expectancy_patterns": positive_profiles,
+        "negative_reason_codes": negative_reasons,
         "eligible_trade_count": len(eligible_trades),
         "excluded_degraded_trade_count": len(closed_trades) - len(eligible_trades),
+        "execution_authority": execution_authority,
+        "strategy_scope": dict(aggregate_scope),
     }
+
+
+def _normalized_decision_lane(value: object) -> str | None:
+    normalized = str(value or "").strip().lower()
+    return normalized or None
+
+
+def _unavailable_strategy_scope(
+    *,
+    evidence_status: str,
+    decision_lane: str | None = None,
+    entry_family_key: str | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": STRATEGY_SCOPE_VERSION,
+        "status": "unavailable",
+        "consumer_eligible": False,
+        "decision_lane": decision_lane,
+        "entry_family_key": entry_family_key,
+        "evidence_status": evidence_status,
+    }
+
+
+def _strategy_scope_for_trade(trade: dict[str, object]) -> dict[str, object]:
+    attributed_lane = _normalized_decision_lane(
+        trade.get("strategy_decision_agent_name")
+    )
+    lineage_lane = _normalized_decision_lane(trade.get("decision_agent_name"))
+    lane = attributed_lane or lineage_lane
+    entry_family_key = _nonempty_text(
+        trade.get("strategy_entry_family_key")
+    )
+    attribution_status = str(
+        trade.get("strategy_family_attribution_status") or "unavailable"
+    ).strip()
+    execution_scope = trade.get("execution_scope")
+    exact_execution_scope = bool(
+        isinstance(execution_scope, dict)
+        and _nonempty_text(execution_scope.get("provider")) is not None
+        and _nonempty_text(execution_scope.get("account_scope")) is not None
+    )
+    exact = bool(
+        attribution_status == "exact"
+        and trade.get("strategy_family_learning_eligible") is True
+        and _trade_has_learning_lineage(trade)
+        and lane in ACTIONABLE_DECISION_LANES
+        and attributed_lane == lane
+        and lineage_lane == lane
+        and entry_family_key is not None
+        and exact_execution_scope
+    )
+    if exact:
+        return {
+            "schema_version": STRATEGY_SCOPE_VERSION,
+            "status": "exact",
+            "consumer_eligible": True,
+            "decision_lane": lane,
+            "entry_family_key": entry_family_key,
+            "evidence_status": "exact",
+        }
+    evidence_status = attribution_status
+    if attribution_status == "exact" and not _trade_has_learning_lineage(trade):
+        evidence_status = "incomplete_decision_lineage"
+    elif attribution_status == "exact" and lane not in ACTIONABLE_DECISION_LANES:
+        evidence_status = "unknown_decision_lane"
+    elif attribution_status == "exact" and (
+        attributed_lane != lane or lineage_lane != lane
+    ):
+        evidence_status = "decision_lane_lineage_mismatch"
+    elif attribution_status == "exact" and entry_family_key is None:
+        evidence_status = "missing_entry_family_key"
+    elif attribution_status == "exact" and not exact_execution_scope:
+        evidence_status = "incomplete_execution_scope"
+    return _unavailable_strategy_scope(
+        evidence_status=evidence_status,
+        decision_lane=lane,
+        entry_family_key=entry_family_key,
+    )
+
+
+def _with_strategy_scope(trade: dict[str, object]) -> dict[str, object]:
+    scoped = dict(trade)
+    scoped["strategy_scope"] = _strategy_scope_for_trade(scoped)
+    return scoped
+
+
+def _candidate_rule_replay_with_scope(
+    candidate_rule_replay: dict[str, object],
+    *,
+    strategy_scope: dict[str, object],
+    execution_authority: bool,
+) -> dict[str, object]:
+    scoped = dict(candidate_rule_replay)
+    scoped["execution_authority"] = execution_authority
+    scoped["strategy_scope"] = dict(strategy_scope)
+    raw_rules = candidate_rule_replay.get("rules")
+    if isinstance(raw_rules, list):
+        scoped["rules"] = [
+            {
+                **rule,
+                "execution_authority": execution_authority,
+                "strategy_scope": dict(strategy_scope),
+            }
+            for rule in raw_rules
+            if isinstance(rule, dict)
+        ]
+    return scoped
+
+
+def _lane_execution_account_scope(
+    closed_trades: list[dict[str, object]],
+    *,
+    additional_scopes: list[dict[str, object]] | None = None,
+) -> dict[str, object] | None:
+    scopes: set[tuple[str, str]] = set()
+    exchanges: set[str] = set()
+    for trade in closed_trades:
+        execution_scope = trade.get("execution_scope")
+        if not isinstance(execution_scope, dict):
+            return None
+        provider = _nonempty_text(execution_scope.get("provider"))
+        account_scope = _nonempty_text(execution_scope.get("account_scope"))
+        if provider is None or account_scope is None:
+            return None
+        scopes.add((provider.lower(), account_scope))
+        exchange = _nonempty_text(execution_scope.get("exchange"))
+        if exchange is not None:
+            exchanges.add(exchange.upper())
+    for execution_scope in additional_scopes or []:
+        provider = _nonempty_text(execution_scope.get("provider"))
+        account_scope = _nonempty_text(execution_scope.get("account_scope"))
+        if provider is None or account_scope is None:
+            return None
+        scopes.add((provider.lower(), account_scope))
+        exchange = _nonempty_text(execution_scope.get("exchange"))
+        if exchange is not None:
+            exchanges.add(exchange.upper())
+    if len(scopes) != 1:
+        return None
+    provider, account_scope = next(iter(scopes))
+    return {
+        "provider": provider,
+        "account_scope": account_scope,
+        "exchanges": sorted(exchanges),
+    }
+
+
+def _strategy_learning_by_lane(
+    *,
+    settings: Settings,
+    closed_trades: list[dict[str, object]],
+    max_lessons: int,
+    duplicate_fill_conflict_evidence: dict[str, object],
+    report_execution_account_scope: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    exact_by_lane: dict[str, list[dict[str, object]]] = {}
+    incomplete_by_lane: dict[str, list[dict[str, object]]] = {}
+    unknown_incomplete_count = 0
+    for trade in closed_trades:
+        scope = trade.get("strategy_scope")
+        if not isinstance(scope, dict) or scope.get("consumer_eligible") is not True:
+            lane = (
+                _normalized_decision_lane(scope.get("decision_lane"))
+                if isinstance(scope, dict)
+                else None
+            )
+            if lane in ACTIONABLE_DECISION_LANES:
+                incomplete_by_lane.setdefault(lane, []).append(trade)
+            else:
+                unknown_incomplete_count += 1
+            continue
+        lane = _normalized_decision_lane(scope.get("decision_lane"))
+        if lane not in ACTIONABLE_DECISION_LANES:
+            unknown_incomplete_count += 1
+            continue
+        exact_by_lane.setdefault(lane, []).append(trade)
+
+    raw_conflict_lanes = duplicate_fill_conflict_evidence.get("decision_lanes")
+    conflict_lanes = {
+        lane
+        for raw_lane in raw_conflict_lanes
+        if (lane := _normalized_decision_lane(raw_lane))
+        in ACTIONABLE_DECISION_LANES
+    } if isinstance(raw_conflict_lanes, list) else set()
+    ambiguous_conflict_count = int(
+        duplicate_fill_conflict_evidence.get(
+            "ambiguous_conflict_group_count",
+            0,
+        )
+        or 0
+    )
+    raw_conflict_groups = duplicate_fill_conflict_evidence.get("groups")
+    conflict_groups = (
+        [group for group in raw_conflict_groups if isinstance(group, dict)]
+        if isinstance(raw_conflict_groups, list)
+        else []
+    )
+    result: dict[str, dict[str, object]] = {}
+    lanes = sorted(
+        set(exact_by_lane) | set(incomplete_by_lane) | conflict_lanes
+    )
+    for lane in lanes:
+        lane_trades = exact_by_lane.get(lane, [])
+        lane_incomplete_trades = incomplete_by_lane.get(lane, [])
+        candidate_rule_replay = _candidate_rule_replay(
+            settings=settings,
+            closed_trades=lane_trades,
+        )
+        quality_gate = _feedback_learning_quality_gate(
+            closed_trades=lane_trades,
+            candidate_rule_replay=candidate_rule_replay,
+            duplicate_fill_economic_conflict=(
+                lane in conflict_lanes or ambiguous_conflict_count > 0
+            ),
+        )
+        blocked_reasons = list(quality_gate.get("blocked_reasons") or [])
+        if lane_incomplete_trades or unknown_incomplete_count:
+            blocked_reasons.append("incomplete_strategy_lane_attribution")
+        lane_conflict_scopes = [
+            scope
+            for group in conflict_groups
+            if _normalized_decision_lane(group.get("decision_lane")) == lane
+            and isinstance(
+                scope := group.get("execution_account_scope"),
+                dict,
+            )
+        ]
+        execution_account_scope = _lane_execution_account_scope(
+            lane_trades + lane_incomplete_trades,
+            additional_scopes=lane_conflict_scopes,
+        )
+        if (
+            execution_account_scope is None
+            and not lane_trades
+            and not lane_incomplete_trades
+            and report_execution_account_scope.get("status") == "single"
+        ):
+            execution_account_scope = {
+                "provider": report_execution_account_scope.get("provider"),
+                "account_scope": report_execution_account_scope.get(
+                    "account_scope"
+                ),
+                "exchanges": [report_execution_account_scope["exchange"]]
+                if report_execution_account_scope.get("exchange")
+                else [],
+            }
+        if execution_account_scope is None:
+            blocked_reasons.append("mixed_or_incomplete_execution_account_scope")
+        blocked_reasons = list(dict.fromkeys(blocked_reasons))
+        consumer_eligible = not blocked_reasons
+        lane_scope = {
+            "schema_version": STRATEGY_SCOPE_VERSION,
+            "status": "exact" if consumer_eligible else "unavailable",
+            "consumer_eligible": consumer_eligible,
+            "decision_lane": lane,
+            "entry_family_key": None,
+            "evidence_status": (
+                "exact_family_partition"
+                if consumer_eligible
+                else "incomplete_strategy_lane_attribution"
+                if lane_incomplete_trades or unknown_incomplete_count
+                else "lane_learning_blocked"
+            ),
+        }
+        result[lane] = {
+            "schema_version": STRATEGY_LANE_LEARNING_VERSION,
+            "status": "ready" if consumer_eligible else "blocked",
+            "consumer_eligible": consumer_eligible,
+            "execution_authority": consumer_eligible,
+            "blocked_reasons": blocked_reasons,
+            "decision_lane": lane,
+            "strategy_scope": lane_scope,
+            "execution_account_scope": execution_account_scope,
+            "closed_trade_count": len(lane_trades),
+            "excluded_unattributed_trade_count": len(lane_incomplete_trades),
+            "unknown_or_ambiguous_lane_trade_count": unknown_incomplete_count,
+            "duplicate_fill_conflict_group_count": sum(
+                _normalized_decision_lane(group.get("decision_lane")) == lane
+                for group in conflict_groups
+            ),
+            "ambiguous_duplicate_fill_conflict_group_count": (
+                ambiguous_conflict_count
+            ),
+            "entry_family_keys": sorted(
+                {
+                    str(trade["strategy_scope"]["entry_family_key"])
+                    for trade in lane_trades
+                }
+            ),
+            "summary": _summary(lane_trades),
+            "lessons": _lessons(
+                lane_trades,
+                max_lessons=max_lessons,
+                strategy_scope=lane_scope,
+                execution_authority=consumer_eligible,
+            ),
+            "candidate_rule_replay": _candidate_rule_replay_with_scope(
+                candidate_rule_replay,
+                strategy_scope=lane_scope,
+                execution_authority=consumer_eligible,
+            ),
+            "quality_gate": {
+                **quality_gate,
+                "status": "ready" if consumer_eligible else "blocked",
+                "consumer_eligible": consumer_eligible,
+                "blocked_reasons": blocked_reasons,
+            },
+        }
+    return result
 
 
 def _feedback_learning_quality_gate(
     *,
     closed_trades: list[dict[str, object]],
     candidate_rule_replay: dict[str, object],
+    duplicate_fill_economic_conflict: bool = False,
 ) -> dict[str, object]:
     eligible_trades = [
         trade for trade in closed_trades if trade.get("profitability_eligible") is True
@@ -2910,6 +3625,13 @@ def _feedback_learning_quality_gate(
         isinstance(trade.get("execution_scope"), dict)
         for trade in closed_trades
     )
+    strategy_family_evidence_present = any(
+        "strategy_family_attribution_status" in trade for trade in closed_trades
+    )
+    strategy_family_eligible_count = sum(
+        trade.get("strategy_family_learning_eligible") is True
+        for trade in closed_trades
+    )
     blocked_reasons: list[str] = []
     if not closed_trades:
         status = "no_data"
@@ -2925,9 +3647,17 @@ def _feedback_learning_quality_gate(
             blocked_reasons.append("incomplete_execution_scope_coverage")
         if len(lineage_eligible_trades) != len(closed_trades):
             blocked_reasons.append("incomplete_decision_lineage_coverage")
+        if (
+            strategy_family_evidence_present
+            and strategy_family_eligible_count != len(closed_trades)
+        ):
+            blocked_reasons.append("incomplete_strategy_family_attribution")
         if candidate_rule_replay.get("status") != "ready":
             blocked_reasons.append("candidate_replay_not_ready")
         status = "blocked" if blocked_reasons else "ready"
+    if duplicate_fill_economic_conflict:
+        blocked_reasons.append("duplicate_fill_economic_conflict")
+        status = "blocked"
     return {
         "schema_version": LEARNING_QUALITY_GATE_VERSION,
         "status": status,
@@ -2939,6 +3669,13 @@ def _feedback_learning_quality_gate(
         "settlement_currency_known_trade_count": currency_known_count,
         "execution_scope_known_trade_count": scope_known_count,
         "decision_lineage_complete_trade_count": len(lineage_eligible_trades),
+        "pnl_attribution_basis": (
+            STRATEGY_FAMILY_PNL_BASIS
+            if strategy_family_evidence_present
+            else ACCOUNT_FIFO_PNL_BASIS
+        ),
+        "strategy_family_attribution_present": strategy_family_evidence_present,
+        "strategy_family_eligible_trade_count": strategy_family_eligible_count,
         "candidate_replay_status": candidate_rule_replay.get("status"),
         "requirements": {
             "net_profitability": "all_closed_trades",
@@ -2960,6 +3697,9 @@ def _feedback_learning_quality_gate(
                 "decision_source_market_date",
                 "decision_run_id=decision_strategy_run_id",
             ],
+            "strategy_family_attribution": (
+                "all_closed_trades_exact_or_legacy_single_lane"
+            ),
         },
     }
 
@@ -2974,67 +3714,36 @@ def _operational_learning_context(
 ) -> dict[str, object]:
     """Aggregate bounded rejection/failure evidence without granting buy authority."""
 
-    failures = list(
-        db.scalars(
-            select(ExecutionFailure)
-            .where(
-                ExecutionFailure.mode == settings.runtime_mode,
-                ExecutionFailure.latest_failed_at >= started_at,
-                ExecutionFailure.latest_failed_at <= as_of,
-            )
-            .options(
-                load_only(
-                    ExecutionFailure.id,
-                    ExecutionFailure.execution_plan_item_id,
-                    ExecutionFailure.strategy_run_id,
-                    ExecutionFailure.decision_actor,
-                    ExecutionFailure.side,
-                    ExecutionFailure.intent,
-                    ExecutionFailure.classification,
-                    ExecutionFailure.retryable,
-                    ExecutionFailure.status,
-                    ExecutionFailure.latest_failed_at,
-                ),
-                selectinload(ExecutionFailure.broker_order).load_only(
-                    BrokerOrder.id,
-                    BrokerOrder.status,
-                    BrokerOrder.broker_name,
-                    BrokerOrder.venue,
-                    BrokerOrder.asset_class,
-                    BrokerOrder.request_metadata,
-                ),
-            )
-            .order_by(
-                ExecutionFailure.latest_failed_at.desc(),
-                ExecutionFailure.id.desc(),
-            )
-            .limit(MAX_OPERATIONAL_LEARNING_FAILURES + 1)
-        )
+    (
+        exact_scope_failures,
+        truncated,
+        scan_cap_exceeded,
+        scanned_failure_count,
+    ) = _load_scoped_operational_failures(
+        settings=settings,
+        db=db,
+        started_at=started_at,
+        as_of=as_of,
+        requested_scope=requested_scope,
     )
-    truncated = len(failures) > MAX_OPERATIONAL_LEARNING_FAILURES
-    failures = failures[:MAX_OPERATIONAL_LEARNING_FAILURES]
-    exact_scope_failures = [
-        failure
-        for failure in failures
-        if _failure_matches_feedback_scope(
-            failure=failure,
-            requested_scope=requested_scope,
-        )
+    failure_items = [
+        _operational_failure_item(failure) for failure in exact_scope_failures
     ]
-    lineage_complete = [
-        failure
-        for failure in exact_scope_failures
-        if failure.execution_plan_item_id is not None
-        and failure.strategy_run_id is not None
-        and failure.decision_actor is not None
+    exact_strategy_scope_items = [
+        item
+        for item in failure_items
+        if isinstance(item.get("strategy_scope"), dict)
+        and item["strategy_scope"].get("consumer_eligible") is True
     ]
     blocked_reasons: list[str] = []
     if requested_scope is None:
         blocked_reasons.append("exact_execution_scope_required")
     if truncated:
         blocked_reasons.append("failure_rows_truncated")
-    if len(lineage_complete) != len(exact_scope_failures):
-        blocked_reasons.append("incomplete_failure_decision_lineage")
+    if scan_cap_exceeded:
+        blocked_reasons.append("failure_scan_cap_exceeded")
+    if len(exact_strategy_scope_items) != len(exact_scope_failures):
+        blocked_reasons.append("incomplete_failure_strategy_scope")
     if not exact_scope_failures:
         status = "no_data" if requested_scope is not None else "blocked"
     else:
@@ -3050,7 +3759,9 @@ def _operational_learning_context(
     return {
         "schema_version": "operational-learning-context-v1",
         "status": status,
-        "consumer_eligible": status == "ready",
+        "consumer_eligible": False,
+        "execution_authority": False,
+        "usage": "aggregate_audit_only",
         "blocked_reasons": blocked_reasons,
         "scope": requested_scope.as_payload() if requested_scope is not None else None,
         "window": {
@@ -3058,10 +3769,13 @@ def _operational_learning_context(
             "end_at": as_of.isoformat(),
         },
         "failure_count": len(exact_scope_failures),
-        "decision_lineage_complete_failure_count": len(lineage_complete),
+        "scanned_failure_count": scanned_failure_count,
+        "failure_scan_cap": MAX_OPERATIONAL_FAILURE_SCAN_ROWS,
+        "decision_lineage_complete_failure_count": len(exact_strategy_scope_items),
         "decision_lineage_missing_failure_count": (
-            len(exact_scope_failures) - len(lineage_complete)
+            len(exact_scope_failures) - len(exact_strategy_scope_items)
         ),
+        "failure_items": failure_items,
         "classification_counts": counts(
             str(failure.classification or "unknown")
             for failure in exact_scope_failures
@@ -3084,12 +3798,396 @@ def _operational_learning_context(
         },
         "allowed_effects": ["delay", "downsize", "reject"],
         "prohibited_effects": ["approve", "increase_size"],
-        "instruction": (
-            "may_apply_negative_operational_lessons_only"
-            if status == "ready"
-            else "do_not_apply_operational_lessons"
-        ),
+        "instruction": "do_not_apply_operational_lessons",
     }
+
+
+def _load_scoped_operational_failures(
+    *,
+    settings: Settings,
+    db: Session,
+    started_at: datetime,
+    as_of: datetime,
+    requested_scope: FeedbackExecutionScope | None,
+) -> tuple[list[ExecutionFailure], bool, bool, int]:
+    if requested_scope is None:
+        return [], False, False, 0
+
+    scope_filters = [
+        ExecutionFailure.mode == settings.runtime_mode,
+        ExecutionFailure.latest_failed_at >= started_at,
+        ExecutionFailure.latest_failed_at <= as_of,
+        func.lower(BrokerOrder.broker_name) == requested_scope.provider,
+    ]
+    if requested_scope.exchange is not None:
+        requested_exchange = requested_scope.exchange
+        scope_filters.append(
+            or_(
+                func.upper(BrokerOrder.venue) == requested_exchange,
+                func.upper(
+                    BrokerOrder.request_metadata["exchange"].as_string()
+                )
+                == requested_exchange,
+                func.upper(
+                    BrokerOrder.request_metadata["route"]["exchange"].as_string()
+                )
+                == requested_exchange,
+                func.upper(
+                    BrokerOrder.request_metadata["execution_scope"][
+                        "exchange"
+                    ].as_string()
+                )
+                == requested_exchange,
+            )
+        )
+    statement = (
+        select(ExecutionFailure)
+        .join(
+            BrokerOrder,
+            ExecutionFailure.broker_order_pk == BrokerOrder.id,
+        )
+        .where(*scope_filters)
+        .options(
+            load_only(
+                ExecutionFailure.id,
+                ExecutionFailure.execution_plan_id,
+                ExecutionFailure.execution_plan_item_id,
+                ExecutionFailure.strategy_run_id,
+                ExecutionFailure.decision_actor,
+                ExecutionFailure.symbol,
+                ExecutionFailure.side,
+                ExecutionFailure.intent,
+                ExecutionFailure.classification,
+                ExecutionFailure.retryable,
+                ExecutionFailure.status,
+                ExecutionFailure.latest_failed_at,
+            ),
+            selectinload(ExecutionFailure.broker_order).load_only(
+                BrokerOrder.id,
+                BrokerOrder.execution_plan_item_id,
+                BrokerOrder.status,
+                BrokerOrder.broker_name,
+                BrokerOrder.venue,
+                BrokerOrder.asset_class,
+                BrokerOrder.request_metadata,
+            ),
+        )
+    )
+    matched: list[ExecutionFailure] = []
+    scanned_count = 0
+    cursor_time: datetime | None = None
+    cursor_id: str | None = None
+    exhausted = False
+    while (
+        scanned_count < MAX_OPERATIONAL_FAILURE_SCAN_ROWS
+        and len(matched) <= MAX_OPERATIONAL_LEARNING_FAILURES
+    ):
+        batch_limit = min(
+            OPERATIONAL_FAILURE_SCAN_BATCH_SIZE,
+            MAX_OPERATIONAL_FAILURE_SCAN_ROWS - scanned_count,
+        )
+        batch_statement = statement
+        if cursor_time is not None and cursor_id is not None:
+            batch_statement = batch_statement.where(
+                or_(
+                    ExecutionFailure.latest_failed_at < cursor_time,
+                    and_(
+                        ExecutionFailure.latest_failed_at == cursor_time,
+                        ExecutionFailure.id < cursor_id,
+                    ),
+                )
+            )
+        batch = list(
+            db.scalars(
+                batch_statement.order_by(
+                    ExecutionFailure.latest_failed_at.desc(),
+                    ExecutionFailure.id.desc(),
+                ).limit(batch_limit)
+            )
+        )
+        if not batch:
+            exhausted = True
+            break
+        scanned_count += len(batch)
+        matched.extend(
+            failure
+            for failure in batch
+            if _failure_matches_feedback_scope(
+                failure=failure,
+                requested_scope=requested_scope,
+            )
+        )
+        cursor_time = _normalize_utc(batch[-1].latest_failed_at)
+        cursor_id = batch[-1].id
+        if len(batch) < batch_limit:
+            exhausted = True
+            break
+
+    truncated = len(matched) > MAX_OPERATIONAL_LEARNING_FAILURES
+    matched = matched[:MAX_OPERATIONAL_LEARNING_FAILURES]
+    scan_cap_exceeded = False
+    if (
+        not truncated
+        and not exhausted
+        and scanned_count >= MAX_OPERATIONAL_FAILURE_SCAN_ROWS
+        and cursor_time is not None
+        and cursor_id is not None
+    ):
+        scan_cap_exceeded = (
+            db.scalar(
+                select(ExecutionFailure.id)
+                .join(
+                    BrokerOrder,
+                    ExecutionFailure.broker_order_pk == BrokerOrder.id,
+                )
+                .where(*scope_filters)
+                .where(
+                    or_(
+                        ExecutionFailure.latest_failed_at < cursor_time,
+                        and_(
+                            ExecutionFailure.latest_failed_at == cursor_time,
+                            ExecutionFailure.id < cursor_id,
+                        ),
+                    )
+                )
+                .limit(1)
+            )
+            is not None
+        )
+    return matched, truncated, scan_cap_exceeded, scanned_count
+
+
+def _operational_failure_item(
+    failure: ExecutionFailure,
+) -> dict[str, object]:
+    strategy_scope = _operational_failure_strategy_scope(failure)
+    route_scope = fifo_route_scope_from_order(failure.broker_order)
+    return {
+        "failure_id": failure.id,
+        "symbol": failure.symbol,
+        "side": failure.side,
+        "intent": failure.intent,
+        "classification": failure.classification,
+        "retryable": failure.retryable,
+        "status": failure.status,
+        "latest_failed_at": _normalize_utc(failure.latest_failed_at).isoformat(),
+        "execution_account_scope": (
+            route_scope.as_payload() if route_scope is not None else None
+        ),
+        "strategy_scope": strategy_scope,
+    }
+
+
+def _operational_failure_strategy_scope(
+    failure: ExecutionFailure,
+) -> dict[str, object]:
+    order = failure.broker_order
+    if order is None:
+        return _unavailable_strategy_scope(
+            evidence_status="broker_order_missing"
+        )
+    lineage_evidence = resolve_decision_lineage_evidence(
+        order=order,
+        fill_payload=None,
+    )
+    lineage = lineage_evidence.get("lineage")
+    immutable_lane = (
+        _normalized_decision_lane(lineage.get("decision_agent_name"))
+        if lineage_evidence.get("status") == "complete"
+        and isinstance(lineage, dict)
+        else None
+    )
+    persisted_identity, persisted_error = (
+        _persisted_order_strategy_family_identity(order)
+    )
+    entry_family_key = (
+        _nonempty_text(persisted_identity.get("entry_family_key"))
+        if isinstance(persisted_identity, dict)
+        else None
+    )
+    persisted_lane = (
+        _normalized_decision_lane(persisted_identity.get("decision_lane"))
+        if isinstance(persisted_identity, dict)
+        else None
+    )
+    route_scope = fifo_route_scope_from_order(order)
+    failure_actor = _normalized_decision_lane(failure.decision_actor)
+    operational_execution_plan_id = (
+        _nonempty_text(lineage.get("operational_execution_plan_id"))
+        if isinstance(lineage, dict)
+        else None
+    ) or (
+        _nonempty_text(lineage.get("execution_plan_id"))
+        if isinstance(lineage, dict)
+        else None
+    )
+    exact_failure_linkage = bool(
+        isinstance(lineage, dict)
+        and _nonempty_text(failure.execution_plan_id)
+        == operational_execution_plan_id
+        and _nonempty_text(failure.execution_plan_item_id)
+        == _nonempty_text(lineage.get("execution_plan_item_id"))
+        and _nonempty_text(failure.execution_plan_item_id)
+        == _nonempty_text(order.execution_plan_item_id)
+        and failure_actor == immutable_lane
+    )
+    exact = bool(
+        lineage_evidence.get("status") == "complete"
+        and immutable_lane in ACTIONABLE_DECISION_LANES
+        and persisted_error is None
+        and entry_family_key is not None
+        and persisted_lane == immutable_lane
+        and route_scope is not None
+        and exact_failure_linkage
+    )
+    if exact:
+        return {
+            "schema_version": STRATEGY_SCOPE_VERSION,
+            "status": "exact",
+            "consumer_eligible": True,
+            "decision_lane": immutable_lane,
+            "entry_family_key": entry_family_key,
+            "evidence_status": "exact_durable_failure_lineage",
+        }
+    if lineage_evidence.get("status") != "complete":
+        evidence_status = "immutable_decision_lineage_incomplete"
+    elif immutable_lane not in ACTIONABLE_DECISION_LANES:
+        evidence_status = "unknown_decision_lane"
+    elif persisted_error is not None:
+        evidence_status = persisted_error
+    elif entry_family_key is None:
+        evidence_status = "missing_entry_family_key"
+    elif persisted_lane != immutable_lane:
+        evidence_status = "decision_lane_family_mismatch"
+    elif route_scope is None:
+        evidence_status = "incomplete_execution_scope"
+    else:
+        evidence_status = "failure_order_lineage_mismatch"
+    return _unavailable_strategy_scope(
+        evidence_status=evidence_status,
+        decision_lane=(
+            immutable_lane
+            if lineage_evidence.get("status") == "complete"
+            else None
+        ),
+        entry_family_key=entry_family_key,
+    )
+
+
+def _failure_item_counts(
+    failure_items: list[dict[str, object]],
+    key: str,
+) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for item in failure_items:
+        value = str(item.get(key) or "unknown")
+        result[value] = result.get(value, 0) + 1
+    return dict(sorted(result.items()))
+
+
+def _operational_learning_by_lane(
+    *,
+    operational_learning_context: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    raw_items = operational_learning_context.get("failure_items")
+    failure_items = (
+        [item for item in raw_items if isinstance(item, dict)]
+        if isinstance(raw_items, list)
+        else []
+    )
+    exact_by_lane: dict[str, list[dict[str, object]]] = {}
+    incomplete_by_lane: dict[str, list[dict[str, object]]] = {}
+    unknown_incomplete_count = 0
+    for item in failure_items:
+        scope = item.get("strategy_scope")
+        lane = (
+            _normalized_decision_lane(scope.get("decision_lane"))
+            if isinstance(scope, dict)
+            else None
+        )
+        if (
+            isinstance(scope, dict)
+            and scope.get("consumer_eligible") is True
+            and lane in ACTIONABLE_DECISION_LANES
+        ):
+            exact_by_lane.setdefault(lane, []).append(item)
+        elif lane in ACTIONABLE_DECISION_LANES:
+            incomplete_by_lane.setdefault(lane, []).append(item)
+        else:
+            unknown_incomplete_count += 1
+
+    result: dict[str, dict[str, object]] = {}
+    for lane in sorted(set(exact_by_lane) | set(incomplete_by_lane)):
+        exact_items = exact_by_lane.get(lane, [])
+        incomplete_items = incomplete_by_lane.get(lane, [])
+        blocked_reasons: list[str] = []
+        if not exact_items:
+            blocked_reasons.append("no_exact_operational_failures")
+        if incomplete_items or unknown_incomplete_count:
+            blocked_reasons.append("incomplete_strategy_lane_attribution")
+        if "failure_rows_truncated" in (
+            operational_learning_context.get("blocked_reasons") or []
+        ):
+            blocked_reasons.append("failure_rows_truncated")
+        if "failure_scan_cap_exceeded" in (
+            operational_learning_context.get("blocked_reasons") or []
+        ):
+            blocked_reasons.append("failure_scan_cap_exceeded")
+        execution_account_scope = operational_learning_context.get("scope")
+        if not isinstance(execution_account_scope, dict):
+            blocked_reasons.append("exact_execution_scope_required")
+            execution_account_scope = None
+        consumer_eligible = not blocked_reasons
+        lane_scope = {
+            "schema_version": STRATEGY_SCOPE_VERSION,
+            "status": "exact" if consumer_eligible else "unavailable",
+            "consumer_eligible": consumer_eligible,
+            "decision_lane": lane,
+            "entry_family_key": None,
+            "evidence_status": (
+                "exact_family_partition"
+                if consumer_eligible
+                else "incomplete_strategy_lane_attribution"
+                if incomplete_items or unknown_incomplete_count
+                else "lane_operational_learning_blocked"
+            ),
+        }
+        result[lane] = {
+            "schema_version": STRATEGY_LANE_OPERATIONAL_VERSION,
+            "status": "ready" if consumer_eligible else "blocked",
+            "consumer_eligible": consumer_eligible,
+            "execution_authority": consumer_eligible,
+            "blocked_reasons": blocked_reasons,
+            "decision_lane": lane,
+            "strategy_scope": lane_scope,
+            "execution_account_scope": execution_account_scope,
+            "failure_count": len(exact_items),
+            "excluded_unattributed_failure_count": len(incomplete_items),
+            "unknown_or_ambiguous_lane_failure_count": unknown_incomplete_count,
+            "entry_family_keys": sorted(
+                {
+                    str(item["strategy_scope"]["entry_family_key"])
+                    for item in exact_items
+                }
+            ),
+            "classification_counts": _failure_item_counts(
+                exact_items,
+                "classification",
+            ),
+            "failure_status_counts": _failure_item_counts(
+                exact_items,
+                "status",
+            ),
+            "failure_items": exact_items,
+            "allowed_effects": ["delay", "downsize", "reject"],
+            "prohibited_effects": ["approve", "increase_size"],
+            "instruction": (
+                "may_apply_negative_operational_lessons_only"
+                if consumer_eligible
+                else "do_not_apply_operational_lessons"
+            ),
+        }
+    return result
 
 
 def _failure_matches_feedback_scope(
@@ -4634,6 +5732,13 @@ def _lesson_trade(trade: dict[str, object]) -> dict[str, object]:
         "target_profile": decision.get("target_profile"),
         "reason_code": decision.get("reason_code"),
         "decision_run_id": trade.get("decision_run_id"),
+        "strategy_scope": (
+            dict(trade["strategy_scope"])
+            if isinstance(trade.get("strategy_scope"), dict)
+            else _unavailable_strategy_scope(
+                evidence_status="strategy_scope_missing"
+            )
+        ),
     }
 
 

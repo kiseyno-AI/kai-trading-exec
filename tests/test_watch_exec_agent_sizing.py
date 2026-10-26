@@ -2177,6 +2177,113 @@ def _resolve_live_watch_veto(
         engine.dispose()
 
 
+def test_trigger_time_watch_buy_rechecks_same_lane_open_order() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        automation_enabled=True,
+        execution_position_account_scope="trigger-time-lane-test",
+    )
+    engine, session, item_id = _watch_veto_plan(
+        settings=settings,
+        risk_context={},
+    )
+    try:
+        resume_runtime(
+            settings=settings,
+            db=session,
+            command=ControlCommand(
+                actor="test",
+                source="test",
+                reason="exercise trigger-time lane guard",
+            ),
+        )
+        candidate = session.get(ExecutionPlanItem, item_id)
+        assert candidate is not None
+        signal_entry = ExecutionPlanItem(
+            plan=candidate.plan,
+            plan_item_index=10,
+            symbol=candidate.symbol,
+            side="buy",
+            intent="intraday_watch_buy",
+            status="broker_order_submitted",
+            decision_agent_name="signal-decider",
+            source_plan_item_id="signal-open-order-family",
+            provider="kis",
+            venue="KRX",
+            asset_class="stock",
+            risk_context={"exchange": "KRX"},
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+        session.add(signal_entry)
+        session.flush()
+        identity = build_position_identity(
+            settings=settings,
+            provider="kis",
+            exchange="KRX",
+        )
+        session.add(
+            BrokerOrder(
+                broker_name="kis",
+                mode="paper",
+                execution_plan_item_id=signal_entry.id,
+                idempotency_key="signal-lane-open-buy",
+                broker_order_id="signal-lane-open-buy",
+                symbol=candidate.symbol,
+                side="buy",
+                status="submitted",
+                quantity=1,
+                limit_price=Decimal("71000"),
+                venue="KRX",
+                asset_class="stock",
+                request_metadata={
+                    "exchange": "KRX",
+                    "execution_scope": execution_scope_payload(
+                        identity=identity,
+                        venue="KRX",
+                        asset_class="stock",
+                    ),
+                },
+            )
+        )
+        session.commit()
+        adapter = WatchSizingBrokerStub(
+            reconcile_payloads=[],
+            snapshot=BrokerAccountSnapshot(
+                available_cash=Decimal("10000000"),
+                buying_power=Decimal("10000000"),
+                observed_at=datetime.now(UTC),
+                source="stub:trigger-time-lane-guard",
+                broker_account_id="trigger-time-lane-test-account",
+            ),
+        )
+
+        other_lane = _resolve_watch_buy_order(
+            settings=settings,
+            db=session,
+            adapter=adapter,
+            item=candidate,
+            observed_price=Decimal("71000"),
+            price=_price(),
+        )
+        assert other_lane.quantity is not None
+
+        signal_entry.decision_agent_name = "short-term-decider"
+        session.commit()
+        same_lane = _resolve_watch_buy_order(
+            settings=settings,
+            db=session,
+            adapter=adapter,
+            item=candidate,
+            observed_price=Decimal("71000"),
+            price=_price(),
+        )
+        assert same_lane.quantity is None
+        assert same_lane.reason == "duplicate_open_buy_order"
+    finally:
+        session.close()
+        engine.dispose()
+
+
 def test_live_watch_buy_rejects_reported_unverified_watch_approval() -> None:
     approval, audit_summary, audit_payload = _resolve_live_watch_veto(
         settings=_watch_veto_settings(),
@@ -3333,6 +3440,124 @@ def test_candidate_payload_omits_decider_flow_short_sector_context_for_legacy_pa
     assert payload["supporting_evidence"] == ["legacy evidence"]
 
 
+@pytest.mark.parametrize("signal_action", ("wait", "reject"))
+def test_candidate_payload_excludes_cross_lane_signal_authority_from_short_term_sizing(
+    signal_action: str,
+) -> None:
+    risk_context: dict[str, object] = {
+        "target_price": "76000",
+        "stop_price": "69000",
+        "signal_decider_alignment": f"{signal_action}_conflict_block",
+        "alignment_gate_action": signal_action,
+        "alignment_gate": {
+            "signal_decider_action": signal_action,
+            "signal_decider_context": {
+                "data_quality_warnings": ["signal_decider alignment warning"]
+            },
+        },
+        "signal_decider_crosscheck": {
+            "action": signal_action,
+            "warning": "signal_decider cross-lane warning",
+        },
+        "data_quality_warnings": [
+            "candidate quote is one minute old",
+            f"signal_decider_{signal_action}_alignment_warning",
+        ],
+        "validation": {
+            "short_term_entry_quality": {"status": "ready"},
+            "alignment_gate": {"action": signal_action},
+            "warning_codes": [
+                "candidate_spread_warning",
+                f"signal_decider_{signal_action}_conflict",
+            ],
+        },
+    }
+    original = deepcopy(risk_context)
+    item = _watch_item(risk_context=risk_context)
+
+    candidate = _candidate_payload(item)
+    request = _sizing_request_payload(
+        settings=Settings(
+            runtime_mode="paper",
+            trade_outcome_feedback_enabled=False,
+        ),
+        plan=ExecutionPlan(
+            external_plan_id=f"cross-lane-{signal_action}",
+            market_date=date(2026, 6, 4),
+            items=[item],
+        ),
+        candidates=[candidate],
+        account_context={"available": True, "orderable_cash_krw": "1000000"},
+        candidate_universe=_candidate_universe_payload([candidate]),
+    )
+
+    assert item.risk_context == original
+    assert candidate["data_quality_warnings"] == [
+        "candidate quote is one minute old"
+    ]
+    assert candidate["validation"] == {
+        "short_term_entry_quality": {"status": "ready"},
+        "warning_codes": ["candidate_spread_warning"],
+    }
+    for forbidden_key in (
+        "signal_decider_alignment",
+        "alignment_gate_action",
+        "alignment_gate",
+        "signal_decider_crosscheck",
+    ):
+        assert forbidden_key not in candidate
+    request_candidate = request["candidates"][0]
+    assert request_candidate["data_quality_warnings"] == [
+        "candidate quote is one minute old"
+    ]
+    assert "signal_decider" not in json.dumps(
+        request_candidate,
+        ensure_ascii=False,
+    ).casefold()
+
+    baseline = _candidate_payload(
+        _watch_item(
+            item_id=item.id,
+            symbol=item.symbol,
+            risk_context={
+                "target_price": "76000",
+                "stop_price": "69000",
+                "data_quality_warnings": ["candidate quote is one minute old"],
+                "validation": {
+                    "short_term_entry_quality": {"status": "ready"},
+                    "warning_codes": ["candidate_spread_warning"],
+                },
+            },
+        )
+    )
+    assert watch_sizing._sizing_candidate_priority_key(candidate) == (
+        watch_sizing._sizing_candidate_priority_key(baseline)
+    )
+
+
+def test_candidate_payload_excludes_cross_lane_short_term_authority_from_signal_sizing() -> None:
+    item = _watch_item(
+        risk_context={
+            "target_price": "76000",
+            "stop_price": "69000",
+            "short_term_decider_crosscheck": {
+                "action": "reject",
+                "warning": "opposite lane evidence",
+            },
+            "data_quality_warnings": [
+                "own signal warning",
+                "short-term-decider rejected tactical entry",
+            ],
+        }
+    )
+    item.decision_agent_name = "signal-decider"
+
+    candidate = _candidate_payload(item)
+
+    assert "short_term_decider_crosscheck" not in candidate
+    assert candidate["data_quality_warnings"] == ["own signal warning"]
+
+
 def test_sizing_request_payload_includes_allowed_action_envelope() -> None:
     settings = Settings(runtime_mode="live")
     item = _watch_item(
@@ -3361,6 +3586,298 @@ def test_sizing_request_payload_includes_allowed_action_envelope() -> None:
     assert "buy" in envelope["allowed_actions"]
     assert envelope["max_quantity"] == 11
     assert envelope["max_notional_krw"] == "800000.0000"
+
+
+def _lane_scoped_feedback_fixture() -> dict[str, object]:
+    def learning(lane: str) -> dict[str, object]:
+        return {
+            "schema_version": "strategy-lane-learning-v1",
+            "status": "ready",
+            "consumer_eligible": True,
+            "execution_authority": True,
+            "decision_lane": lane,
+            "summary": {"lane": lane},
+            "lessons": [{"lesson": f"{lane}-loss-pattern"}],
+            "quality_gate": {
+                "status": "ready",
+                "consumer_eligible": True,
+                "blocked_reasons": [],
+            },
+        }
+
+    def operational(lane: str) -> dict[str, object]:
+        return {
+            "schema_version": "strategy-lane-operational-learning-v1",
+            "status": "ready",
+            "consumer_eligible": True,
+            "decision_lane": lane,
+            "failure_count": 1,
+            "classification_counts": {f"{lane}-failure": 1},
+            "allowed_effects": ["delay", "downsize", "reject"],
+            "prohibited_effects": ["approve", "increase_size"],
+        }
+
+    return {
+        "status": "ready",
+        "consumer_eligible": False,
+        "execution_authority": False,
+        "summary": {"aggregate_audit_only": True},
+        "strategy_learning_by_lane": {
+            lane: learning(lane)
+            for lane in ("short-term-decider", "signal-decider")
+        },
+        "operational_learning_by_lane": {
+            lane: operational(lane)
+            for lane in ("short-term-decider", "signal-decider")
+        },
+    }
+
+
+def test_watch_sizing_batches_and_feedback_are_exact_lane_scoped(
+    monkeypatch,
+) -> None:
+    short_item = _watch_item(
+        item_id="lane-short-item",
+        symbol="005930",
+        risk_context={"target_price": "76000", "stop_price": "69000"},
+    )
+    signal_item = _watch_item(
+        item_id="lane-signal-item",
+        symbol="000660",
+        risk_context={"target_price": "150000", "stop_price": "130000"},
+    )
+    signal_item.decision_agent_name = "signal-decider"
+    plan = ExecutionPlan(
+        external_plan_id="lane-scoped-watch-plan",
+        market_date=date(2026, 6, 4),
+        items=[short_item, signal_item],
+    )
+    candidates = [_candidate_payload(short_item), _candidate_payload(signal_item)]
+    batches = watch_sizing._lane_scoped_sizing_batches(
+        candidates,
+        batch_size=10,
+    )
+    assert [
+        [candidate["decision_agent_name"] for candidate in batch]
+        for batch in batches
+    ] == [["short-term-decider"], ["signal-decider"]]
+    monkeypatch.setattr(
+        watch_sizing,
+        "load_latest_trade_outcome_feedback_snippet",
+        lambda *_, **__: _lane_scoped_feedback_fixture(),
+    )
+    account_context: dict[str, object] = {
+        "available": True,
+        "orderable_cash_krw": "100000",
+        "buying_power_krw": "100000",
+        "holdings": [],
+        "open_orders": [],
+        "execution_account_scope": {
+            "provider": "kis",
+            "account_scope": "lane-feedback-account",
+        },
+    }
+
+    short_request = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        candidates=batches[0],
+        account_context=account_context,
+        candidate_universe=_candidate_universe_payload(batches[0]),
+    )
+    watch_sizing._reserve_approved_notional_in_account_context(
+        account_context=account_context,
+        summary={
+            "approved_reservations": [
+                {
+                    "approved_notional_krw": "40000",
+                    "quantity": 1,
+                    "sizing_price": "40000",
+                    "symbol": "005930",
+                    "source_candidate_id": "lane-short-item",
+                    "decision_agent_name": "short-term-decider",
+                }
+            ]
+        },
+    )
+    signal_request = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        candidates=batches[1],
+        account_context=account_context,
+        candidate_universe=_candidate_universe_payload(batches[1]),
+    )
+
+    assert short_request["decision_lane"] == "short-term-decider"
+    assert short_request["candidate_universe"]["candidate_count"] == 1
+    assert short_request["candidate_universe"]["candidates"][0]["symbol"] == (
+        "005930"
+    )
+    assert short_request["trade_outcome_feedback"]["summary"] == {
+        "lane": "short-term-decider"
+    }
+    assert short_request["trade_outcome_feedback"][
+        "operational_learning_context"
+    ]["classification_counts"] == {"short-term-decider-failure": 1}
+    assert "aggregate_audit_only" not in json.dumps(short_request)
+
+    assert signal_request["decision_lane"] == "signal-decider"
+    assert signal_request["candidate_universe"]["candidate_count"] == 1
+    assert signal_request["candidate_universe"]["candidates"][0]["symbol"] == (
+        "000660"
+    )
+    assert signal_request["trade_outcome_feedback"]["summary"] == {
+        "lane": "signal-decider"
+    }
+    assert signal_request["account_context"]["orderable_cash_krw"] == (
+        "60000.0000"
+    )
+
+
+def test_watch_sizing_never_uses_global_feedback_without_account_scope(
+    monkeypatch,
+) -> None:
+    item = _watch_item(
+        item_id="missing-feedback-scope-item",
+        symbol="005930",
+        risk_context={"target_price": "76000", "stop_price": "69000"},
+    )
+    plan = ExecutionPlan(
+        external_plan_id="missing-feedback-scope-plan",
+        market_date=date(2026, 6, 4),
+        items=[item],
+    )
+
+    def forbidden_global_load(*_args, **_kwargs):
+        raise AssertionError("unscoped global feedback must not be loaded")
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "load_latest_trade_outcome_feedback_snippet",
+        forbidden_global_load,
+    )
+    candidate = _candidate_payload(item)
+
+    request = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        candidates=[candidate],
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "100000",
+            "buying_power_krw": "100000",
+            "holdings": [],
+            "open_orders": [],
+        },
+        candidate_universe=_candidate_universe_payload([candidate]),
+    )
+
+    assert request["trade_outcome_feedback"]["status"] == "unavailable"
+    assert request["trade_outcome_feedback"]["reason"] == (
+        "strategy_lane_learning_unavailable"
+    )
+
+
+def test_watch_sizing_account_projection_keeps_shared_exposure_without_other_lane_identity() -> None:
+    item = _watch_item(
+        item_id="lane-account-watch-item",
+        symbol="005930",
+        risk_context={"target_price": "120", "stop_price": "90"},
+    )
+    plan = ExecutionPlan(
+        external_plan_id="lane-account-watch-plan",
+        market_date=date.today(),
+        items=[item],
+    )
+    account_context = _fresh_account_context(
+        holdings=[{"symbol": "005930", "quantity": 3, "average_price": "100"}],
+        holding_quantities_by_decision_lane={
+            "005930": {"short-term-decider": 1, "signal-decider": 2},
+        },
+        holding_lane_attribution_complete_by_symbol={"005930": True},
+        open_orders=[
+            {
+                "symbol": "005930",
+                "side": "buy",
+                "quantity": 1,
+                "remaining_quantity": 1,
+                "status": "open",
+                "limit_price": "100",
+                "broker_order_id": "short-order",
+                "idempotency_key": "short-idempotency",
+                "decision_agent_name": "short-term-decider",
+                "entry_family_key": "short-family",
+            },
+            {
+                "symbol": "005930",
+                "side": "buy",
+                "quantity": 2,
+                "remaining_quantity": 2,
+                "status": "open",
+                "limit_price": "110",
+                "broker_order_id": "signal-order",
+                "idempotency_key": "signal-idempotency",
+                "decision_agent_name": "signal-decider",
+                "entry_family_key": "signal-family",
+            },
+        ],
+    )
+    candidate = _candidate_payload(item)
+
+    payload = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        candidates=[candidate],
+        account_context=account_context,
+        candidate_universe=_candidate_universe_payload([candidate]),
+    )
+
+    projected = payload["account_context"]
+    assert projected["holdings"] == account_context["holdings"]
+    assert projected["holding_quantities_by_decision_lane"] == {
+        "005930": {"short-term-decider": 1}
+    }
+    assert projected["open_orders"][0]["broker_order_id"] == "short-order"
+    assert projected["open_orders"][0]["entry_family_key"] == "short-family"
+    assert projected["open_orders"][1] == {
+        "symbol": "005930",
+        "side": "buy",
+        "quantity": 2,
+        "remaining_quantity": 2,
+        "status": "open",
+        "limit_price": "110",
+    }
+    assert account_context["open_orders"][1]["decision_agent_name"] == (
+        "signal-decider"
+    )
+
+
+def test_watch_sizing_interleaves_lanes_before_second_batch_in_same_lane() -> None:
+    short_candidates = [
+        {
+            "execution_plan_item_id": f"short-{index}",
+            "decision_agent_name": "short-term-decider",
+        }
+        for index in range(3)
+    ]
+    signal_candidates = [
+        {
+            "execution_plan_item_id": "signal-1",
+            "decision_agent_name": "signal-decider",
+        }
+    ]
+
+    work = watch_sizing._interleaved_plan_lane_batches(
+        [
+            ("short-plan", short_candidates),
+            ("signal-plan", signal_candidates),
+        ],
+        batch_size=1,
+    )
+
+    assert [
+        batch[0]["decision_agent_name"] for _, batch in work[:2]
+    ] == ["short-term-decider", "signal-decider"]
 
 
 def _delegated_gate_context() -> dict[str, object]:
@@ -4360,7 +4877,16 @@ def test_short_transaction_no_decision_attempts_persist_for_monitoring_fallback(
     with session_factory() as session:
         item = session.get(ExecutionPlanItem, "watch-item-no-decision")
         assert item is not None
-        assert item.risk_context == large_context
+        assert {
+            key: item.risk_context[key]
+            for key in large_context
+        } == large_context
+        deferred = item.risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
+        assert deferred["reason_code"] == "exec_agent_request_failure"
+        assert deferred["disposition"] == "retry"
+        assert datetime.fromisoformat(deferred["retry_after"]) > datetime.fromisoformat(
+            deferred["deferred_at"]
+        )
         assert item.quantity_policy["exec_agent_watch_sizing_attempt_count"] == 2
         assert item.quantity_policy["exec_agent_watch_sizing_max_attempts"] == 2
         assert item.quantity_policy["exec_agent_watch_sizing_fallback_allowed"] is False
@@ -5190,6 +5716,138 @@ def test_short_transaction_prioritizes_highest_edge_candidate_when_batch_budget_
     assert observed_symbols == ["999999"]
 
 
+@pytest.mark.parametrize(
+    ("second_lane", "expected_second_symbol"),
+    [
+        ("short-term-decider", "111111"),
+        ("signal-decider", "111111"),
+    ],
+)
+def test_short_transaction_rotates_failed_head_before_next_bounded_cycle(
+    tmp_path,
+    monkeypatch,
+    second_lane: str,
+    expected_second_symbol: str,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / f'watch-sizing-failure-rotation-{second_lane}.db'}",
+        runtime_mode="paper",
+        exec_agent_enabled=True,
+        exec_agent_watch_sizing_enabled=True,
+        exec_agent_watch_sizing_start_local_time="00:00",
+        exec_agent_watch_sizing_end_local_time="23:59",
+        exec_agent_watch_sizing_batch_size=1,
+        exec_agent_watch_sizing_max_batches_per_cycle=1,
+        exec_agent_watch_sizing_max_attempts=1,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    failed_head = _watch_item(
+        item_id="watch-failed-head",
+        symbol="999999",
+        risk_context={
+            "target_price": "79520",
+            "stop_price": "69000",
+            "expected_return_pct": "12.0",
+            "confidence_score_10": "8.0",
+            "conviction_score_10": "8.5",
+        },
+    )
+    next_candidate = _watch_item(
+        item_id="watch-next-candidate",
+        symbol=expected_second_symbol,
+        risk_context={
+            "target_price": "74550",
+            "stop_price": "69000",
+            "expected_return_pct": "5.0",
+            "confidence_score_10": "6.0",
+        },
+    )
+    next_candidate.decision_agent_name = second_lane
+    with session_factory() as session:
+        session.add(
+            ExecutionPlan(
+                external_plan_id="plan-failure-rotation",
+                strategy_run_id="strategy-1",
+                source="core-short-term-decider",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                items=[failed_head, next_candidate],
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_load_sizing_account_context_short_transaction",
+        lambda **_: {
+            "available": True,
+            "buy_sizing_available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+            "open_orders_truth": {"available": True},
+        },
+    )
+    observed_symbols: list[str] = []
+
+    def fail_head_then_reject_next(*, payload, **_) -> dict[str, object]:
+        candidate = payload["candidates"][0]
+        symbol = str(candidate["symbol"])
+        observed_symbols.append(symbol)
+        if symbol == "999999":
+            raise RuntimeError("fixture sizing timeout")
+        return {
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "plan_id": payload["plan_id"],
+            "decisions": [
+                {
+                    "execution_plan_item_id": candidate["execution_plan_item_id"],
+                    "symbol": symbol,
+                    "action": "reject",
+                    "quantity": 0,
+                    "approved_notional_krw": 0,
+                    "sizing_price": candidate["trigger_price"],
+                    "confidence": 0.5,
+                    "reason_code": "fixture_reject",
+                    "reason": "fixture rejection",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "_request_exec_agent_decisions",
+        fail_head_then_reject_next,
+    )
+    first_cycle = datetime(2026, 6, 4, 0, 0, tzinfo=UTC)
+    first = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        now=first_cycle,
+    )
+    second = run_due_watch_exec_agent_sizing(
+        settings=settings,
+        session_factory=session_factory,
+        now=first_cycle + timedelta(minutes=1),
+    )
+
+    assert observed_symbols == ["999999", expected_second_symbol]
+    assert first.payload["batches_processed"] == 1
+    assert second.payload["batches_processed"] == 1
+    with session_factory() as session:
+        persisted_head = session.get(ExecutionPlanItem, "watch-failed-head")
+        assert persisted_head is not None
+        deferred = persisted_head.risk_context[
+            watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY
+        ]
+        assert deferred["reason_code"] == "exec_agent_request_failure"
+        assert deferred["retry_after"] > deferred["deferred_at"]
+
+
 def test_short_transaction_supersedes_older_duplicate_symbol_before_sizing(
     tmp_path,
     monkeypatch,
@@ -5469,6 +6127,367 @@ def test_sizing_envelope_rejects_reward_risk_below_deterministic_floor() -> None
     assert envelope["allowed_actions"] == ["hold", "reject"]
 
 
+def test_sizing_envelope_allows_other_lane_but_keeps_aggregate_symbol_cap() -> None:
+    account_context = _fresh_account_context(
+        holdings=[{"symbol": "005930", "quantity": 2, "average_price": "100"}],
+        holding_quantities_by_decision_lane={
+            "005930": {"signal-decider": 2},
+        },
+        holding_lane_attribution_complete_by_symbol={"005930": True},
+        open_orders=[
+            {
+                "symbol": "005930",
+                "side": "buy",
+                "quantity": 1,
+                "remaining_quantity": 1,
+                "limit_price": "100",
+                "decision_agent_name": "signal-decider",
+            }
+        ],
+    )
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(
+            runtime_mode="paper",
+            exec_agent_max_symbol_budget=Decimal("1000"),
+            exec_agent_max_position_allocation_pct=Decimal("0.10"),
+            exec_agent_watch_sizing_fallback_account_basis_krw=Decimal("10000"),
+        ),
+        candidate={
+            "symbol": "005930",
+            "provider": "kis",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "intent": "intraday_watch_buy",
+            "decision_agent_name": "short-term-decider",
+            "chase_limit_price": "150",
+            "target_price": "180",
+            "stop_loss_price": "130",
+        },
+        account_context=account_context,
+    )
+
+    assert "existing_holding" not in envelope["hard_reject_reasons"]
+    assert "duplicate_open_buy_order" not in envelope["hard_reject_reasons"]
+    assert "buy" in envelope["allowed_actions"]
+    assert envelope["existing_symbol_exposure_krw"] == "450.0000"
+    assert envelope["max_notional_krw"] == "550.0000"
+
+    same_lane_context = deepcopy(account_context)
+    same_lane_context["holding_quantities_by_decision_lane"]["005930"] = {
+        "short-term-decider": 2,
+    }
+    same_lane_context["open_orders"][0]["decision_agent_name"] = (
+        "short-term-decider"
+    )
+    blocked = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="paper"),
+        candidate={
+            "symbol": "005930",
+            "provider": "kis",
+            "asset_class": "stock",
+            "exchange": "KRX",
+            "intent": "intraday_watch_buy",
+            "decision_agent_name": "short-term-decider",
+            "chase_limit_price": "100",
+            "target_price": "120",
+            "stop_loss_price": "90",
+        },
+        account_context=same_lane_context,
+    )
+    assert "existing_holding" in blocked["hard_reject_reasons"]
+    assert "duplicate_open_buy_order" in blocked["hard_reject_reasons"]
+
+
+def test_apply_sizing_batch_reserves_symbol_exposure_and_lane_independently() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        exec_agent_max_symbol_budget=Decimal("1000"),
+        exec_agent_max_total_budget=Decimal("5000"),
+        exec_agent_max_position_allocation_pct=Decimal("1"),
+        exec_agent_max_trade_risk_pct=Decimal("0.015"),
+        exec_agent_stop_loss_pct=Decimal("0.10"),
+        exec_agent_watch_sizing_min_notional_krw=Decimal("1"),
+        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("1"),
+        exec_agent_watch_sizing_fallback_account_basis_krw=Decimal("10000"),
+    )
+    signal = _watch_item(
+        item_id="batch-signal",
+        symbol="005930",
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "120",
+            "stop_loss_price": "90",
+        },
+        trigger_price="100",
+        limit_price="100",
+    )
+    signal.decision_agent_name = "signal-decider"
+    signal.source_plan_item_id = "shared-batch-source"
+    short = _watch_item(
+        item_id="batch-short",
+        symbol="005930",
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "120",
+            "stop_loss_price": "90",
+        },
+        trigger_price="100",
+        limit_price="100",
+    )
+    short.plan_item_index = 1
+    short.decision_agent_name = "short-term-decider"
+    short.source_plan_item_id = "shared-batch-source"
+    plan = ExecutionPlan(
+        external_plan_id="two-lane-sizing-batch",
+        source="test",
+        market_date=date(2026, 10, 26),
+        mode="paper",
+        items=[signal, short],
+    )
+    decisions = [
+        {
+            "execution_plan_item_id": item.id,
+            "symbol": item.symbol,
+            "action": "approve",
+            "quantity": 8,
+            "approved_notional_krw": "800",
+            "sizing_price": "100",
+            "confidence": "0.90",
+            "target_profile": "short_swing",
+            "reason_code": "approved",
+            "reason": "independent lane approval",
+        }
+        for item in (signal, short)
+    ]
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
+            "decisions": decisions,
+        },
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
+        account_context=_fresh_account_context(
+            orderable_cash_krw="10000",
+            buying_power_krw="10000",
+        ),
+        expected_item_ids={signal.id, short.id},
+        now=datetime(2026, 10, 26, 0, 0, tzinfo=UTC),
+    )
+
+    assert summary["approved"] == 2
+    assert sorted(
+        [
+            signal.quantity_policy["quantity"],
+            short.quantity_policy["quantity"],
+        ]
+    ) == [2, 8]
+    assert summary["approved_notional_krw"] == "1000.0000"
+    assert {
+        reservation["decision_agent_name"]
+        for reservation in summary["approved_reservations"]
+    } == {"signal-decider", "short-term-decider"}
+
+
+def test_apply_sizing_batch_blocks_second_same_lane_even_with_shared_source_key() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        exec_agent_max_symbol_budget=Decimal("1000"),
+        exec_agent_max_total_budget=Decimal("5000"),
+        exec_agent_max_position_allocation_pct=Decimal("1"),
+        exec_agent_max_trade_risk_pct=Decimal("0.015"),
+        exec_agent_stop_loss_pct=Decimal("0.10"),
+        exec_agent_watch_sizing_min_notional_krw=Decimal("1"),
+        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("1"),
+        exec_agent_watch_sizing_fallback_account_basis_krw=Decimal("10000"),
+    )
+    first = _watch_item(
+        item_id="same-lane-first",
+        symbol="005930",
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "120",
+            "stop_loss_price": "90",
+        },
+        trigger_price="100",
+        limit_price="100",
+    )
+    second = _watch_item(
+        item_id="same-lane-second",
+        symbol="005930",
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "120",
+            "stop_loss_price": "90",
+        },
+        trigger_price="100",
+        limit_price="100",
+    )
+    second.plan_item_index = 1
+    first.source_plan_item_id = second.source_plan_item_id = "shared-source-key"
+    plan = ExecutionPlan(
+        external_plan_id="same-lane-sizing-batch",
+        source="test",
+        market_date=date(2026, 10, 26),
+        mode="paper",
+        items=[first, second],
+    )
+    decisions = [
+        {
+            "execution_plan_item_id": item.id,
+            "symbol": item.symbol,
+            "action": "approve",
+            "quantity": 2,
+            "approved_notional_krw": "200",
+            "sizing_price": "100",
+            "confidence": "0.90",
+            "target_profile": "short_swing",
+            "reason_code": "approved",
+            "reason": "candidate approval",
+        }
+        for item in (first, second)
+    ]
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
+            "decisions": decisions,
+        },
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
+        account_context=_fresh_account_context(),
+        expected_item_ids={first.id, second.id},
+        now=datetime(2026, 10, 26, 0, 0, tzinfo=UTC),
+    )
+
+    assert summary["approved"] == 1
+    assert summary["rejected"] == 1
+    assert first.status == "watch_monitoring_active"
+    assert second.status == "exec_agent_rejected"
+    assert second.quantity_policy["exec_agent_decision"]["reason_code"] == (
+        "allowed_action_envelope_blocked"
+    )
+
+
+def test_account_exposure_uses_zero_remaining_without_falling_back_to_order_quantity() -> None:
+    exposure = watch_sizing._account_symbol_exposure_notional(
+        account_context=_fresh_account_context(
+            holdings=[
+                {"symbol": "005930", "quantity": 4, "average_price": "100"}
+            ],
+            open_orders=[
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "quantity": 10,
+                    "remaining_quantity": 0,
+                    "limit_price": "100",
+                }
+            ],
+        ),
+        symbol="005930",
+        fallback_price=Decimal("100"),
+    )
+
+    assert exposure == Decimal("400.0000")
+
+
+def test_sizing_account_context_deduplicates_partial_local_and_broker_order() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as session:
+        item = ExecutionPlanItem(
+            id="partial-watch-entry",
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="broker_order_submitted",
+            decision_agent_name="signal-decider",
+            source_plan_item_id="partial-watch-source",
+            provider="kis",
+            venue="KRX",
+            asset_class="stock",
+        )
+        plan = ExecutionPlan(
+            external_plan_id="partial-watch-plan",
+            source="test",
+            market_date=date(2026, 10, 26),
+            mode="paper",
+            items=[item],
+        )
+        order = BrokerOrder(
+            id="partial-watch-order",
+            broker_name="kis",
+            mode="paper",
+            execution_plan_item_id=item.id,
+            idempotency_key="partial-watch-order",
+            broker_order_id="partial-watch-order",
+            symbol="005930",
+            side="buy",
+            status="partially_filled",
+            quantity=10,
+            limit_price=Decimal("100"),
+            venue="KRX",
+            asset_class="stock",
+        )
+        session.add_all([plan, order])
+        session.flush()
+        session.add(
+            ExecutionFill(
+                broker_order_pk=order.id,
+                broker_fill_id="partial-watch-fill",
+                symbol="005930",
+                side="buy",
+                quantity=4,
+                price=Decimal("100"),
+                filled_at=datetime(2026, 10, 26, 0, 1, tzinfo=UTC),
+                payload={"fill_time_precision": "exact"},
+            )
+        )
+        session.commit()
+        account_context = _fresh_account_context(
+            open_orders=[
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "quantity": 10,
+                    "remaining_quantity": 6,
+                    "status": "partially_filled",
+                    "limit_price": "100",
+                    "broker_order_id": "partial-watch-order",
+                }
+            ]
+        )
+
+        watch_sizing._enrich_account_context_with_decision_lanes(
+            settings=settings,
+            db=session,
+            account_context=account_context,
+            observed_at=datetime(2026, 10, 26, 0, 2, tzinfo=UTC),
+        )
+
+    assert len(account_context["open_orders"]) == 1
+    assert account_context["open_orders"][0]["remaining_quantity"] == 6
+    assert account_context["open_orders"][0]["decision_agent_name"] == (
+        "signal-decider"
+    )
+    assert watch_sizing._account_symbol_exposure_notional(
+        account_context=account_context,
+        symbol="005930",
+        fallback_price=Decimal("100"),
+    ) == Decimal("600.0000")
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("symbol", "entry", "target", "upstream_stop", "expected_effective_stop"),
     [
@@ -5520,6 +6539,7 @@ def test_approved_watch_sizing_persists_effective_stop_and_updates_stop_child() 
     settings = Settings(
         runtime_mode="paper",
         exec_agent_stop_loss_pct=Decimal("0.025"),
+        execution_position_account_scope="watch-sizing-effective-stop-route-a",
     )
     entry = _watch_item(
         item_id="effective-stop-entry",
@@ -5533,6 +6553,31 @@ def test_approved_watch_sizing_persists_effective_stop_and_updates_stop_child() 
         limit_price="10000",
     )
     entry.source_plan_item_id = "core-entry-000020"
+    entry.provider = "kis"
+    entry.venue = "KRX"
+    entry.asset_class = "stock"
+    entry.risk_context, entry.quantity_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context=entry.risk_context,
+        quantity_policy=entry.quantity_policy,
+    )
+    stop_risk, stop_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={
+            "exchange": "KRX",
+            "entry_context": {
+                "source_plan_item_id": "core-entry-000020",
+                "execution_plan_item_id": entry.id,
+                "decision_agent_name": "short-term-decider",
+            },
+        },
+        quantity_policy={
+            "type": "position_exit_from_entry",
+            "linked_entry_item_key": "core-entry-000020",
+        },
+    )
     stop = ExecutionPlanItem(
         id="effective-stop-child",
         plan_item_index=1,
@@ -5540,11 +6585,82 @@ def test_approved_watch_sizing_persists_effective_stop_and_updates_stop_child() 
         side="sell",
         intent="stop_sell",
         status="stop_sell_pending_config",
+        decision_agent_name="short-term-decider",
         trigger_price=Decimal("9000"),
+        quantity_policy=stop_policy,
+        risk_context=stop_risk,
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+    )
+    other_lane_risk, other_lane_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={
+            "exchange": "KRX",
+            "entry_context": {
+                "source_plan_item_id": "core-entry-000020",
+                "execution_plan_item_id": "other-lane-entry",
+                "decision_agent_name": "signal-decider",
+            },
+        },
         quantity_policy={
             "type": "position_exit_from_entry",
             "linked_entry_item_key": "core-entry-000020",
         },
+    )
+    other_lane_stop = ExecutionPlanItem(
+        id="effective-stop-other-lane",
+        plan_item_index=2,
+        symbol="000020",
+        side="sell",
+        intent="stop_sell",
+        status="stop_sell_pending_config",
+        decision_agent_name="signal-decider",
+        trigger_price=Decimal("8900"),
+        quantity_policy=other_lane_policy,
+        risk_context=other_lane_risk,
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+    )
+    foreign_settings = settings.model_copy(
+        update={
+            "execution_position_account_scope": (
+                "watch-sizing-effective-stop-route-b"
+            )
+        }
+    )
+    other_route_risk, other_route_policy = bind_kis_account_route(
+        settings=foreign_settings,
+        provider="kis",
+        risk_context={
+            "exchange": "KRX",
+            "entry_context": {
+                "source_plan_item_id": "core-entry-000020",
+                "execution_plan_item_id": entry.id,
+                "decision_agent_name": "short-term-decider",
+            },
+        },
+        quantity_policy={
+            "type": "position_exit_from_entry",
+            "linked_entry_item_key": "core-entry-000020",
+        },
+    )
+    other_route_stop = ExecutionPlanItem(
+        id="effective-stop-other-route",
+        plan_item_index=3,
+        symbol="000020",
+        side="sell",
+        intent="stop_sell",
+        status="stop_sell_pending_config",
+        decision_agent_name="short-term-decider",
+        trigger_price=Decimal("8800"),
+        quantity_policy=other_route_policy,
+        risk_context=other_route_risk,
+        provider="kis",
+        venue="NXT",
+        asset_class="stock",
     )
     plan = ExecutionPlan(
         id="effective-stop-plan",
@@ -5552,7 +6668,7 @@ def test_approved_watch_sizing_persists_effective_stop_and_updates_stop_child() 
         source="core-short-term-decider",
         market_date=date(2026, 10, 14),
         mode="paper",
-        items=[entry, stop],
+        items=[entry, stop, other_lane_stop, other_route_stop],
     )
 
     summary = _apply_decisions(
@@ -5591,6 +6707,56 @@ def test_approved_watch_sizing_persists_effective_stop_and_updates_stop_child() 
         "server_effective_stop_v1"
     )
     assert stop.trigger_price == Decimal("9750.0000")
+    assert other_lane_stop.trigger_price == Decimal("8900")
+    assert other_route_stop.trigger_price == Decimal("8800")
+
+
+def test_effective_stop_update_fails_closed_without_exact_entry_route() -> None:
+    entry = _watch_item(
+        item_id="effective-stop-unbound-entry",
+        symbol="000020",
+        risk_context={"exchange": "KRX"},
+        trigger_price="10000",
+        limit_price="10000",
+    )
+    entry.source_plan_item_id = "effective-stop-unbound-family"
+    stop = ExecutionPlanItem(
+        id="effective-stop-unbound-child",
+        plan_item_index=1,
+        symbol=entry.symbol,
+        side="sell",
+        intent="stop_sell",
+        status="stop_sell_pending_config",
+        decision_agent_name="short-term-decider",
+        trigger_price=Decimal("9000"),
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 1,
+            "linked_entry_item_key": "effective-stop-unbound-family",
+        },
+        risk_context={
+            "exchange": "KRX",
+            "entry_context": {
+                "source_plan_item_id": "effective-stop-unbound-family",
+                "execution_plan_item_id": entry.id,
+                "decision_agent_name": "short-term-decider",
+            },
+        },
+    )
+    ExecutionPlan(
+        id="effective-stop-unbound-plan",
+        external_plan_id="effective-stop-unbound-plan",
+        source="test",
+        mode="paper",
+        items=[entry, stop],
+    )
+
+    watch_sizing._persist_server_owned_effective_stop(
+        item=entry,
+        envelope={"effective_stop_price": "9750"},
+    )
+
+    assert stop.trigger_price == Decimal("9000")
 
 
 def test_final_watch_quantity_uses_the_same_effective_stop_as_the_envelope() -> None:

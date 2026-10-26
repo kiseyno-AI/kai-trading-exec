@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.broker.base import (
     BrokerAccountOpenOrder,
@@ -24,6 +24,9 @@ from app.models.runtime import (
     ExecutionPosition,
     RuntimeControlState,
 )
+from app.services.fill_economics import effective_fill_quantity
+from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.execution_semantics import KRX_EXCHANGES
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.account_drawdown_recovery import (
     account_snapshot_authority_deadline,
@@ -38,8 +41,13 @@ from app.services.execution_account_route import (
 )
 from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
 from app.services.json_compaction import json_payload_hash
-from app.services.plan_item_identity import serialize_plan_item_source_identity
+from app.services.plan_item_identity import (
+    plan_item_decision_agent_name,
+    plan_item_entry_family_key,
+    serialize_plan_item_source_identity,
+)
 from app.services.position_identity import (
+    EXECUTION_SCOPE_POLICY_VERSION,
     PositionIdentity,
     PositionIdentityConflictError,
     build_position_identity,
@@ -58,6 +66,15 @@ from app.services.broker_order_state import (
     active_local_broker_order_filters,
 )
 from app.services.runtime_controls import RUNTIME_CONTROL_ID, effective_automation_enabled
+from app.services.strategy_lane_authority import (
+    normalized_decision_lane,
+    sizing_authority_account_context,
+    sizing_authority_risk_context,
+    strategy_feedback_for_decision_lane,
+)
+from app.services.trade_outcome_feedback import (
+    load_latest_trade_outcome_feedback_snippet,
+)
 
 SHORT_TERM_DECIDER_NAME = "short-term-decider"
 SUPPORTED_SHORT_TERM_BUY_INTENTS = frozenset({"next_open_buy"})
@@ -244,6 +261,7 @@ class ExecAgentSizingRequest(BaseModel):
     account: dict[str, Any]
     portfolio: dict[str, Any]
     market_data: dict[str, Any] | None = None
+    trade_outcome_feedback: dict[str, Any] = Field(default_factory=dict)
     risk_caps: dict[str, Any]
     binding: ExecAgentDecisionBinding
 
@@ -276,6 +294,7 @@ class ExecAgentBatchSizingRequest(BaseModel):
     candidates: list[ExecAgentAllocationCandidate] = Field(min_length=1)
     account: dict[str, Any]
     portfolio: dict[str, Any]
+    trade_outcome_feedback: dict[str, Any] = Field(default_factory=dict)
     risk_caps: dict[str, Any]
 
 
@@ -395,6 +414,12 @@ class _AccountContext:
     unresolved_buy_reserved_notional: Decimal
     unresolved_buy_reservation_complete: bool
     execution_identity: PositionIdentity | None = None
+    holding_quantities_by_decision_lane: dict[str, dict[str, int]] = field(
+        default_factory=dict
+    )
+    holding_lane_attribution_complete_by_symbol: dict[str, bool] = field(
+        default_factory=dict
+    )
 
 
 class _InvalidAgentContract(ValueError):
@@ -468,6 +493,8 @@ def apply_short_term_exec_agent_decisions(
     rejected_count = 0
     reserved_total_budget = account_context.unresolved_buy_reserved_notional
     reserved_cash_budget = account_context.unresolved_buy_reserved_notional
+    reserved_symbol_notional: dict[str, Decimal] = {}
+    reserved_entry_lanes: set[tuple[str, str]] = set()
     reserved_daily_buy_notional = _load_daily_new_buy_notional(
         settings=settings,
         db=db,
@@ -492,6 +519,11 @@ def apply_short_term_exec_agent_decisions(
             reserved_total_budget=reserved_total_budget,
             reserved_cash_budget=reserved_cash_budget,
             reserved_daily_buy_notional=reserved_daily_buy_notional,
+            reserved_symbol_notional=reserved_symbol_notional.get(
+                item.symbol,
+                Decimal("0"),
+            ),
+            reserved_entry_lanes=reserved_entry_lanes,
             agent_contract_result=agent_contracts.get(item.id),
         )
         decisions.append(decision)
@@ -501,6 +533,13 @@ def apply_short_term_exec_agent_decisions(
             reserved_total_budget += approved_notional
             reserved_cash_budget += approved_notional
             reserved_daily_buy_notional += approved_notional
+            reserved_symbol_notional[item.symbol] = (
+                reserved_symbol_notional.get(item.symbol, Decimal("0"))
+                + approved_notional
+            )
+            lane = _normalized_decision_lane(plan_item_decision_agent_name(item))
+            if lane is not None:
+                reserved_entry_lanes.add((item.symbol, lane))
             _apply_approved_decision(
                 settings=settings,
                 item=item,
@@ -657,6 +696,16 @@ def _load_account_context(
             position.quantity,
         )
 
+    (
+        holding_quantities_by_decision_lane,
+        holding_lane_attribution_complete_by_symbol,
+    ) = _holding_lane_attribution(
+        settings=settings,
+        db=db,
+        holdings_by_symbol=holdings_by_symbol,
+        observed_at=snapshot.observed_at,
+    )
+
     local_open_orders = _load_local_open_orders(
         settings=settings,
         db=db,
@@ -681,10 +730,19 @@ def _load_account_context(
         observed_at=snapshot.observed_at,
         snapshot_payload=snapshot_payload,
         holdings_by_symbol=holdings_by_symbol,
-        open_orders=[*snapshot.open_orders, *local_open_orders],
+        open_orders=_merge_account_open_orders(
+            broker_orders=snapshot.open_orders,
+            local_orders=local_open_orders,
+        ),
         unresolved_buy_reserved_notional=unresolved_reserved_notional,
         unresolved_buy_reservation_complete=unresolved_reservation_complete,
         execution_identity=identity,
+        holding_quantities_by_decision_lane=(
+            holding_quantities_by_decision_lane
+        ),
+        holding_lane_attribution_complete_by_symbol=(
+            holding_lane_attribution_complete_by_symbol
+        ),
     )
 
 
@@ -706,6 +764,8 @@ def _single_candidate_account_route(
         )
         if not provider or not exchange:
             return None
+        if provider == "kis" and exchange in KRX_EXCHANGES:
+            exchange = "KRX"
         routes.add((provider, exchange))
     if len(routes) != 1:
         return None
@@ -769,6 +829,48 @@ def _load_local_positions(
     ).all()
 
 
+def _holding_lane_attribution(
+    *,
+    settings: Settings,
+    db: Session,
+    holdings_by_symbol: dict[str, int],
+    observed_at: datetime,
+) -> tuple[dict[str, dict[str, int]], dict[str, bool]]:
+    # Local import avoids a startup cycle because monitoring imports the
+    # duplicate-order guard from this module at trigger time.
+    from app.services.monitoring import _post_entry_family_inventories
+
+    quantities_by_symbol: dict[str, dict[str, int]] = {}
+    complete_by_symbol: dict[str, bool] = {}
+    for symbol, aggregate_quantity in holdings_by_symbol.items():
+        if aggregate_quantity <= 0:
+            continue
+        inventories, lineage_found = _post_entry_family_inventories(
+            settings=settings,
+            db=db,
+            symbol=symbol,
+            position_quantity=aggregate_quantity,
+            through=observed_at,
+        )
+        lane_quantities: dict[str, int] = {}
+        complete = bool(inventories) and lineage_found
+        for inventory in inventories:
+            lane = _normalized_decision_lane(
+                plan_item_decision_agent_name(inventory.entry_item)
+            )
+            if lane is None:
+                complete = False
+                continue
+            lane_quantities[lane] = (
+                lane_quantities.get(lane, 0) + inventory.remaining_quantity
+            )
+        if sum(lane_quantities.values()) != aggregate_quantity:
+            complete = False
+        quantities_by_symbol[symbol] = lane_quantities
+        complete_by_symbol[symbol] = complete
+    return quantities_by_symbol, complete_by_symbol
+
+
 def _load_local_open_orders(
     *,
     settings: Settings,
@@ -790,6 +892,9 @@ def _load_local_open_orders(
                 statuses=OPEN_BUY_ORDER_STATUSES,
             ),
             BrokerOrder.side == "buy",
+        ).options(
+            selectinload(BrokerOrder.plan_item),
+            selectinload(BrokerOrder.fills),
         )
     ).all()
     normalized_orders: list[BrokerAccountOpenOrder] = []
@@ -805,22 +910,66 @@ def _load_local_open_orders(
         ):
             continue
         reserved_notional = _broker_order_reserved_notional(order)
+        exact_remaining_quantity = _local_order_remaining_quantity(order)
+        if exact_remaining_quantity == 0:
+            continue
+        remaining_quantity_indeterminate = exact_remaining_quantity is None
+        remaining_quantity = (
+            exact_remaining_quantity
+            if exact_remaining_quantity is not None
+            else (_conservative_local_order_quantity(order) or 0)
+        )
+        source_candidate_id = (
+            serialize_plan_item_source_identity(order.plan_item).get(
+                "source_plan_item_id"
+            )
+            if order.plan_item is not None
+            else None
+        )
         normalized_orders.append(
             BrokerAccountOpenOrder(
                 symbol=order.symbol,
                 side=order.side,
                 quantity=order.quantity or 0,
-                remaining_quantity=order.quantity or 0,
+                remaining_quantity=remaining_quantity,
                 status=order.status,
                 broker_order_id=order.broker_order_id,
                 idempotency_key=order.idempotency_key,
+                source_candidate_id=(
+                    str(source_candidate_id)
+                    if source_candidate_id is not None
+                    else None
+                ),
                 limit_price=order.limit_price,
                 payload={
                     "source": "local_broker_orders",
                     "broker_order_pk": order.id,
                     "execution_plan_item_id": order.execution_plan_item_id,
-                    "capital_truth_uncertain": order.status
-                    in UNCERTAIN_BUY_CAPITAL_STATUSES,
+                    "decision_agent_name": (
+                        plan_item_decision_agent_name(order.plan_item)
+                        if order.plan_item is not None
+                        else None
+                    ),
+                    "entry_family_key": (
+                        plan_item_entry_family_key(order.plan_item)
+                        if order.plan_item is not None
+                        else None
+                    ),
+                    "execution_scope": (
+                        {
+                            "policy_version": EXECUTION_SCOPE_POLICY_VERSION,
+                            **route_scope.as_payload(),
+                        }
+                        if route_scope is not None
+                        else None
+                    ),
+                    "remaining_quantity_indeterminate": (
+                        remaining_quantity_indeterminate
+                    ),
+                    "capital_truth_uncertain": (
+                        order.status in UNCERTAIN_BUY_CAPITAL_STATUSES
+                        or remaining_quantity_indeterminate
+                    ),
                     "reserved_notional": (
                         str(reserved_notional) if reserved_notional is not None else None
                     ),
@@ -828,6 +977,227 @@ def _load_local_open_orders(
             )
         )
     return normalized_orders
+
+
+def _local_order_remaining_quantity(order: BrokerOrder) -> int | None:
+    ordered_quantity = order.quantity
+    if isinstance(ordered_quantity, bool) or not isinstance(ordered_quantity, int):
+        return None
+    if ordered_quantity <= 0:
+        return None
+    filled_quantity = Decimal("0")
+    try:
+        fills = dedupe_execution_fills(list(order.fills))
+        for fill in fills:
+            if str(fill.side or "").strip().lower() != "buy":
+                return None
+            quantity = effective_fill_quantity(fill)
+            if not quantity.is_finite() or quantity <= 0:
+                return None
+            filled_quantity += quantity
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if filled_quantity > Decimal(ordered_quantity):
+        return None
+    remaining = Decimal(ordered_quantity) - filled_quantity
+    integral = remaining.to_integral_value(rounding=ROUND_DOWN)
+    if integral != remaining:
+        return None
+    return int(integral)
+
+
+def _conservative_local_order_quantity(order: BrokerOrder) -> int | None:
+    quantity = order.quantity
+    if isinstance(quantity, int) and not isinstance(quantity, bool) and quantity > 0:
+        return quantity
+    return None
+
+
+def _unique_open_order_index(
+    orders: list[BrokerAccountOpenOrder],
+    *,
+    attribute: str,
+) -> dict[str, BrokerAccountOpenOrder]:
+    candidates: dict[str, list[BrokerAccountOpenOrder]] = {}
+    for order in orders:
+        value = getattr(order, attribute, None)
+        if isinstance(value, str) and value:
+            candidates.setdefault(value, []).append(order)
+    return {
+        key: matches[0]
+        for key, matches in candidates.items()
+        if len(matches) == 1
+    }
+
+
+def _complete_execution_scope_key(payload: object) -> tuple[str, ...] | None:
+    if not isinstance(payload, dict):
+        return None
+    scope = payload.get("execution_scope")
+    if (
+        not isinstance(scope, dict)
+        or scope.get("policy_version") != EXECUTION_SCOPE_POLICY_VERSION
+    ):
+        return None
+    account_scope = str(scope.get("account_scope") or "").strip().lower()
+    if len(account_scope) != 24 or any(
+        character not in "0123456789abcdef" for character in account_scope
+    ):
+        return None
+    normalized = (
+        str(scope.get("provider") or "").strip().lower(),
+        account_scope,
+        str(scope.get("venue") or "").strip().upper(),
+        str(scope.get("asset_class") or "").strip().lower(),
+        str(scope.get("exchange") or "").strip().upper(),
+    )
+    if not all(normalized):
+        return None
+    return normalized
+
+
+def _source_lane_scope_order_key(
+    order: BrokerAccountOpenOrder,
+) -> tuple[str, ...] | None:
+    source = str(order.source_candidate_id or "").strip()
+    payload = order.payload if isinstance(order.payload, dict) else {}
+    lane = _normalized_decision_lane(payload.get("decision_agent_name"))
+    scope = _complete_execution_scope_key(payload)
+    if not source or lane is None or scope is None:
+        return None
+    return (
+        source,
+        lane,
+        *scope,
+        str(order.symbol or "").strip().upper(),
+        str(order.side or "").strip().lower(),
+    )
+
+
+def _unique_source_lane_scope_index(
+    orders: list[BrokerAccountOpenOrder],
+) -> dict[tuple[str, ...], BrokerAccountOpenOrder]:
+    candidates: dict[tuple[str, ...], list[BrokerAccountOpenOrder]] = {}
+    for order in orders:
+        key = _source_lane_scope_order_key(order)
+        if key is not None:
+            candidates.setdefault(key, []).append(order)
+    return {
+        key: matches[0]
+        for key, matches in candidates.items()
+        if len(matches) == 1
+    }
+
+
+def _strong_order_identity_contradicts(
+    left: BrokerAccountOpenOrder,
+    right: BrokerAccountOpenOrder,
+) -> bool:
+    for attribute in ("broker_order_id", "idempotency_key"):
+        left_value = str(getattr(left, attribute, None) or "").strip()
+        right_value = str(getattr(right, attribute, None) or "").strip()
+        if left_value and right_value and left_value != right_value:
+            return True
+    return False
+
+
+def _merge_account_open_orders(
+    *,
+    broker_orders: list[BrokerAccountOpenOrder],
+    local_orders: list[BrokerAccountOpenOrder],
+) -> list[BrokerAccountOpenOrder]:
+    local_by_broker_id = _unique_open_order_index(
+        local_orders,
+        attribute="broker_order_id",
+    )
+    local_by_idempotency = _unique_open_order_index(
+        local_orders,
+        attribute="idempotency_key",
+    )
+    local_by_source_lane_scope = _unique_source_lane_scope_index(local_orders)
+    represented_local_ids: set[int] = set()
+    merged: list[BrokerAccountOpenOrder] = []
+    for broker_order in broker_orders:
+        local_order = None
+        identity_contradiction = False
+        if broker_order.broker_order_id:
+            candidate = local_by_broker_id.get(broker_order.broker_order_id)
+            if candidate is not None:
+                identity_contradiction = _strong_order_identity_contradicts(
+                    broker_order,
+                    candidate,
+                )
+                if not identity_contradiction:
+                    local_order = candidate
+        if (
+            local_order is None
+            and not identity_contradiction
+            and broker_order.idempotency_key
+        ):
+            candidate = local_by_idempotency.get(broker_order.idempotency_key)
+            if candidate is not None:
+                identity_contradiction = _strong_order_identity_contradicts(
+                    broker_order,
+                    candidate,
+                )
+                if not identity_contradiction:
+                    local_order = candidate
+        if local_order is None and not identity_contradiction:
+            source_lane_scope_key = _source_lane_scope_order_key(broker_order)
+            if source_lane_scope_key is not None:
+                candidate = local_by_source_lane_scope.get(
+                    source_lane_scope_key
+                )
+                if candidate is not None and not _strong_order_identity_contradicts(
+                    broker_order,
+                    candidate,
+                ):
+                    local_order = candidate
+        if local_order is None:
+            remaining_quantity = (
+                broker_order.remaining_quantity
+                if broker_order.remaining_quantity is not None
+                else broker_order.quantity
+            )
+            if remaining_quantity is not None and remaining_quantity <= 0:
+                continue
+            merged.append(broker_order)
+            continue
+        represented_local_ids.add(id(local_order))
+        payload = dict(broker_order.payload or {})
+        payload.update(dict(local_order.payload or {}))
+        remaining_quantity = (
+            broker_order.remaining_quantity
+            if broker_order.remaining_quantity is not None
+            else local_order.remaining_quantity
+        )
+        if remaining_quantity is not None and remaining_quantity <= 0:
+            continue
+        merged.append(
+            BrokerAccountOpenOrder(
+                symbol=broker_order.symbol,
+                side=broker_order.side,
+                quantity=broker_order.quantity,
+                remaining_quantity=remaining_quantity,
+                status=broker_order.status,
+                broker_order_id=(
+                    broker_order.broker_order_id or local_order.broker_order_id
+                ),
+                idempotency_key=(
+                    broker_order.idempotency_key or local_order.idempotency_key
+                ),
+                source_candidate_id=(
+                    broker_order.source_candidate_id
+                    or local_order.source_candidate_id
+                ),
+                limit_price=broker_order.limit_price or local_order.limit_price,
+                payload=payload,
+            )
+        )
+    merged.extend(
+        order for order in local_orders if id(order) not in represented_local_ids
+    )
+    return merged
 
 
 def _broker_order_reserved_notional(order: BrokerOrder) -> Decimal | None:
@@ -1033,6 +1403,8 @@ def _decide_candidate(
     reserved_total_budget: Decimal,
     reserved_cash_budget: Decimal,
     reserved_daily_buy_notional: Decimal,
+    reserved_symbol_notional: Decimal,
+    reserved_entry_lanes: set[tuple[str, str]],
     agent_contract_result: _AgentContractResolution | None,
 ) -> dict[str, object]:
     source_identity = serialize_plan_item_source_identity(item)
@@ -1123,6 +1495,51 @@ def _decide_candidate(
             available_cash=available_cash,
         )
     existing_holding = account_context.holdings_by_symbol.get(item.symbol, 0)
+    candidate_lane = _normalized_decision_lane(
+        plan_item_decision_agent_name(item)
+    )
+    if candidate_lane is None:
+        return _reject(
+            base,
+            "holding_lane_attribution_incomplete",
+            "candidate decision lane is unavailable",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            existing_holding=existing_holding,
+        )
+    if (item.symbol, candidate_lane) in reserved_entry_lanes:
+        return _reject(
+            base,
+            "duplicate_open_buy_order",
+            "an earlier candidate in this sizing batch already reserved the decision lane",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            existing_holding=existing_holding,
+        )
+    same_lane_holding, attribution_complete = _same_lane_holding_quantity(
+        account_context=account_context,
+        symbol=item.symbol,
+        decision_lane=candidate_lane,
+        aggregate_quantity=existing_holding,
+    )
+    if existing_holding > 0 and not attribution_complete:
+        return _reject(
+            base,
+            "holding_lane_attribution_incomplete",
+            "existing holding cannot be attributed exactly to decision lanes",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            existing_holding=existing_holding,
+        )
+    if same_lane_holding > 0:
+        return _reject(
+            base,
+            "existing_holding",
+            "candidate decision lane already owns an open holding",
+            agent_contract=agent_contract,
+            available_cash=available_cash,
+            existing_holding=existing_holding,
+        )
     if _has_duplicate_open_buy_order(
         item=item,
         idempotency_key=idempotency_key,
@@ -1293,7 +1710,11 @@ def _decide_candidate(
         "exec_agent_max_symbol_budget",
         Decimal("1000000"),
     )
-    existing_symbol_exposure = sizing_price * Decimal(existing_holding)
+    existing_symbol_exposure = _existing_symbol_exposure(
+        account_context=account_context,
+        symbol=item.symbol,
+        fallback_price=sizing_price,
+    ) + reserved_symbol_notional
     account_basis = _minimum_decimal(account_context.available_cash, account_context.buying_power) or available_cash
     market_regime_context = market_regime_context_from_item_payloads(
         item.risk_context,
@@ -2120,6 +2541,7 @@ def _call_batch_sizing_client(
                     account_context=account_context,
                     source_identity=serialize_plan_item_source_identity(item),
                     binding=requested_candidates[item.id].binding,
+                    trade_outcome_feedback=request.trade_outcome_feedback,
                 )
             )
         except Exception as exc:
@@ -2181,6 +2603,42 @@ def _contracts_from_batch_response(
     return contracts
 
 
+def _exact_candidate_decision_lane(
+    candidates: list[ExecutionPlanItem],
+) -> str:
+    lanes = {
+        normalized_decision_lane(plan_item_decision_agent_name(item))
+        for item in candidates
+    }
+    if None in lanes or len(lanes) != 1:
+        raise _InvalidAgentContract(
+            "exec-agent sizing candidates require one exact decision lane"
+        )
+    return next(iter(lanes))  # type: ignore[return-value]
+
+
+def _strategy_lane_trade_outcome_feedback(
+    *,
+    settings: Settings,
+    account_context: _AccountContext,
+    decision_lane: str | None,
+) -> dict[str, object]:
+    identity = account_context.execution_identity
+    loaded = (
+        load_latest_trade_outcome_feedback_snippet(
+            settings,
+            provider=identity.provider,
+            account_scope=identity.account_scope,
+        )
+        if identity is not None
+        else {}
+    )
+    return strategy_feedback_for_decision_lane(
+        loaded,
+        decision_lane=decision_lane,
+    )
+
+
 def _build_batch_agent_request(
     *,
     settings: Settings,
@@ -2194,9 +2652,21 @@ def _build_batch_agent_request(
         account_context=account_context,
         request_started_at=request_started_at,
     )
-    account = _agent_account_payload(account_context)
-    portfolio = _agent_portfolio_payload(account_context)
+    decision_lane = _exact_candidate_decision_lane(candidates)
+    account = _agent_account_payload(
+        account_context,
+        decision_lane=decision_lane,
+    )
+    portfolio = _agent_portfolio_payload(
+        account_context,
+        decision_lane=decision_lane,
+    )
     risk_caps = _agent_risk_caps(settings)
+    trade_outcome_feedback = _strategy_lane_trade_outcome_feedback(
+        settings=settings,
+        account_context=account_context,
+        decision_lane=decision_lane,
+    )
     agent_id = getattr(settings, "exec_agent_id", OPENCLAW_EXEC_AGENT_ID)
     model = getattr(settings, "exec_agent_model", OPENCLAW_EXEC_AGENT_MODEL)
     request_context_digest = json_payload_hash(
@@ -2207,6 +2677,7 @@ def _build_batch_agent_request(
             "account": account,
             "portfolio": portfolio,
             "risk_caps": risk_caps,
+            "trade_outcome_feedback": trade_outcome_feedback,
         }
     )
     return ExecAgentBatchSizingRequest(
@@ -2227,6 +2698,7 @@ def _build_batch_agent_request(
         ],
         account=account,
         portfolio=portfolio,
+        trade_outcome_feedback=trade_outcome_feedback,
         risk_caps=risk_caps,
     )
 
@@ -2239,6 +2711,7 @@ def _build_agent_request(
     account_context: _AccountContext,
     source_identity: dict[str, object],
     binding: ExecAgentDecisionBinding | None = None,
+    trade_outcome_feedback: dict[str, object] | None = None,
 ) -> ExecAgentSizingRequest:
     candidate = _build_agent_candidate(
         plan=plan,
@@ -2255,6 +2728,19 @@ def _build_agent_request(
     )
     if binding is not None and candidate.binding != binding:
         raise _InvalidAgentContract("single-candidate request binding mismatch")
+    if binding is not None and trade_outcome_feedback is None:
+        raise _InvalidAgentContract(
+            "bound single-candidate request requires captured lane feedback"
+        )
+    exact_lane_feedback = (
+        trade_outcome_feedback
+        if trade_outcome_feedback is not None
+        else _strategy_lane_trade_outcome_feedback(
+            settings=settings,
+            account_context=account_context,
+            decision_lane=plan_item_decision_agent_name(item),
+        )
+    )
     return ExecAgentSizingRequest(
         agent_id=getattr(settings, "exec_agent_id", OPENCLAW_EXEC_AGENT_ID),
         model=getattr(settings, "exec_agent_model", OPENCLAW_EXEC_AGENT_MODEL),
@@ -2267,9 +2753,16 @@ def _build_agent_request(
         candidate_context=candidate.candidate_context,
         decider_input=candidate.decider_input,
         decider_output=candidate.decider_output,
-        account=_agent_account_payload(account_context),
-        portfolio=_agent_portfolio_payload(account_context),
+        account=_agent_account_payload(
+            account_context,
+            decision_lane=plan_item_decision_agent_name(item),
+        ),
+        portfolio=_agent_portfolio_payload(
+            account_context,
+            decision_lane=plan_item_decision_agent_name(item),
+        ),
         market_data=candidate.market_data,
+        trade_outcome_feedback=exact_lane_feedback,
         risk_caps=_agent_risk_caps(settings),
         binding=candidate.binding,
     )
@@ -2284,6 +2777,10 @@ def _build_agent_candidate(
     request_context_digest: str | None,
 ) -> ExecAgentAllocationCandidate:
     risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    sizing_risk_context = sizing_authority_risk_context(
+        risk_context,
+        decision_lane=plan_item_decision_agent_name(item),
+    )
     candidate_context = _agent_candidate_context(plan=plan, item=item)
     binding = _build_agent_decision_binding(
         plan=plan,
@@ -2300,11 +2797,11 @@ def _build_agent_candidate(
         intent=item.intent,
         source_identity=source_identity,
         candidate_context=candidate_context,
-        decider_input=_dict_or_none(risk_context.get("decider_input")),
-        decider_output=_dict_or_none(risk_context.get("decider_output")),
-        market_data=_dict_or_none(risk_context.get("market_data"))
-        or _dict_or_none(risk_context.get("quote"))
-        or _dict_or_none(risk_context.get("orderbook")),
+        decider_input=_dict_or_none(sizing_risk_context.get("decider_input")),
+        decider_output=_dict_or_none(sizing_risk_context.get("decider_output")),
+        market_data=_dict_or_none(sizing_risk_context.get("market_data"))
+        or _dict_or_none(sizing_risk_context.get("quote"))
+        or _dict_or_none(sizing_risk_context.get("orderbook")),
         binding=binding,
     )
 
@@ -2315,10 +2812,18 @@ def _agent_candidate_context(
     item: ExecutionPlanItem,
 ) -> dict[str, object]:
     risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    sizing_risk_context = sizing_authority_risk_context(
+        risk_context,
+        decision_lane=plan_item_decision_agent_name(item),
+    )
     quantity_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    sizing_quantity_policy = sizing_authority_risk_context(
+        quantity_policy,
+        decision_lane=plan_item_decision_agent_name(item),
+    )
     return {
-        "risk_context": risk_context,
-        "quantity_policy": quantity_policy,
+        "risk_context": sizing_risk_context,
+        "quantity_policy": sizing_quantity_policy,
         "limit_price": _serialize_decimal(item.limit_price),
         "trigger_price": _serialize_decimal(item.trigger_price),
         "time_in_force": item.time_in_force,
@@ -2517,15 +3022,32 @@ def _validate_agent_response_binding(
         raise _InvalidAgentContract("exec-agent response binding mismatch")
 
 
-def _agent_account_payload(account_context: _AccountContext) -> dict[str, object]:
-    return dict(account_context.snapshot_payload or {})
+def _agent_account_payload(
+    account_context: _AccountContext,
+    *,
+    decision_lane: str | None,
+) -> dict[str, object]:
+    return sizing_authority_account_context(
+        dict(account_context.snapshot_payload or {}),
+        decision_lane=decision_lane,
+    )
 
 
-def _agent_portfolio_payload(account_context: _AccountContext) -> dict[str, object]:
-    return {
+def _agent_portfolio_payload(
+    account_context: _AccountContext,
+    *,
+    decision_lane: str | None,
+) -> dict[str, object]:
+    return sizing_authority_account_context({
         "holdings_by_symbol": dict(account_context.holdings_by_symbol),
+        "holding_quantities_by_decision_lane": dict(
+            account_context.holding_quantities_by_decision_lane
+        ),
+        "holding_lane_attribution_complete_by_symbol": dict(
+            account_context.holding_lane_attribution_complete_by_symbol
+        ),
         "open_orders": [_serialize_open_order(order) for order in account_context.open_orders],
-    }
+    }, decision_lane=decision_lane)
 
 
 def _agent_risk_caps(settings: Settings) -> dict[str, object]:
@@ -2588,7 +3110,9 @@ def _agent_risk_caps(settings: Settings) -> dict[str, object]:
             "extended_momentum",
         ],
         "add_on_requires_confirmation": True,
-        "max_holding_trading_sessions": getattr(settings, "exec_agent_max_holding_trading_sessions", 2),
+        "max_holding_trading_sessions": _bounded_short_term_holding_sessions(
+            getattr(settings, "exec_agent_max_holding_trading_sessions", 2)
+        ),
         "max_account_snapshot_age_seconds": getattr(settings, "exec_agent_max_account_snapshot_age_seconds", 300),
     }
 
@@ -2798,6 +3322,49 @@ def _apply_rejected_decision(
     item.status = REJECTED_STATUS
 
 
+def _bounded_short_term_holding_sessions(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 2
+    return min(3, max(2, value))
+
+
+def _prefill_short_term_holding_sessions(
+    *,
+    settings: Settings,
+    buy_item: ExecutionPlanItem,
+) -> int:
+    configured: object = getattr(
+        settings,
+        "exec_agent_max_holding_trading_sessions",
+        2,
+    )
+    risk_context = (
+        buy_item.risk_context if isinstance(buy_item.risk_context, dict) else {}
+    )
+    policy = risk_context.get("max_holding_close_policy")
+    if policy is False or (
+        isinstance(policy, dict) and policy.get("enabled") is False
+    ):
+        # The short-term time exit is a hard safety cap. A caller may not
+        # disable it; the post-fill monitor uses the same three-session cap.
+        configured = 3
+    elif isinstance(policy, dict):
+        for key in (
+            "trading_sessions",
+            "max_holding_trading_sessions",
+            "sessions",
+        ):
+            candidate = policy.get(key)
+            if (
+                isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                and candidate > 0
+            ):
+                configured = candidate
+                break
+    return _bounded_short_term_holding_sessions(configured)
+
+
 def _append_monitoring_items(
     *,
     settings: Settings,
@@ -2807,6 +3374,10 @@ def _append_monitoring_items(
     next_plan_item_index: int,
 ) -> int:
     quantity = int(decision["quantity"])
+    max_holding_sessions = _prefill_short_term_holding_sessions(
+        settings=settings,
+        buy_item=buy_item,
+    )
     for stage in _take_profit_stages(settings=settings, decision=decision, quantity=quantity):
         plan.items.append(
             _new_monitoring_item(
@@ -2817,7 +3388,7 @@ def _append_monitoring_items(
                 quantity=stage["quantity"],
                 next_plan_item_index=next_plan_item_index,
                 trigger_price=stage["trigger_price"],
-                max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 2),
+                max_sessions=max_holding_sessions,
                 exit_rule=stage["exit_rule"],
             )
         )
@@ -2833,7 +3404,7 @@ def _append_monitoring_items(
             quantity=quantity,
             next_plan_item_index=next_plan_item_index,
             trigger_price=stop_price,
-            max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 2),
+            max_sessions=max_holding_sessions,
             exit_rule={
                 "kind": "hard_stop_loss",
                 "stop_price": _serialize_decimal(stop_price),
@@ -2852,7 +3423,7 @@ def _append_monitoring_items(
             quantity=quantity,
             next_plan_item_index=next_plan_item_index,
             trigger_price=None,
-            max_sessions=getattr(settings, "exec_agent_max_holding_trading_sessions", 2),
+            max_sessions=max_holding_sessions,
             exit_rule={"kind": "time_stop"},
         )
     )
@@ -2948,8 +3519,14 @@ def _new_monitoring_item(
     max_sessions: int,
     exit_rule: dict[str, object],
 ) -> ExecutionPlanItem:
+    max_sessions = _bounded_short_term_holding_sessions(max_sessions)
     provisional_entry_date = plan.market_date
-    close_exit_date = add_weekday_sessions(provisional_entry_date, max_sessions)
+    # The entry session is session one, matching the post-fill monitor's
+    # inclusive holding-age contract.
+    close_exit_date = add_weekday_sessions(
+        provisional_entry_date,
+        max_sessions - 1,
+    )
     source_market_date = buy_item.source_market_date
     provider = str(buy_item.provider or "kis").strip().lower()
     if provider != "kis":
@@ -2971,10 +3548,24 @@ def _new_monitoring_item(
         "source": "exec_agent_monitoring",
         "parent_idempotency_key": decision["idempotency_key"],
     }
+    entry_source_identity = serialize_plan_item_source_identity(buy_item)
+    entry_source_key = entry_source_identity.get("source_plan_item_id")
+    if isinstance(entry_source_key, str) and entry_source_key.strip():
+        quantity_policy["linked_entry_item_key"] = entry_source_key.strip()
+    entry_context = {
+        "source_plan_item_id": (
+            entry_source_key.strip()
+            if isinstance(entry_source_key, str) and entry_source_key.strip()
+            else None
+        ),
+        "execution_plan_item_id": buy_item.id,
+        "decision_agent_name": plan_item_decision_agent_name(buy_item),
+    }
     risk_context: dict[str, object] | None = {
         "generated_by": EXEC_AGENT_DECISION_VERSION,
-        "parent_source_identity": serialize_plan_item_source_identity(buy_item),
+        "parent_source_identity": entry_source_identity,
         "parent_idempotency_key": decision["idempotency_key"],
+        "entry_context": entry_context,
         "exit_rule": exit_rule,
         "confidence": decision.get("confidence"),
         "max_holding_trading_sessions": max_sessions,
@@ -3035,25 +3626,138 @@ def _has_duplicate_open_buy_order(
 ) -> bool:
     source_identity = serialize_plan_item_source_identity(item)
     source_candidate_id = source_identity.get("source_plan_item_id")
+    candidate_lane = _normalized_decision_lane(
+        plan_item_decision_agent_name(item)
+    )
+    lanes_by_broker_order_id: dict[str, set[str]] = {}
+    lanes_by_idempotency_key: dict[str, set[str]] = {}
+    for order in open_orders:
+        payload = order.payload if isinstance(order.payload, dict) else {}
+        lane = _normalized_decision_lane(payload.get("decision_agent_name"))
+        if lane is None:
+            continue
+        if order.broker_order_id:
+            lanes_by_broker_order_id.setdefault(order.broker_order_id, set()).add(
+                lane
+            )
+        if order.idempotency_key:
+            lanes_by_idempotency_key.setdefault(order.idempotency_key, set()).add(
+                lane
+            )
+    attributed_lanes_by_broker_order_id = {
+        key: next(iter(lanes))
+        for key, lanes in lanes_by_broker_order_id.items()
+        if len(lanes) == 1
+    }
+    attributed_lanes_by_idempotency_key = {
+        key: next(iter(lanes))
+        for key, lanes in lanes_by_idempotency_key.items()
+        if len(lanes) == 1
+    }
     for order in open_orders:
         if order.side != "buy":
             continue
         payload = order.payload if isinstance(order.payload, dict) else {}
         if (
             order.symbol == item.symbol
-            and payload.get("capital_truth_uncertain") is True
+            and payload.get("remaining_quantity_indeterminate") is True
         ):
             return True
-        remaining_quantity = order.remaining_quantity or order.quantity
+        remaining_quantity = (
+            order.remaining_quantity
+            if order.remaining_quantity is not None
+            else order.quantity
+        )
         if remaining_quantity is not None and remaining_quantity <= 0:
             continue
         if order.idempotency_key == idempotency_key:
             return True
+        order_lane = _normalized_decision_lane(payload.get("decision_agent_name"))
+        if order_lane is None and order.broker_order_id:
+            order_lane = attributed_lanes_by_broker_order_id.get(order.broker_order_id)
+        if order_lane is None and order.idempotency_key:
+            order_lane = attributed_lanes_by_idempotency_key.get(order.idempotency_key)
         if source_candidate_id and order.source_candidate_id == source_candidate_id:
+            if (
+                candidate_lane is None
+                or order_lane is None
+                or order_lane == candidate_lane
+            ):
+                return True
+        if order.symbol != item.symbol:
+            continue
+        if candidate_lane is None or order_lane is None:
             return True
-        if order.symbol == item.symbol and order.idempotency_key is None and order.source_candidate_id is None:
+        if order_lane == candidate_lane:
             return True
     return False
+
+
+def _normalized_decision_lane(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().casefold()
+
+
+def _same_lane_holding_quantity(
+    *,
+    account_context: _AccountContext,
+    symbol: str,
+    decision_lane: str,
+    aggregate_quantity: int,
+) -> tuple[int, bool]:
+    if aggregate_quantity <= 0:
+        return 0, True
+    if (
+        account_context.holding_lane_attribution_complete_by_symbol.get(symbol)
+        is not True
+    ):
+        return aggregate_quantity, False
+    quantities_by_lane = (
+        account_context.holding_quantities_by_decision_lane.get(symbol)
+    )
+    if not isinstance(quantities_by_lane, dict):
+        return aggregate_quantity, False
+    attributed_total = 0
+    same_lane_quantity = 0
+    for raw_lane, raw_quantity in quantities_by_lane.items():
+        lane = _normalized_decision_lane(raw_lane)
+        if lane is None or isinstance(raw_quantity, bool):
+            return aggregate_quantity, False
+        try:
+            quantity = int(raw_quantity)
+        except (TypeError, ValueError):
+            return aggregate_quantity, False
+        if quantity < 0 or quantity != raw_quantity:
+            return aggregate_quantity, False
+        attributed_total += quantity
+        if lane == decision_lane:
+            same_lane_quantity += quantity
+    if attributed_total != aggregate_quantity:
+        return aggregate_quantity, False
+    return same_lane_quantity, True
+
+
+def _existing_symbol_exposure(
+    *,
+    account_context: _AccountContext,
+    symbol: str,
+    fallback_price: Decimal,
+) -> Decimal:
+    total = Decimal(account_context.holdings_by_symbol.get(symbol, 0)) * fallback_price
+    for order in account_context.open_orders:
+        if order.symbol != symbol or str(order.side or "").strip().lower() != "buy":
+            continue
+        remaining_quantity = (
+            order.remaining_quantity
+            if order.remaining_quantity is not None
+            else order.quantity
+        )
+        if remaining_quantity is None or remaining_quantity <= 0:
+            continue
+        order_price = order.limit_price or fallback_price
+        total += Decimal(remaining_quantity) * max(fallback_price, order_price)
+    return total.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
 
 
 def _sizing_price(
@@ -3131,7 +3835,8 @@ def _serialize_account_snapshot(snapshot: BrokerAccountSnapshot) -> dict[str, ob
 
 
 def _serialize_open_order(order: BrokerAccountOpenOrder) -> dict[str, object]:
-    return {
+    payload = order.payload if isinstance(order.payload, dict) else {}
+    serialized: dict[str, object] = {
         "symbol": order.symbol,
         "side": order.side,
         "quantity": order.quantity,
@@ -3142,6 +3847,11 @@ def _serialize_open_order(order: BrokerAccountOpenOrder) -> dict[str, object]:
         "source_candidate_id": order.source_candidate_id,
         "limit_price": _serialize_decimal(order.limit_price),
     }
+    if payload.get("decision_agent_name") is not None:
+        serialized["decision_agent_name"] = payload["decision_agent_name"]
+    if payload.get("entry_family_key") is not None:
+        serialized["entry_family_key"] = payload["entry_family_key"]
+    return serialized
 
 
 def _serialize_decimal(value: Decimal | None) -> str | None:

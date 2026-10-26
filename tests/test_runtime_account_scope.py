@@ -2030,6 +2030,411 @@ def test_runtime_pnl_includes_supported_kis_nxt_and_sor_routes() -> None:
     engine.dispose()
 
 
+def test_runtime_pnl_matches_kis_domestic_lots_across_execution_routes() -> None:
+    settings = _settings().model_copy(update={"monthly_target_krw": Decimal("100")})
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 9, 10, 3, 0, tzinfo=UTC)
+    buy = _canonical_order(
+        settings,
+        key="pnl-domestic-nxt-buy",
+        symbol="DOMESTIC-CROSS-ROUTE",
+        side="buy",
+        status="filled",
+        exchange="NXT",
+    )
+    sell = _canonical_order(
+        settings,
+        key="pnl-domestic-krx-sell",
+        symbol="DOMESTIC-CROSS-ROUTE",
+        side="sell",
+        status="filled",
+        exchange="KRX",
+    )
+    db.add_all((buy, sell))
+    db.flush()
+    db.add_all(
+        (
+            _fill(
+                buy,
+                key="pnl-domestic-nxt-buy-fill",
+                quantity=1,
+                price="100",
+                settlement_currency="KRW",
+                transaction_cost="0",
+                filled_at=now - timedelta(hours=2),
+            ),
+            _fill(
+                sell,
+                key="pnl-domestic-krx-sell-fill",
+                quantity=1,
+                price="90",
+                settlement_currency="KRW",
+                transaction_cost="0",
+                filled_at=now - timedelta(hours=1),
+            ),
+        )
+    )
+    db.commit()
+
+    daily = runtime_service.daily_pnl_payload(settings=settings, db=db, now=now)
+    weekly = runtime_service.weekly_pnl_payload(settings=settings, db=db, now=now)
+    monthly = runtime_service.monthly_pnl_payload(settings=settings, db=db, now=now)
+
+    assert daily["daily_gross_realized_pnl_krw"] == "-10.0000"
+    assert daily["matched_sell_quantity"] == 1
+    assert weekly["weekly_gross_realized_pnl_krw"] == "-10.0000"
+    assert weekly["loss_count"] == 1
+    assert monthly["monthly_gross_realized_pnl_krw"] == "-10.0000"
+    db.close()
+    engine.dispose()
+
+
+def test_runtime_pnl_fails_closed_on_active_generation_duplicate_fill_conflict() -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 9, 10, 3, 0, tzinfo=UTC)
+    buy = _canonical_order(
+        settings,
+        key="pnl-conflict-buy",
+        symbol="PNL-CONFLICT",
+        side="buy",
+        status="filled",
+    )
+    sell = _canonical_order(
+        settings,
+        key="pnl-conflict-sell",
+        symbol="PNL-CONFLICT",
+        side="sell",
+        status="filled",
+    )
+    db.add_all((buy, sell))
+    db.flush()
+    first = _fill(
+        sell,
+        key="pnl-conflicting-broker-fill",
+        quantity=1,
+        price="90",
+        settlement_currency="KRW",
+        transaction_cost="0",
+        filled_at=now - timedelta(hours=2),
+    )
+    conflicting = _fill(
+        sell,
+        key="pnl-conflicting-broker-fill",
+        quantity=1,
+        price="91",
+        settlement_currency="KRW",
+        transaction_cost="0",
+        filled_at=now - timedelta(hours=2),
+    )
+    first.id = "pnl-conflicting-fill-a"
+    conflicting.id = "pnl-conflicting-fill-b"
+    db.add_all(
+        (
+            _fill(
+                buy,
+                key="pnl-conflict-buy-fill",
+                quantity=1,
+                price="100",
+                settlement_currency="KRW",
+                transaction_cost="0",
+                filled_at=now - timedelta(hours=3),
+            ),
+            first,
+            conflicting,
+            FifoInventoryIsolation(
+                mode=settings.runtime_mode,
+                provider=buy.request_metadata["execution_scope"]["provider"],
+                account_scope=buy.request_metadata["execution_scope"]["account_scope"],
+                venue="KRX",
+                asset_class="kr_equity",
+                exchange="KRX",
+                symbol="PNL-CONFLICT",
+                residual_quantity=Decimal("0"),
+                last_local_fill_at=now - timedelta(hours=2),
+                broker_position_id="pnl-conflict-later-flat",
+                broker_position_quantity=Decimal("0"),
+                broker_reconciled_at=now - timedelta(minutes=30),
+                isolated_through_at=now - timedelta(minutes=30),
+                evidence_source="broker_flat_reconciliation",
+                actor="test",
+                reason="later flat cannot rewrite period economics",
+            ),
+        )
+    )
+    db.commit()
+
+    for payload in (
+        runtime_service.daily_pnl_payload(settings=settings, db=db, now=now),
+        runtime_service.weekly_pnl_payload(settings=settings, db=db, now=now),
+        runtime_service.monthly_pnl_payload(settings=settings, db=db, now=now),
+    ):
+        assert payload["calculation_status"] == "not_computed"
+        assert payload["calculation_reason"] == "duplicate_fill_economic_conflict"
+    db.close()
+    engine.dispose()
+
+
+def test_runtime_pnl_blocks_duplicate_identity_spanning_flat_boundary() -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 9, 10, 3, 0, tzinfo=UTC)
+    old_at = now - timedelta(days=2)
+    boundary_at = now - timedelta(days=1)
+    buy = _canonical_order(
+        settings,
+        key="pnl-spanning-conflict-buy",
+        symbol="PNL-SPANNING-CONFLICT",
+        side="buy",
+        status="filled",
+        exchange="KRX",
+    )
+    sell = _canonical_order(
+        settings,
+        key="pnl-spanning-conflict-sell",
+        symbol="PNL-SPANNING-CONFLICT",
+        side="sell",
+        status="filled",
+        exchange="NXT",
+    )
+    db.add_all((buy, sell))
+    db.flush()
+    old_sell = _fill(
+        sell,
+        key="  pnl-spanning-conflicting-fill  ",
+        quantity=1,
+        price="90",
+        settlement_currency="KRW",
+        transaction_cost="0",
+        filled_at=old_at,
+    )
+    current_sell = _fill(
+        sell,
+        key="pnl-spanning-conflicting-fill",
+        quantity=1,
+        price="91",
+        settlement_currency="KRW",
+        transaction_cost="0",
+        filled_at=now - timedelta(hours=1),
+    )
+    old_sell.id = "pnl-spanning-conflicting-fill-old"
+    current_sell.id = "pnl-spanning-conflicting-fill-current"
+    execution_scope = buy.request_metadata["execution_scope"]
+    db.add_all(
+        (
+            _fill(
+                buy,
+                key="pnl-spanning-clean-buy-fill",
+                quantity=1,
+                price="100",
+                settlement_currency="KRW",
+                transaction_cost="0",
+                filled_at=now - timedelta(hours=2),
+            ),
+            old_sell,
+            current_sell,
+            FifoInventoryIsolation(
+                mode=settings.runtime_mode,
+                provider=execution_scope["provider"],
+                account_scope=execution_scope["account_scope"],
+                venue="KRX",
+                asset_class="kr_equity",
+                exchange="KRX",
+                symbol="PNL-SPANNING-CONFLICT",
+                residual_quantity=Decimal("1"),
+                last_local_fill_at=old_at,
+                broker_position_id="pnl-spanning-conflict-flat",
+                broker_position_quantity=Decimal("0"),
+                broker_reconciled_at=boundary_at,
+                isolated_through_at=boundary_at,
+                evidence_source="broker_flat_reconciliation",
+                actor="test",
+                reason="flat cannot split a conflicting broker fill identity",
+            ),
+        )
+    )
+    db.commit()
+
+    period_selection = runtime_service._active_runtime_fills_for_period(
+        settings=settings,
+        db=db,
+        start_at=datetime(2026, 9, 9, 15, 0, tzinfo=UTC),
+        end_at=datetime(2026, 9, 10, 15, 0, tzinfo=UTC),
+        provider="kis",
+    )
+    assert period_selection.scope_unavailable_reason == (
+        "duplicate_fill_economic_conflict"
+    )
+    assert "pnl-spanning-conflicting-fill-old" not in {
+        fill.id for fill in period_selection.fills
+    }
+
+    for payload in (
+        runtime_service.daily_pnl_payload(settings=settings, db=db, now=now),
+        runtime_service.weekly_pnl_payload(settings=settings, db=db, now=now),
+        runtime_service.monthly_pnl_payload(settings=settings, db=db, now=now),
+    ):
+        assert payload["calculation_status"] == "not_computed"
+        assert payload["calculation_reason"] == "duplicate_fill_economic_conflict"
+
+    db.close()
+    engine.dispose()
+
+
+def test_runtime_period_peer_lookup_fails_closed_at_strict_row_cap() -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    start_at = datetime(2026, 9, 9, 15, 0, tzinfo=UTC)
+    end_at = datetime(2026, 9, 10, 15, 0, tzinfo=UTC)
+    order = _canonical_order(
+        settings,
+        key="pnl-peer-overflow-buy",
+        symbol="PNL-PEER-OVERFLOW",
+        side="buy",
+        status="filled",
+    )
+    db.add(order)
+    db.flush()
+    db.add_all(
+        [
+            _fill(
+                order,
+                key="pnl-peer-overflow-fill",
+                quantity=1,
+                price="100",
+                settlement_currency="KRW",
+                transaction_cost="0",
+                filled_at=start_at + timedelta(hours=1),
+            )
+            for _index in range(1001)
+        ]
+    )
+    db.commit()
+
+    selection = runtime_service._active_runtime_fills_for_period(
+        settings=settings,
+        db=db,
+        start_at=start_at,
+        end_at=end_at,
+        provider="kis",
+    )
+
+    assert selection.scope_unavailable_reason == (
+        "duplicate_fill_peer_evidence_overflow"
+    )
+    db.close()
+    engine.dispose()
+
+
+def test_runtime_pnl_ignores_duplicate_conflict_before_domestic_flat_boundary() -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    now = datetime(2026, 9, 10, 3, 0, tzinfo=UTC)
+    old_at = datetime(2026, 8, 31, 1, 0, tzinfo=UTC)
+    boundary_at = datetime(2026, 9, 1, 1, 0, tzinfo=UTC)
+    old_buy = _canonical_order(
+        settings,
+        key="pnl-old-conflict-nxt-buy",
+        symbol="PNL-CLEAN-GENERATION",
+        side="buy",
+        status="filled",
+        exchange="NXT",
+    )
+    clean_buy = _canonical_order(
+        settings,
+        key="pnl-clean-krx-buy",
+        symbol="PNL-CLEAN-GENERATION",
+        side="buy",
+        status="filled",
+        exchange="KRX",
+    )
+    clean_sell = _canonical_order(
+        settings,
+        key="pnl-clean-nxt-sell",
+        symbol="PNL-CLEAN-GENERATION",
+        side="sell",
+        status="filled",
+        exchange="NXT",
+    )
+    db.add_all((old_buy, clean_buy, clean_sell))
+    db.flush()
+    old_first = _fill(
+        old_buy,
+        key="pnl-old-conflicting-broker-fill",
+        quantity=1,
+        price="50",
+        settlement_currency="KRW",
+        transaction_cost="0",
+        filled_at=old_at,
+    )
+    old_conflicting = _fill(
+        old_buy,
+        key="pnl-old-conflicting-broker-fill",
+        quantity=1,
+        price="60",
+        settlement_currency="KRW",
+        transaction_cost="0",
+        filled_at=old_at,
+    )
+    old_first.id = "pnl-old-conflicting-fill-a"
+    old_conflicting.id = "pnl-old-conflicting-fill-b"
+    execution_scope = clean_buy.request_metadata["execution_scope"]
+    db.add_all(
+        (
+            old_first,
+            old_conflicting,
+            _fill(
+                clean_buy,
+                key="pnl-clean-buy-fill",
+                quantity=1,
+                price="100",
+                settlement_currency="KRW",
+                transaction_cost="0",
+                filled_at=now - timedelta(hours=2),
+            ),
+            _fill(
+                clean_sell,
+                key="pnl-clean-sell-fill",
+                quantity=1,
+                price="90",
+                settlement_currency="KRW",
+                transaction_cost="0",
+                filled_at=now - timedelta(hours=1),
+            ),
+            FifoInventoryIsolation(
+                mode=settings.runtime_mode,
+                provider=execution_scope["provider"],
+                account_scope=execution_scope["account_scope"],
+                venue="KRX",
+                asset_class="kr_equity",
+                exchange="KRX",
+                symbol="PNL-CLEAN-GENERATION",
+                residual_quantity=Decimal("1"),
+                last_local_fill_at=old_at,
+                broker_position_id="pnl-clean-generation-flat",
+                broker_position_quantity=Decimal("0"),
+                broker_reconciled_at=boundary_at,
+                isolated_through_at=boundary_at,
+                evidence_source="broker_flat_reconciliation",
+                actor="test",
+                reason="verified domestic flat boundary",
+            ),
+        )
+    )
+    db.commit()
+
+    for payload in (
+        runtime_service.daily_pnl_payload(settings=settings, db=db, now=now),
+        runtime_service.weekly_pnl_payload(settings=settings, db=db, now=now),
+        runtime_service.monthly_pnl_payload(settings=settings, db=db, now=now),
+    ):
+        assert payload["calculation_status"] == "computed"
+        assert Decimal(str(payload["gross_realized_pnl_krw"])) == Decimal("-10.0000")
+        assert payload["matched_sell_quantity"] == 1
+    db.close()
+    engine.dispose()
+
+
 def test_runtime_pnl_does_not_report_zero_when_fill_scope_is_ambiguous() -> None:
     settings = _settings()
     engine, _factory, db = _session(settings)

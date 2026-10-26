@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, distinct, func, literal, or_, select
+from sqlalchemy import and_, distinct, func, literal, or_, select, tuple_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import (
     Session,
@@ -36,6 +36,7 @@ from app.services.fill_idempotency import (
     duplicate_fill_conflicting_fields,
     duplicate_fill_group_candidate_key,
     execution_fill_dedupe_key,
+    execution_fills_have_relevant_conflicting_identity,
 )
 from app.services.fill_economics import (
     ClosedTradeEconomics,
@@ -46,6 +47,7 @@ from app.services.fill_economics import (
 from app.services.fifo_inventory import (
     FifoRouteScope,
     ambiguous_fifo_realized_pnl_sell_count,
+    canonical_fifo_inventory_route_scope,
     fifo_fill_sort_key,
     fifo_route_scope_from_order,
     legacy_kis_krx_event_is_isolated,
@@ -1572,26 +1574,99 @@ def _active_runtime_fills_for_period(
     ]
     if start_at is not None:
         period_filters.append(ExecutionFill.filled_at >= start_at)
-    fills = dedupe_execution_fills(
+    fill_load_options = (
+        undefer(ExecutionFill.payload),
+        selectinload(ExecutionFill.broker_order).load_only(
+            BrokerOrder.id,
+            BrokerOrder.broker_name,
+            BrokerOrder.mode,
+            BrokerOrder.request_metadata,
+            BrokerOrder.venue,
+            BrokerOrder.asset_class,
+        ),
+    )
+    raw_fills = list(
         db.scalars(
             select(ExecutionFill)
             .select_from(ExecutionFill)
             .join(ExecutionFill.broker_order)
             .where(*period_filters)
-            .options(
-                undefer(ExecutionFill.payload),
-                selectinload(ExecutionFill.broker_order).load_only(
-                    BrokerOrder.id,
-                    BrokerOrder.broker_name,
-                    BrokerOrder.mode,
-                    BrokerOrder.request_metadata,
-                    BrokerOrder.venue,
-                    BrokerOrder.asset_class,
-                ),
-            )
+            .options(*fill_load_options)
             .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
         ).all()
     )
+    active_period_raw_fills: list[ExecutionFill] = []
+    for fill in raw_fills:
+        classification, _route_scope = _runtime_order_scope_classification(
+            settings=settings,
+            order=fill.broker_order,
+            provider=provider,
+            runtime_scope=scope,
+        )
+        if classification == "active":
+            active_period_raw_fills.append(fill)
+
+    conflict_evidence_fills = list(active_period_raw_fills)
+    if start_at is not None and active_period_raw_fills:
+        peer_idempotency_keys = sorted(
+            {
+                str(fill.idempotency_key)
+                for fill in active_period_raw_fills
+                if isinstance(fill.idempotency_key, str)
+                and fill.idempotency_key.strip()
+            }
+        )
+        peer_broker_fill_keys = sorted(
+            {
+                (str(fill.broker_order_pk), str(fill.broker_fill_id).strip())
+                for fill in active_period_raw_fills
+                if isinstance(fill.broker_fill_id, str)
+                and fill.broker_fill_id.strip()
+            }
+        )
+        peer_fills_by_id = {fill.id: fill for fill in conflict_evidence_fills}
+        peer_batch_size = 200
+        peer_row_limit_per_batch = 1000
+        peer_evidence_overflow = False
+        peer_predicates = [
+            ExecutionFill.idempotency_key.in_(
+                peer_idempotency_keys[index : index + peer_batch_size]
+            )
+            for index in range(0, len(peer_idempotency_keys), peer_batch_size)
+        ]
+        peer_predicates.extend(
+            tuple_(
+                ExecutionFill.broker_order_pk,
+                func.trim(ExecutionFill.broker_fill_id),
+            ).in_(peer_broker_fill_keys[index : index + peer_batch_size])
+            for index in range(0, len(peer_broker_fill_keys), peer_batch_size)
+        )
+        for predicate in peer_predicates:
+            peer_rows = db.scalars(
+                select(ExecutionFill)
+                .select_from(ExecutionFill)
+                .join(ExecutionFill.broker_order)
+                .where(
+                    BrokerOrder.mode == settings.runtime_mode,
+                    ExecutionFill.filled_at < end_at,
+                    predicate,
+                )
+                .options(*fill_load_options)
+                .order_by(ExecutionFill.filled_at.asc(), ExecutionFill.id.asc())
+                .limit(peer_row_limit_per_batch + 1)
+            ).all()
+            if len(peer_rows) > peer_row_limit_per_batch:
+                peer_evidence_overflow = True
+                break
+            for fill in peer_rows:
+                peer_fills_by_id[fill.id] = fill
+        conflict_evidence_fills = sorted(
+            peer_fills_by_id.values(),
+            key=lambda fill: (_as_utc(fill.filled_at), str(fill.id)),
+        )
+    else:
+        peer_evidence_overflow = False
+    fills = dedupe_execution_fills(raw_fills)
     active_fills: list[ExecutionFill] = []
     indeterminate_fill_count = 0
     isolated_legacy_fill_count = 0
@@ -1604,6 +1679,50 @@ def _active_runtime_fills_for_period(
         )
         if exact_krx_scope is not None and legacy_isolation_cutoff is not None
         else None
+    )
+    active_generation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=settings.runtime_mode,
+        through=end_at,
+    )
+    report_start = start_at or legacy_isolation_cutoff
+    active_scope_raw_fills: list[ExecutionFill] = []
+
+    def conflict_is_relevant(fill: ExecutionFill) -> bool:
+        classification, route_scope = _runtime_order_scope_classification(
+            settings=settings,
+            order=fill.broker_order,
+            provider=provider,
+            runtime_scope=scope,
+        )
+        if classification != "active" or route_scope is None:
+            return False
+        latest_boundary = active_generation_cursor.latest_boundary_through(
+            route_scope=route_scope,
+            symbol=fill.symbol,
+            observed_at=end_at,
+        )
+        fill_time = _as_utc(fill.filled_at)
+        return (
+            (report_start is not None and fill_time >= report_start)
+            or latest_boundary is None
+            or fill_time > latest_boundary
+        )
+
+    for fill in conflict_evidence_fills:
+        classification, _route_scope = _runtime_order_scope_classification(
+            settings=settings,
+            order=fill.broker_order,
+            provider=provider,
+            runtime_scope=scope,
+        )
+        if classification == "active":
+            active_scope_raw_fills.append(fill)
+    duplicate_fill_economic_conflict = (
+        execution_fills_have_relevant_conflicting_identity(
+            active_scope_raw_fills,
+            is_relevant=conflict_is_relevant,
+        )
     )
     for fill in fills:
         classification, _route_scope = _runtime_order_scope_classification(
@@ -1634,6 +1753,15 @@ def _active_runtime_fills_for_period(
         fills=active_fills,
         indeterminate_fill_count=indeterminate_fill_count,
         isolated_legacy_fill_count=isolated_legacy_fill_count,
+        scope_unavailable_reason=(
+            "duplicate_fill_peer_evidence_overflow"
+            if peer_evidence_overflow
+            else (
+                "duplicate_fill_economic_conflict"
+                if duplicate_fill_economic_conflict
+                else None
+            )
+        ),
     )
 
 
@@ -4507,14 +4635,19 @@ def daily_pnl_payload(
         quantity = _pnl_fill_quantity(fill)
         notional = _pnl_fill_notional(fill=fill, quantity=quantity)
         route_scope = fifo_route_scope_from_order(fill.broker_order)
-        lots = (
-            lots_by_route_symbol.setdefault((route_scope, symbol), [])
+        inventory_route_scope = (
+            canonical_fifo_inventory_route_scope(route_scope)
             if route_scope is not None
+            else None
+        )
+        lots = (
+            lots_by_route_symbol.setdefault((inventory_route_scope, symbol), [])
+            if inventory_route_scope is not None
             else []
         )
         scope_quality_available = (
             isolation_cursor.apply_before(
-                route_scope=route_scope,
+                route_scope=inventory_route_scope,
                 symbol=symbol,
                 observed_at=filled_at,
                 lots=lots,
@@ -4801,14 +4934,19 @@ def _period_realized_pnl_summary(
         quantity = _pnl_fill_quantity(fill)
         notional = _pnl_fill_notional(fill=fill, quantity=quantity)
         route_scope = fifo_route_scope_from_order(fill.broker_order)
-        lots = (
-            lots_by_route_symbol.setdefault((route_scope, symbol), [])
+        inventory_route_scope = (
+            canonical_fifo_inventory_route_scope(route_scope)
             if route_scope is not None
+            else None
+        )
+        lots = (
+            lots_by_route_symbol.setdefault((inventory_route_scope, symbol), [])
+            if inventory_route_scope is not None
             else []
         )
         scope_quality_available = (
             isolation_cursor.apply_before(
-                route_scope=route_scope,
+                route_scope=inventory_route_scope,
                 symbol=symbol,
                 observed_at=filled_at,
                 lots=lots,
@@ -4840,7 +4978,7 @@ def _period_realized_pnl_summary(
         in_period = filled_at >= start_at
         next_buy_after_sell = _pnl_next_buy_after(
             fills=fills,
-            route_scope=route_scope,
+            route_scope=inventory_route_scope,
             symbol=symbol,
             after=filled_at,
         )
@@ -4861,7 +4999,7 @@ def _period_realized_pnl_summary(
             cost_source = "fill_fifo"
             position = _pnl_position_for_route(
                 positions_by_route_symbol=positions_by_route_symbol,
-                route_scope=route_scope,
+                route_scope=inventory_route_scope,
                 symbol=symbol,
             )
             broker_cost_basis = _pnl_broker_reconciliation_cost_basis(
@@ -4903,7 +5041,7 @@ def _period_realized_pnl_summary(
         if remaining > 0 and in_period:
             position = _pnl_position_for_route(
                 positions_by_route_symbol=positions_by_route_symbol,
-                route_scope=route_scope,
+                route_scope=inventory_route_scope,
                 symbol=symbol,
             )
             broker_cost_basis = _pnl_broker_reconciliation_cost_basis(
@@ -5019,7 +5157,13 @@ def _pnl_next_buy_after(
         _as_utc(fill.filled_at)
         for fill in fills
         if fill.symbol == symbol
-        and fifo_route_scope_from_order(fill.broker_order) == route_scope
+        and (
+            (fill_route_scope := fifo_route_scope_from_order(fill.broker_order))
+            is not None
+        )
+        and route_scope is not None
+        and canonical_fifo_inventory_route_scope(fill_route_scope)
+        == canonical_fifo_inventory_route_scope(route_scope)
         and str(fill.side or "").lower() == "buy"
         and _as_utc(fill.filled_at) > after
     ]
@@ -5037,15 +5181,38 @@ def _pnl_position_matches_route(
         identity = position_identity_from_columns(position)
     except PositionIdentityConflictError:
         return False
-    return bool(
-        identity is not None
-        and identity.provider == route_scope.provider
-        and identity.account_scope == route_scope.account_scope
-        and identity.exchange == route_scope.exchange
+    if identity is None:
+        return False
+    return _pnl_inventory_position_identity_key(
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+    ) == _pnl_inventory_position_identity_key(
+        provider=route_scope.provider,
+        account_scope=route_scope.account_scope,
+        exchange=route_scope.exchange,
     )
 
 
 PnlPositionRouteKey = tuple[str, str, str, str]
+
+
+def _pnl_inventory_position_identity_key(
+    *,
+    provider: str,
+    account_scope: str,
+    exchange: str,
+) -> tuple[str, str, str]:
+    scope = canonical_fifo_inventory_route_scope(
+        FifoRouteScope(
+            provider=provider,
+            account_scope=account_scope,
+            venue=exchange,
+            asset_class="stock",
+            exchange=exchange,
+        )
+    )
+    return (scope.provider, scope.account_scope, scope.exchange)
 
 
 def _pnl_position_route_key(position: ExecutionPosition) -> PnlPositionRouteKey | None:
@@ -5055,10 +5222,15 @@ def _pnl_position_route_key(position: ExecutionPosition) -> PnlPositionRouteKey 
         return None
     if identity is None:
         return None
+    provider, account_scope, exchange = _pnl_inventory_position_identity_key(
+        provider=identity.provider,
+        account_scope=identity.account_scope,
+        exchange=identity.exchange,
+    )
     return (
-        identity.provider,
-        identity.account_scope,
-        identity.exchange,
+        provider,
+        account_scope,
+        exchange,
         position.symbol,
     )
 
@@ -5114,11 +5286,12 @@ def _pnl_position_for_route(
 ) -> ExecutionPosition | None:
     if route_scope is None:
         return None
+    inventory_scope = canonical_fifo_inventory_route_scope(route_scope)
     return positions_by_route_symbol.get(
         (
-            route_scope.provider,
-            route_scope.account_scope,
-            route_scope.exchange,
+            inventory_scope.provider,
+            inventory_scope.account_scope,
+            inventory_scope.exchange,
             symbol,
         )
     )

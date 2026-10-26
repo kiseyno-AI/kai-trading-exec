@@ -24,6 +24,7 @@ from app.services.autonomous_runtime import (
     MonitoringRuntimeSnapshot,
 )
 from app.services.execution_account_route import bind_kis_account_route
+from app.services.execution_semantics import KRX_EXCHANGES
 from app.services.exec_agent_approval import (
     BuyEconomicsAssessment,
     delegated_buy_gate_rejections,
@@ -153,6 +154,7 @@ def _monitoring_order(
     plan_item: ExecutionPlanItem | None = None,
     created_at: datetime | None = None,
 ) -> BrokerOrder:
+    asset_class = "kr_equity" if exchange in KRX_EXCHANGES else "us_equity"
     identity = build_position_identity(
         settings=settings,
         provider="kis",
@@ -161,7 +163,7 @@ def _monitoring_order(
     scope = execution_scope_payload(
         identity=identity,
         venue=exchange,
-        asset_class="kr_equity" if exchange == "KRX" else "us_equity",
+        asset_class=asset_class,
     )
     if account_scope is not None:
         scope["account_scope"] = account_scope
@@ -176,7 +178,7 @@ def _monitoring_order(
         status=status,
         quantity=1,
         venue=exchange,
-        asset_class="kr_equity" if exchange == "KRX" else "us_equity",
+        asset_class=asset_class,
         execution_plan_item_id=plan_item.id if plan_item is not None else None,
         request_metadata={"exchange": exchange, "execution_scope": scope},
         created_at=created_at,
@@ -960,13 +962,21 @@ def test_foreign_replanned_stop_cannot_replace_matching_account_monitor() -> Non
         settings=settings,
         provider="kis",
         risk_context={"exchange": "KRX"},
-        quantity_policy={"kind": "shares", "quantity": 2},
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 2,
+            "linked_entry_item_key": "core-entry-1",
+        },
     )
     foreign_risk, foreign_policy = bind_kis_account_route(
         settings=foreign_settings,
         provider="kis",
         risk_context={"exchange": "KRX"},
-        quantity_policy={"kind": "shares", "quantity": 2},
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 2,
+            "linked_entry_item_key": "core-entry-1",
+        },
     )
 
     try:
@@ -979,6 +989,7 @@ def test_foreign_replanned_stop_cannot_replace_matching_account_monitor() -> Non
                 intent="stop_sell",
                 status="stop_sell_monitoring",
                 source_plan_item_id="core-entry-1",
+                decision_agent_name="signal-decider",
                 provider="kis",
                 asset_class="stock",
                 trigger_price=Decimal("90"),
@@ -1006,6 +1017,7 @@ def test_foreign_replanned_stop_cannot_replace_matching_account_monitor() -> Non
                 intent="stop_sell",
                 status="pending",
                 source_plan_item_id="core-entry-1",
+                decision_agent_name="signal-decider",
                 provider="kis",
                 asset_class="stock",
                 trigger_price=Decimal("80"),
@@ -1052,7 +1064,11 @@ def test_temporally_invalid_replan_cannot_mutate_current_protective_monitor(
         settings=settings,
         provider="kis",
         risk_context={"exchange": "KRX"},
-        quantity_policy={"kind": "shares", "quantity": 2},
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 2,
+            "linked_entry_item_key": "core-temporal-entry",
+        },
     )
     identity = build_position_identity(
         settings=settings,
@@ -1069,6 +1085,7 @@ def test_temporally_invalid_replan_cannot_mutate_current_protective_monitor(
                 intent="stop_sell",
                 status="stop_sell_monitoring",
                 source_plan_item_id="core-temporal-entry",
+                decision_agent_name="signal-decider",
                 provider="kis",
                 asset_class="stock",
                 trigger_price=Decimal("90"),
@@ -1107,6 +1124,7 @@ def test_temporally_invalid_replan_cannot_mutate_current_protective_monitor(
                 intent="stop_sell",
                 status="pending",
                 source_plan_item_id="core-temporal-entry",
+                decision_agent_name="signal-decider",
                 provider="kis",
                 asset_class="stock",
                 trigger_price=Decimal("10"),
@@ -1164,7 +1182,11 @@ def test_delayed_same_day_replan_cannot_downgrade_newer_core_protection() -> Non
         settings=settings,
         provider="kis",
         risk_context={"exchange": "KRX"},
-        quantity_policy={"kind": "shares", "quantity": 2},
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 2,
+            "linked_entry_item_key": "core-sequenced-entry",
+        },
     )
     identity = build_position_identity(
         settings=settings,
@@ -1181,6 +1203,7 @@ def test_delayed_same_day_replan_cannot_downgrade_newer_core_protection() -> Non
                 intent="stop_sell",
                 status="stop_sell_monitoring",
                 source_plan_item_id="core-sequenced-entry",
+                decision_agent_name="signal-decider",
                 provider="kis",
                 asset_class="stock",
                 trigger_price=Decimal("90"),
@@ -1221,6 +1244,7 @@ def test_delayed_same_day_replan_cannot_downgrade_newer_core_protection() -> Non
                 intent="stop_sell",
                 status="pending",
                 source_plan_item_id="core-sequenced-entry",
+                decision_agent_name="signal-decider",
                 provider="kis",
                 asset_class="stock",
                 trigger_price=Decimal("10"),
@@ -1269,6 +1293,7 @@ def test_delayed_same_day_replan_cannot_downgrade_newer_core_protection() -> Non
                 intent="stop_sell",
                 status="pending",
                 source_plan_item_id="core-sequenced-entry",
+                decision_agent_name="signal-decider",
                 provider="kis",
                 asset_class="stock",
                 trigger_price=Decimal("80"),
@@ -1306,6 +1331,7 @@ def test_delayed_same_day_replan_cannot_downgrade_newer_core_protection() -> Non
                 intent="stop_sell",
                 status="pending",
                 source_plan_item_id="core-sequenced-entry",
+                decision_agent_name="signal-decider",
                 provider="kis",
                 asset_class="stock",
                 trigger_price=Decimal("20"),
@@ -1351,7 +1377,11 @@ def test_equal_core_request_time_with_divergent_sell_material_is_quarantined() -
         settings=settings,
         provider="kis",
         risk_context={"exchange": "KRX"},
-        quantity_policy={"kind": "shares", "quantity": 1},
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 1,
+            "linked_entry_item_key": "equal-time-entry",
+        },
     )
     try:
         with session_factory() as db:
@@ -1363,6 +1393,7 @@ def test_equal_core_request_time_with_divergent_sell_material_is_quarantined() -
                 intent="stop_sell",
                 status="stop_sell_monitoring",
                 source_plan_item_id="equal-time-entry",
+                decision_agent_name="signal-decider",
                 provider="kis",
                 asset_class="stock",
                 trigger_price=Decimal("90"),
@@ -1391,6 +1422,7 @@ def test_equal_core_request_time_with_divergent_sell_material_is_quarantined() -
                 intent="stop_sell",
                 status="pending",
                 source_plan_item_id="equal-time-entry",
+                decision_agent_name="signal-decider",
                 provider="kis",
                 asset_class="stock",
                 trigger_price=Decimal("10"),
@@ -2346,6 +2378,115 @@ def test_monitoring_order_evidence_ignores_foreign_and_legacy_routes() -> None:
                 db=db,
                 symbols=["005930"],
             ) == set()
+    finally:
+        engine.dispose()
+
+
+def test_position_truth_evidence_folds_same_account_kis_domestic_routes() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    sell_items: list[ExecutionPlanItem] = []
+    for index, exchange in enumerate(("KRX", "NXT")):
+        risk_context, quantity_policy = bind_kis_account_route(
+            settings=settings,
+            provider="kis",
+            risk_context={"exchange": exchange},
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+        sell_items.append(
+            ExecutionPlanItem(
+                id=f"domestic-position-truth-sell-{exchange.lower()}",
+                plan_item_index=index,
+                symbol="005930",
+                side="sell",
+                intent="stop_sell",
+                status="stop_sell_monitoring",
+                provider="kis",
+                venue=exchange,
+                asset_class="stock",
+                risk_context=risk_context,
+                quantity_policy=quantity_policy,
+            )
+        )
+    try:
+        with session_factory() as db:
+            db.add_all(
+                [
+                    ExecutionPlan(
+                        external_plan_id="domestic-position-truth-plan",
+                        source="test",
+                        mode="paper",
+                        status="accepted",
+                        items=sell_items,
+                    ),
+                    _monitoring_order(
+                        settings,
+                        symbol="005930",
+                        side="buy",
+                        status="open",
+                        exchange="KRX",
+                    ),
+                    _monitoring_order(
+                        settings,
+                        symbol="005930",
+                        side="buy",
+                        status="open",
+                        exchange="NXT",
+                    ),
+                ]
+            )
+            db.commit()
+
+            evidence = monitoring_service._position_truth_evidence_by_symbol(
+                settings=settings,
+                db=db,
+                symbols={"005930"},
+            )
+
+            assert evidence == {
+                "005930": [
+                    "broker_order:buy:open",
+                    "sell_monitor:stop_sell_monitoring",
+                ]
+            }
+    finally:
+        engine.dispose()
+
+
+def test_position_truth_evidence_does_not_fold_kis_us_into_domestic_inventory() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="paper")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_factory() as db:
+            db.add_all(
+                [
+                    _monitoring_order(
+                        settings,
+                        symbol="DUAL",
+                        side="buy",
+                        status="open",
+                        exchange="KRX",
+                    ),
+                    _monitoring_order(
+                        settings,
+                        symbol="DUAL",
+                        side="buy",
+                        status="open",
+                        exchange="NASD",
+                    ),
+                ]
+            )
+            db.commit()
+
+            assert monitoring_service._position_truth_evidence_by_symbol(
+                settings=settings,
+                db=db,
+                symbols={"DUAL"},
+            ) == {}
     finally:
         engine.dispose()
 
@@ -3601,12 +3742,13 @@ def test_trigger_time_account_context_exposes_only_exact_route_positions() -> No
                 observed_at=snapshot.observed_at,
             )
 
-        assert payload["local_positions"] == [
+        assert "local_positions" not in payload
+        assert payload["holdings"] == [
             {
                 "symbol": "005930",
                 "quantity": 2,
+                "sellable_quantity": None,
                 "average_price": None,
-                "last_reconciled_at": None,
             }
         ]
     finally:
@@ -4914,6 +5056,98 @@ def test_kis_duplicate_housekeeping_ignores_non_kis_and_foreign_kis_rows() -> No
         engine.dispose()
 
 
+def test_duplicate_watch_housekeeping_isolated_by_decision_agent_lane() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        kis_app_secret="lane-isolation-secret-at-least-32-bytes",
+        account_drawdown_recovery_scope_secret=(
+            "lane-isolation-secret-at-least-32-bytes"
+        ),
+        monitoring_expire_prior_market_watch_buys_enabled=False,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    risk_context, quantity_policy = bind_kis_account_route(
+        settings=settings,
+        provider="kis",
+        risk_context={"exchange": "KRX"},
+        quantity_policy={"kind": "exec_agent_sizing"},
+    )
+
+    def watch(
+        *,
+        item_id: str,
+        source_id: str,
+        decision_agent_name: str,
+    ) -> ExecutionPlanItem:
+        return ExecutionPlanItem(
+            id=item_id,
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="next_open_buy",
+            status="watch_monitoring_active",
+            provider="kis",
+            asset_class="stock",
+            source_plan_item_id=source_id,
+            decision_agent_name=decision_agent_name,
+            risk_context=risk_context,
+            quantity_policy=quantity_policy,
+        )
+
+    signal_old = watch(
+        item_id="signal-old",
+        source_id="core-signal-old",
+        decision_agent_name="signal-decider",
+    )
+    signal_new = watch(
+        item_id="signal-new",
+        source_id="core-signal-new",
+        decision_agent_name=" SIGNAL-DECIDER ",
+    )
+    short_term = watch(
+        item_id="short-term",
+        source_id="core-short-term",
+        decision_agent_name="short-term-decider",
+    )
+    try:
+        with session_factory() as db:
+            for hour, item in enumerate(
+                (signal_old, signal_new, short_term),
+                start=7,
+            ):
+                db.add(
+                    ExecutionPlan(
+                        id=f"plan-{item.id}",
+                        external_plan_id=f"plan-{item.id}",
+                        source="test",
+                        market_date=date(2026, 9, 8),
+                        accepted_at=datetime(2026, 9, 8, hour, tzinfo=UTC),
+                        mode="live",
+                        status="accepted",
+                        items=[item],
+                    )
+                )
+            db.commit()
+
+            changed = monitoring_service.supersede_duplicate_active_watch_buys(
+                settings=settings,
+                db=db,
+                superseded_at=datetime(2026, 9, 8, 12, tzinfo=UTC),
+            )
+
+            assert changed == 1
+            assert signal_old.status == "superseded"
+            assert signal_new.status == "watch_monitoring_active"
+            assert short_term.status == "watch_monitoring_active"
+    finally:
+        engine.dispose()
+
+
 def test_newer_legacy_mismatched_account_watch_cannot_supersede_valid_watch() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
@@ -5502,14 +5736,79 @@ def test_watch_queue_prioritizes_verified_execution_quality_before_core_hint() -
 
             assert ordered == [
                 "900001",
+                "900004",
                 "900002",
                 "900003",
-                "900004",
                 "900005",
                 "900006",
             ]
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("signal_action", ("wait", "reject"))
+def test_watch_queue_ignores_cross_lane_signal_alignment_and_warnings(
+    signal_action: str,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    evaluated_at = datetime(2026, 9, 8, 1, tzinfo=UTC)
+
+    def candidate(risk_context: dict[str, object]) -> ExecutionPlanItem:
+        return ExecutionPlanItem(
+            id="same-priority-item",
+            symbol="005930",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="watch_monitoring_active",
+            provider="kis",
+            venue="KRX",
+            asset_class="stock",
+            decision_agent_name="short-term-decider",
+            risk_context={"exchange": "KRX", **risk_context},
+            quantity_policy={"kind": "shares", "quantity": 1},
+        )
+
+    aligned = candidate(
+        {
+            "signal_decider_alignment": "buy_aligned",
+            "alignment_gate": {
+                "signal_decider_action": "buy",
+                "signal_decider_context": {
+                    "data_quality_warnings": ["signal advisory warning"]
+                },
+            },
+        }
+    )
+    cross_lane_block = candidate(
+        {
+            "signal_decider_alignment": f"{signal_action}_conflict_block",
+            "alignment_gate_action": signal_action,
+            "alignment_gate": {
+                "signal_decider_action": signal_action,
+                "signal_decider_context": {
+                    "data_quality_warnings": ["signal advisory warning"]
+                },
+            },
+        }
+    )
+
+    assert monitoring_service._watch_buy_queue_priority_key(
+        settings=settings,
+        item=aligned,
+        evaluated_at=evaluated_at,
+        desired_rank=0,
+    ) == monitoring_service._watch_buy_queue_priority_key(
+        settings=settings,
+        item=cross_lane_block,
+        evaluated_at=evaluated_at,
+        desired_rank=0,
+    )
+    assert monitoring_service._watch_buy_queue_warning_count(
+        aligned.risk_context
+    ) == 0
+    assert monitoring_service._watch_buy_queue_warning_count(
+        cross_lane_block.risk_context
+    ) == 0
 
 
 def test_watch_queue_does_not_prioritize_caller_supplied_full_cost_economics() -> None:
@@ -6234,6 +6533,73 @@ def test_loaded_watch_work_uses_only_latest_item_in_runtime_and_keeps_all_sells(
             "live-new-buy",
             "live-target-sell",
             "live-stop-sell",
+        }
+    finally:
+        engine.dispose()
+
+
+def test_default_monitor_loader_keeps_latest_plan_for_each_decision_lane() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    try:
+        with session_factory() as db:
+            signal_plan = ExecutionPlan(
+                id="signal-plan",
+                external_plan_id="signal-plan",
+                source="test",
+                market_date=date(2026, 10, 23),
+                accepted_at=datetime(2026, 10, 23, 5, tzinfo=UTC),
+                mode="live",
+                status="accepted",
+                items=[
+                    ExecutionPlanItem(
+                        id="signal-watch",
+                        plan_item_index=0,
+                        symbol="005930",
+                        side="buy",
+                        intent="intraday_watch_buy",
+                        status="watch_monitoring_active",
+                        decision_agent_name="signal-decider",
+                        source_plan_item_id="signal-watch-family",
+                    )
+                ],
+            )
+            short_plan = ExecutionPlan(
+                id="short-plan",
+                external_plan_id="short-plan",
+                source="test",
+                market_date=date(2026, 10, 23),
+                accepted_at=datetime(2026, 10, 23, 6, tzinfo=UTC),
+                mode="live",
+                status="accepted",
+                items=[
+                    ExecutionPlanItem(
+                        id="short-watch",
+                        plan_item_index=0,
+                        symbol="005930",
+                        side="buy",
+                        intent="intraday_watch_buy",
+                        status="watch_monitoring_active",
+                        decision_agent_name="short-term-decider",
+                        source_plan_item_id="short-watch-family",
+                    )
+                ],
+            )
+            db.add_all([signal_plan, short_plan])
+            db.commit()
+
+            selected = _load_monitored_items(
+                settings=settings,
+                db=db,
+                current_market_date=date(2026, 10, 23),
+            )
+
+        assert {item.id for item in selected} == {
+            "signal-watch",
+            "short-watch",
         }
     finally:
         engine.dispose()

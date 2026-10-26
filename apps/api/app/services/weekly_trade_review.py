@@ -6,10 +6,11 @@ import os
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from sqlalchemy import and_, func, or_, select
@@ -46,15 +47,21 @@ from app.services.execution_lineage import (
     resolve_decision_lineage_payloads,
 )
 from app.services.fifo_inventory import (
+    FifoIsolationCursor,
     FifoRouteScope,
     ambiguous_fifo_chronology_buckets,
+    canonical_fifo_inventory_route_scope,
+    fifo_chronology_ambiguity_reason_at,
     fifo_chronology_is_ambiguous_at,
     fifo_fill_sort_key,
     fifo_route_scope_from_order,
     legacy_kis_krx_event_is_isolated,
     load_fifo_isolation_cursor,
 )
-from app.services.fill_idempotency import dedupe_execution_fills
+from app.services.fill_idempotency import (
+    dedupe_execution_fills,
+    execution_fills_have_relevant_conflicting_identity,
+)
 from app.services.fill_economics import closed_trade_economics
 from app.services.runtime_transitions import WATCH_SIZING_PENDING_STATUS
 from app.services.max_holding_actionability import max_holding_actionability_summary
@@ -62,6 +69,15 @@ from app.services.late_entry_actionability import late_entry_actionability_summa
 from app.services.position_identity import (
     PositionIdentityConflictError,
     build_position_identity,
+)
+from app.services.strategy_family_attribution import (
+    ACCOUNT_FIFO_PNL_BASIS,
+    STRATEGY_FAMILY_PNL_BASIS,
+    StrategyFamilyEntryReference,
+    StrategyFamilyLedger,
+    legacy_single_lane_agents_by_route_symbol,
+    plan_item_execution_family_reference_ids,
+    strategy_family_outcome_fields,
 )
 
 
@@ -296,13 +312,19 @@ def generate_weekly_trade_review(
         max_rows=max_execution_failures,
     )
     progress("weekly_execution_failures", row_count=len(failures), truncated=failures_truncated)
-    closed_trades, closed_trades_truncated = _weekly_closed_trades(
+    closed_trade_quality: dict[str, bool] = {}
+    (
+        closed_trades,
+        strategy_closed_trades,
+        closed_trades_truncated,
+    ) = _weekly_closed_trades_with_strategy(
         db=db,
         settings=settings,
         mode=settings.runtime_mode,
         start_at=start_at,
         end_at=end_at,
         max_rows=max_fills,
+        quality=closed_trade_quality,
     )
     progress("weekly_closed_trades", row_count=len(closed_trades), truncated=closed_trades_truncated)
     pnl_coverage = _weekly_pnl_coverage(closed_trades, truncated=closed_trades_truncated)
@@ -310,12 +332,23 @@ def generate_weekly_trade_review(
         closed_trades,
         truncated=closed_trades_truncated,
     )
+    strategy_pnl_coverage = _weekly_pnl_coverage(
+        strategy_closed_trades,
+        truncated=closed_trades_truncated,
+        accepted_cost_basis_sources={"strategy_virtual_entry_family"},
+    )
+    strategy_realized_pnl_summary = _weekly_realized_pnl_summary(
+        strategy_closed_trades,
+        truncated=closed_trades_truncated,
+    )
+    stale_fifo_quality: dict[str, bool] = {}
     stale_fifo_inventory_alerts, stale_fifo_inventory_alerts_truncated = _stale_fifo_inventory_alerts(
         db=db,
         settings=settings,
         mode=settings.runtime_mode,
         end_at=end_at,
         max_rows=max_fills,
+        quality=stale_fifo_quality,
     )
     progress(
         "stale_fifo_inventory_alerts",
@@ -365,8 +398,15 @@ def generate_weekly_trade_review(
         realized_pnl_coverage=pnl_coverage,
         realized_pnl_summary=realized_pnl_summary,
         closed_trades=closed_trades,
+        strategy_realized_pnl_coverage=strategy_pnl_coverage,
+        strategy_realized_pnl_summary=strategy_realized_pnl_summary,
+        strategy_closed_trades=strategy_closed_trades,
         weekly_order_status_counts=weekly_order_counts,
         execution_failures=failures,
+        duplicate_fill_economic_conflict=bool(
+            closed_trade_quality.get("duplicate_fill_economic_conflict")
+            or stale_fifo_quality.get("duplicate_fill_economic_conflict")
+        ),
         truncated={
             "fills": fills_truncated,
             "weekly_orders": weekly_orders_truncated,
@@ -444,6 +484,7 @@ def generate_weekly_trade_review(
             "late_entry_shadow_count": late_entry_actionability["shadow_count"],
             "late_entry_block_count": late_entry_actionability["block_count"],
             "closed_trade_count": len(closed_trades),
+            "strategy_closed_trade_count": len(strategy_closed_trades),
             "closed_sell_fill_count": realized_pnl_summary["sell_fill_count"],
             "total_sell_rows": pnl_coverage["total_sell_rows"],
             "pnl_covered_sell_rows": pnl_coverage["covered_sell_rows"],
@@ -466,8 +507,13 @@ def generate_weekly_trade_review(
         "weekly_order_samples": weekly_orders,
         "execution_failures": failures,
         "closed_trades": closed_trades,
+        "account_fifo_pnl_basis": ACCOUNT_FIFO_PNL_BASIS,
+        "strategy_closed_trades": strategy_closed_trades,
+        "strategy_pnl_basis": "strategy_virtual_entry_family",
         "realized_pnl_coverage": pnl_coverage,
         "realized_pnl_summary": realized_pnl_summary,
+        "strategy_realized_pnl_coverage": strategy_pnl_coverage,
+        "strategy_realized_pnl_summary": strategy_realized_pnl_summary,
         "stale_fifo_inventory_alerts": stale_fifo_inventory_alerts,
         "active_broker_order_summary": active_order_summary,
         "execution_plan_item_summary": plan_item_summary,
@@ -755,6 +801,10 @@ def _weekly_learning_evidence(
     weekly_order_status_counts: Sequence[dict[str, object]],
     execution_failures: Sequence[dict[str, object]],
     truncated: dict[str, bool],
+    strategy_realized_pnl_coverage: dict[str, object] | None = None,
+    strategy_realized_pnl_summary: dict[str, object] | None = None,
+    strategy_closed_trades: Sequence[dict[str, object]] | None = None,
+    duplicate_fill_economic_conflict: bool = False,
 ) -> dict[str, object]:
     """Build a stable, fail-closed contract for downstream learning consumers."""
 
@@ -783,6 +833,94 @@ def _weekly_learning_evidence(
         if closed_trade_lineage_missing_ids:
             performance_blocked_reasons.append("incomplete_closed_trade_decision_lineage")
         performance_status = "blocked" if performance_blocked_reasons else "ready"
+    if duplicate_fill_economic_conflict:
+        performance_blocked_reasons.append("duplicate_fill_economic_conflict")
+        performance_status = "blocked"
+
+    strategy_feedback: dict[str, object] | None = None
+    if strategy_closed_trades is not None:
+        strategy_trades = list(strategy_closed_trades)
+        strategy_coverage = strategy_realized_pnl_coverage or {}
+        strategy_summary = strategy_realized_pnl_summary or {}
+        strategy_lineage_missing_ids = sorted(
+            {
+                str(row.get("sell_fill_id"))
+                for row in strategy_trades
+                if not _weekly_closed_trade_lineage_is_complete(row)
+            }
+        )
+        strategy_family_ineligible_ids = sorted(
+            {
+                str(row.get("sell_fill_id"))
+                for row in strategy_trades
+                if row.get("strategy_family_learning_eligible") is not True
+            }
+        )
+        strategy_blocked_reasons: list[str] = []
+        if not strategy_trades:
+            strategy_status = "no_data"
+            strategy_blocked_reasons.append("no_closed_trades")
+        else:
+            if truncated.get("fills") or truncated.get("closed_trades"):
+                strategy_blocked_reasons.append("source_rows_truncated")
+            if fill_attribution_coverage.get("status") != "complete":
+                strategy_blocked_reasons.append("incomplete_fill_decision_lineage")
+            if strategy_coverage.get("status") != "complete":
+                strategy_blocked_reasons.append("incomplete_cost_basis_coverage")
+            if strategy_summary.get("transaction_cost_coverage") != "complete":
+                strategy_blocked_reasons.append(
+                    "incomplete_transaction_cost_coverage"
+                )
+            if strategy_summary.get("currency_coverage") != "complete":
+                strategy_blocked_reasons.append(
+                    "incomplete_settlement_currency_coverage"
+                )
+            if strategy_lineage_missing_ids:
+                strategy_blocked_reasons.append(
+                    "incomplete_closed_trade_decision_lineage"
+                )
+            if strategy_family_ineligible_ids:
+                strategy_blocked_reasons.append(
+                    "incomplete_strategy_family_attribution"
+                )
+            strategy_status = "blocked" if strategy_blocked_reasons else "ready"
+        if duplicate_fill_economic_conflict:
+            strategy_blocked_reasons.append("duplicate_fill_economic_conflict")
+            strategy_status = "blocked"
+        strategy_feedback = {
+            "status": strategy_status,
+            "consumer_eligible": strategy_status == "ready",
+            "blocked_reasons": strategy_blocked_reasons,
+            "closed_trade_count": len(strategy_trades),
+            "account_fifo_closed_trade_count": len(closed_trades),
+            "pnl_attribution_basis": STRATEGY_FAMILY_PNL_BASIS,
+            "profitability_eligible_sell_fill_count": strategy_summary.get(
+                "covered_sell_fill_count"
+            ),
+            "cost_basis_coverage": strategy_coverage.get("status"),
+            "transaction_cost_coverage": strategy_summary.get(
+                "transaction_cost_coverage"
+            ),
+            "settlement_currency_coverage": strategy_summary.get(
+                "currency_coverage"
+            ),
+            "fill_decision_lineage_coverage": fill_attribution_coverage.get(
+                "status"
+            ),
+            "closed_trade_decision_lineage_missing_count": len(
+                strategy_lineage_missing_ids
+            ),
+            "closed_trade_decision_lineage_missing_sell_fill_ids": (
+                strategy_lineage_missing_ids
+            ),
+            "strategy_family_attribution_required": True,
+            "strategy_family_attribution_ineligible_count": len(
+                strategy_family_ineligible_ids
+            ),
+            "strategy_family_attribution_ineligible_sell_fill_ids": (
+                strategy_family_ineligible_ids
+            ),
+        }
 
     failure_rows_with_lineage = sum(
         1
@@ -823,7 +961,7 @@ def _weekly_learning_evidence(
         and not failure_feedback_blocked_reasons
         and bool(execution_failures)
     )
-    return {
+    evidence: dict[str, object] = {
         "schema_version": WEEKLY_LEARNING_EVIDENCE_SCHEMA_VERSION,
         "performance_feedback": {
             "status": performance_status,
@@ -873,6 +1011,9 @@ def _weekly_learning_evidence(
             "terminal_order_outcome_counts": terminal_order_outcomes,
         },
     }
+    if strategy_feedback is not None:
+        evidence["strategy_performance_feedback"] = strategy_feedback
+    return evidence
 
 
 def _count_values(
@@ -1378,6 +1519,27 @@ def _weekly_closed_trades(
     end_at: datetime,
     max_rows: int,
 ) -> tuple[list[dict[str, object]], bool]:
+    account_rows, _, truncated = _weekly_closed_trades_with_strategy(
+        db=db,
+        settings=settings,
+        mode=mode,
+        start_at=start_at,
+        end_at=end_at,
+        max_rows=max_rows,
+    )
+    return account_rows, truncated
+
+
+def _weekly_closed_trades_with_strategy(
+    *,
+    db: Session,
+    settings: Settings,
+    mode: str,
+    start_at: datetime,
+    end_at: datetime,
+    max_rows: int,
+    quality: dict[str, bool] | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], bool]:
     newest_fills = db.scalars(
         select(ExecutionFill)
         .join(BrokerOrder, ExecutionFill.broker_order_pk == BrokerOrder.id)
@@ -1390,7 +1552,9 @@ def _weekly_closed_trades(
             selectinload(ExecutionFill.broker_order).load_only(
                 BrokerOrder.id,
                 BrokerOrder.broker_name,
+                BrokerOrder.execution_plan_item_id,
                 BrokerOrder.request_metadata,
+                BrokerOrder.symbol,
                 BrokerOrder.venue,
                 BrokerOrder.asset_class,
             ),
@@ -1398,19 +1562,46 @@ def _weekly_closed_trades(
             .selectinload(BrokerOrder.plan_item)
             .load_only(
                 ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
+                ExecutionPlanItem.symbol,
+                ExecutionPlanItem.source_plan_item_id,
                 ExecutionPlanItem.decision_agent_name,
                 ExecutionPlanItem.decision_snapshot_id,
                 ExecutionPlanItem.decision_run_id,
+                ExecutionPlanItem.quantity_policy,
+                ExecutionPlanItem.risk_context,
             ),
         )
         .order_by(ExecutionFill.filled_at.desc(), ExecutionFill.id.desc())
         .limit(max_rows + 1)
     ).all()
     truncated = len(newest_fills) > max_rows
-    fills = dedupe_execution_fills(list(reversed(newest_fills[:max_rows])))
+    raw_fills = list(reversed(newest_fills[:max_rows]))
+    isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=mode,
+        through=end_at,
+    )
+    duplicate_fill_economic_conflict = _fifo_fills_have_relevant_conflict(
+        fills=raw_fills,
+        isolation_cursor=isolation_cursor,
+        review_start=start_at,
+        review_end=end_at,
+    )
+    if quality is not None:
+        quality["duplicate_fill_economic_conflict"] = (
+            duplicate_fill_economic_conflict
+        )
+    fills = dedupe_execution_fills(raw_fills)
+    entry_references_by_id = _weekly_strategy_family_entry_references(
+        db=db,
+        fills=fills,
+    )
     ambiguous_buckets = ambiguous_fifo_chronology_buckets(fills)
     sell_route_symbols = {
-        (route_scope, fill.symbol)
+        (canonical_fifo_inventory_route_scope(route_scope), fill.symbol)
         for fill in fills
         if (route_scope := fifo_route_scope_from_order(fill.broker_order)) is not None
         if str(fill.side or "").lower() == "sell" and start_at <= _normalize_utc(fill.filled_at) < end_at
@@ -1420,7 +1611,6 @@ def _weekly_closed_trades(
         mode=mode,
         route_symbols=sell_route_symbols,
     )
-    isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=mode, through=end_at)
     exact_krx_scope = _weekly_exact_krx_fifo_scope(settings)
 
     lots_by_route_symbol: dict[
@@ -1457,10 +1647,11 @@ def _weekly_closed_trades(
                     )
                 )
             continue
-        route_symbol = (route_scope, fill.symbol)
+        inventory_route_scope = canonical_fifo_inventory_route_scope(route_scope)
+        route_symbol = (inventory_route_scope, fill.symbol)
         lots = lots_by_route_symbol.setdefault(route_symbol, [])
         scope_quality_available = isolation_cursor.apply_before(
-            route_scope=route_scope,
+            route_scope=inventory_route_scope,
             symbol=fill.symbol,
             observed_at=fill_time,
             lots=lots,
@@ -1468,7 +1659,7 @@ def _weekly_closed_trades(
         if fifo_chronology_is_ambiguous_at(
             ambiguous_buckets=ambiguous_buckets,
             isolation_cursor=isolation_cursor,
-            route_scope=route_scope,
+            route_scope=inventory_route_scope,
             symbol=fill.symbol,
             observed_at=fill_time,
         ):
@@ -1515,7 +1706,7 @@ def _weekly_closed_trades(
         filled_at = fill_time
         next_buy_after_sell = _next_buy_after(
             fills=fills,
-            route_scope=route_scope,
+            route_scope=inventory_route_scope,
             symbol=fill.symbol,
             after=filled_at,
         )
@@ -1591,7 +1782,166 @@ def _weekly_closed_trades(
                         route_scope=route_scope,
                     )
                 )
-    return closed, truncated
+    strategy_closed = _weekly_strategy_closed_trade_rows(
+        db=db,
+        mode=mode,
+        fills=fills,
+        start_at=start_at,
+        end_at=end_at,
+        entry_references_by_id=entry_references_by_id,
+    )
+    return closed, strategy_closed, truncated
+
+
+def _weekly_strategy_closed_trade_rows(
+    *,
+    db: Session,
+    mode: str,
+    fills: Sequence[ExecutionFill],
+    start_at: datetime,
+    end_at: datetime,
+    entry_references_by_id: Mapping[str, StrategyFamilyEntryReference],
+) -> list[dict[str, object]]:
+    ledger = StrategyFamilyLedger(
+        legacy_agents_by_route_symbol=legacy_single_lane_agents_by_route_symbol(
+            fills,
+            entry_references_by_id=entry_references_by_id,
+        ),
+        entry_references_by_id=entry_references_by_id,
+    )
+    ambiguous_buckets = ambiguous_fifo_chronology_buckets(fills)
+    isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=mode,
+        through=end_at,
+    )
+    scope_probe_lots: dict[tuple[FifoRouteScope, str], list[object]] = {}
+    closed: list[dict[str, object]] = []
+    for fill in sorted(fills, key=fifo_fill_sort_key):
+        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        fill_time = _normalize_utc(fill.filled_at)
+        inventory_route_scope = (
+            canonical_fifo_inventory_route_scope(route_scope)
+            if route_scope is not None
+            else None
+        )
+        route_symbol = (
+            (inventory_route_scope, str(fill.symbol or "").strip().upper())
+            if route_scope is not None
+            else None
+        )
+        evidence_available = route_scope is not None
+        generation_boundary = None
+        if route_scope is not None:
+            assert route_symbol is not None
+            evidence_available = isolation_cursor.apply_before(
+                route_scope=inventory_route_scope,
+                symbol=fill.symbol,
+                observed_at=fill_time,
+                lots=scope_probe_lots.setdefault(route_symbol, []),
+            )
+            generation_boundary = isolation_cursor.latest_boundary_before(
+                route_scope=inventory_route_scope,
+                symbol=fill.symbol,
+                observed_at=fill_time,
+            )
+        chronology_reason = (
+            fifo_chronology_ambiguity_reason_at(
+                ambiguous_buckets=ambiguous_buckets,
+                isolation_cursor=isolation_cursor,
+                route_scope=inventory_route_scope,
+                symbol=fill.symbol,
+                observed_at=fill_time,
+            )
+            if route_scope is not None
+            else None
+        )
+        outcome = ledger.observe(
+            fill=fill,
+            route_scope=route_scope,
+            evidence_available=evidence_available,
+            chronology_reason=chronology_reason,
+            generation_boundary=generation_boundary,
+        )
+        if outcome is None or not (start_at <= fill_time < end_at):
+            continue
+        if outcome.learning_eligible:
+            assert route_scope is not None
+            for allocation in outcome.allocations:
+                row = _closed_trade_row(
+                    fill=fill,
+                    buy_fill=allocation.fill,
+                    quantity=allocation.quantity,
+                    buy_price=Decimal(allocation.fill.price),
+                    cost_basis_source="strategy_virtual_entry_family",
+                    cost_basis_observed_at=_normalize_utc(
+                        allocation.fill.filled_at
+                    ),
+                    route_scope=route_scope,
+                )
+                row.update(strategy_family_outcome_fields(outcome))
+                closed.append(row)
+            continue
+        row = _closed_trade_row(
+            fill=fill,
+            buy_fill=None,
+            quantity=outcome.requested_quantity,
+            buy_price=None,
+            cost_basis_source=f"strategy_family_{outcome.status}",
+            cost_basis_observed_at=None,
+            route_scope=route_scope,
+        )
+        row.update(strategy_family_outcome_fields(outcome))
+        closed.append(row)
+    return closed
+
+
+def _weekly_strategy_family_entry_references(
+    *,
+    db: Session,
+    fills: Sequence[ExecutionFill],
+) -> Mapping[str, StrategyFamilyEntryReference]:
+    reference_ids: set[str] = set()
+    for fill in fills:
+        order = fill.broker_order
+        item = order.plan_item if order is not None else None
+        if item is None:
+            continue
+        claims = plan_item_execution_family_reference_ids(item)
+        if len(claims) == 1:
+            reference_ids.update(claims)
+    if not reference_ids:
+        return MappingProxyType({})
+
+    rows = db.execute(
+        select(
+            ExecutionPlanItem.id,
+            ExecutionPlanItem.execution_plan_id,
+            ExecutionPlanItem.symbol,
+            ExecutionPlanItem.side,
+            ExecutionPlanItem.source_plan_item_id,
+        ).where(ExecutionPlanItem.id.in_(sorted(reference_ids)))
+    ).all()
+    references: dict[str, StrategyFamilyEntryReference] = {}
+    duplicate_ids: set[str] = set()
+    for row in rows:
+        item_id = str(row.id or "").strip()
+        if not item_id:
+            continue
+        if item_id in references:
+            duplicate_ids.add(item_id)
+            continue
+        source_plan_item_id = str(row.source_plan_item_id or "").strip() or None
+        references[item_id] = StrategyFamilyEntryReference(
+            execution_plan_item_id=item_id,
+            execution_plan_id=str(row.execution_plan_id or "").strip(),
+            symbol=str(row.symbol or "").strip().upper(),
+            side=str(row.side or "").strip().lower(),
+            source_plan_item_id=source_plan_item_id,
+        )
+    for duplicate_id in duplicate_ids:
+        references.pop(duplicate_id, None)
+    return MappingProxyType(references)
 
 
 def _broker_reconciliation_cost_basis(
@@ -1619,7 +1969,12 @@ def _weekly_pnl_coverage(
     closed_trades: Sequence[dict[str, object]],
     *,
     truncated: bool,
+    accepted_cost_basis_sources: set[str] | None = None,
 ) -> dict[str, object]:
+    covered_sources = accepted_cost_basis_sources or {
+        "fill_fifo",
+        "broker_reconciliation",
+    }
     rows_by_fill_id: dict[str, list[dict[str, object]]] = {}
     for row in closed_trades:
         rows_by_fill_id.setdefault(str(row["sell_fill_id"]), []).append(row)
@@ -1627,14 +1982,14 @@ def _weekly_pnl_coverage(
         row
         for row in closed_trades
         if row.get("cost_basis_source")
-        not in {"fill_fifo", "broker_reconciliation"}
+        not in covered_sources
     ]
     uncovered_fill_ids = {
         fill_id
         for fill_id, rows in rows_by_fill_id.items()
         if any(
             row.get("cost_basis_source")
-            not in {"fill_fifo", "broker_reconciliation"}
+            not in covered_sources
             for row in rows
         )
     }
@@ -1903,11 +2258,47 @@ def _next_buy_after(
         _normalize_utc(fill.filled_at)
         for fill in fills
         if fill.symbol == symbol
-        and fifo_route_scope_from_order(fill.broker_order) == route_scope
+        and (
+            (fill_route_scope := fifo_route_scope_from_order(fill.broker_order))
+            is not None
+        )
+        and canonical_fifo_inventory_route_scope(fill_route_scope)
+        == canonical_fifo_inventory_route_scope(route_scope)
         and str(fill.side or "").lower() == "buy"
         and _normalize_utc(fill.filled_at) > after
     ]
     return min(later_buys) if later_buys else None
+
+
+def _fifo_fills_have_relevant_conflict(
+    *,
+    fills: Sequence[ExecutionFill],
+    isolation_cursor: FifoIsolationCursor,
+    review_start: datetime | None,
+    review_end: datetime,
+) -> bool:
+    def is_relevant(fill: ExecutionFill) -> bool:
+        fill_time = _normalize_utc(fill.filled_at)
+        route_scope = fifo_route_scope_from_order(fill.broker_order)
+        latest_boundary = (
+            isolation_cursor.latest_boundary_through(
+                route_scope=route_scope,
+                symbol=fill.symbol,
+                observed_at=review_end,
+            )
+            if route_scope is not None
+            else None
+        )
+        return (
+            (review_start is not None and fill_time >= review_start)
+            or latest_boundary is None
+            or fill_time > latest_boundary
+        )
+
+    return execution_fills_have_relevant_conflicting_identity(
+        list(fills),
+        is_relevant=is_relevant,
+    )
 
 
 def _closed_trade_row(
@@ -1962,6 +2353,7 @@ def _closed_trade_row(
         "sell_broker_order_pk": fill.broker_order_pk,
         "sell_filled_at": _normalize_utc(fill.filled_at),
         "quantity": _quantity_value(quantity),
+        "pnl_attribution_basis": ACCOUNT_FIFO_PNL_BASIS,
         "sell_price": sell_price,
         "cost_basis_price": buy_price,
         "cost_basis_source": cost_basis_source,
@@ -2012,6 +2404,7 @@ def _stale_fifo_inventory_alerts(
     mode: str,
     end_at: datetime,
     max_rows: int,
+    quality: dict[str, bool] | None = None,
 ) -> tuple[list[dict[str, object]], bool]:
     newest_fills = db.scalars(
         select(ExecutionFill)
@@ -2034,9 +2427,24 @@ def _stale_fifo_inventory_alerts(
         .limit(max_rows + 1)
     ).all()
     truncated = len(newest_fills) > max_rows
-    fills = dedupe_execution_fills(list(reversed(newest_fills[:max_rows])))
+    raw_fills = list(reversed(newest_fills[:max_rows]))
+    isolation_cursor = load_fifo_isolation_cursor(
+        db=db,
+        runtime_mode=mode,
+        through=end_at,
+    )
+    duplicate_fill_economic_conflict = _fifo_fills_have_relevant_conflict(
+        fills=raw_fills,
+        isolation_cursor=isolation_cursor,
+        review_start=None,
+        review_end=end_at,
+    )
+    if quality is not None:
+        quality["duplicate_fill_economic_conflict"] = (
+            duplicate_fill_economic_conflict
+        )
+    fills = dedupe_execution_fills(raw_fills)
     ambiguous_buckets = ambiguous_fifo_chronology_buckets(fills)
-    isolation_cursor = load_fifo_isolation_cursor(db=db, runtime_mode=mode, through=end_at)
     exact_krx_scope = _weekly_exact_krx_fifo_scope(settings)
     lots_by_route_symbol: dict[tuple[FifoRouteScope, str], list[Decimal]] = {}
     first_fill_at: dict[tuple[FifoRouteScope, str], datetime] = {}
@@ -2064,10 +2472,11 @@ def _stale_fifo_inventory_alerts(
                 unavailable_scope_fill_count.get(fill.symbol, 0) + 1
             )
             continue
-        route_symbol = (route_scope, fill.symbol)
+        inventory_route_scope = canonical_fifo_inventory_route_scope(route_scope)
+        route_symbol = (inventory_route_scope, fill.symbol)
         lots = lots_by_route_symbol.setdefault(route_symbol, [])
         generation_boundary = isolation_cursor.latest_boundary_before(
-            route_scope=route_scope,
+            route_scope=inventory_route_scope,
             symbol=fill.symbol,
             observed_at=observed_at,
         )
@@ -2081,7 +2490,7 @@ def _stale_fifo_inventory_alerts(
             last_fill_at.pop(route_symbol, None)
         generation_by_route_symbol[route_symbol] = generation_boundary
         scope_quality_available = isolation_cursor.apply_before(
-            route_scope=route_scope,
+            route_scope=inventory_route_scope,
             symbol=fill.symbol,
             observed_at=observed_at,
             lots=lots,
@@ -2089,7 +2498,7 @@ def _stale_fifo_inventory_alerts(
         if fifo_chronology_is_ambiguous_at(
             ambiguous_buckets=ambiguous_buckets,
             isolation_cursor=isolation_cursor,
-            route_scope=route_scope,
+            route_scope=inventory_route_scope,
             symbol=fill.symbol,
             observed_at=observed_at,
         ):
@@ -2164,6 +2573,15 @@ def _stale_fifo_inventory_alerts(
         }
         for symbol, fill_count in sorted(unavailable_scope_fill_count.items())
     ]
+    if duplicate_fill_economic_conflict:
+        alerts.append(
+            {
+                "kind": "duplicate_fill_economic_conflict",
+                "reason": "duplicate_fill_economic_conflict",
+                "repair_action": "reconcile conflicting persisted fill evidence",
+                "message": "conflicting duplicate fill identity was excluded from FIFO replay",
+            }
+        )
     alerts.extend(
         {
             "kind": "fifo_fill_chronology_ambiguous",

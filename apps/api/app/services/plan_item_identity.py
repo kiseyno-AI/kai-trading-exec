@@ -5,9 +5,15 @@ from datetime import date
 from typing import Any
 
 from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.orm import Session, object_session
 from sqlalchemy.orm.exc import DetachedInstanceError
 
 from app.models.runtime import ExecutionPlanItem
+from app.services.execution_account_route import (
+    execution_account_scope_binding_from_payloads,
+    kis_account_route_binding_from_payloads,
+)
+from app.services.execution_semantics import KRX_ASSET_CLASS_ALIASES, KRX_EXCHANGES
 
 _DECISION_AGENT_KEYS = (
     "decision_agent_name",
@@ -90,18 +96,59 @@ def plan_item_source_market_date(plan_item: ExecutionPlanItem) -> date | None:
 
 def plan_item_entry_family_key(plan_item: ExecutionPlanItem) -> str | None:
     """Return the exact entry family represented by an entry or managed exit."""
+    family_key, _error = resolve_plan_item_entry_family_key(plan_item)
+    return family_key
+
+
+def resolve_plan_item_entry_family_key(
+    plan_item: ExecutionPlanItem,
+    *,
+    session: Session | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve one family only when every comparable lineage claim agrees."""
     if plan_item.side == "buy":
         source_key = plan_item_source_plan_item_id(plan_item)
         if source_key is not None:
-            return f"source:{source_key}"
+            return f"source:{source_key}", None
         item_id = str(plan_item.id or "").strip()
-        return f"execution:{item_id}" if item_id else None
+        if item_id:
+            return f"execution:{item_id}", None
+        return None, "entry_family_unavailable"
 
+    source_claims: set[str] = set()
+    execution_claims: set[str] = set()
     for payload in (plan_item.quantity_policy, plan_item.risk_context):
-        family_key = _entry_family_key_from_payload(payload)
-        if family_key is not None:
-            return family_key
-    return None
+        payload_sources, payload_executions = _entry_family_claims_from_payload(
+            payload
+        )
+        source_claims.update(payload_sources)
+        execution_claims.update(payload_executions)
+
+    if len(source_claims) > 1:
+        return None, "entry_family_ambiguous"
+    if len(execution_claims) > 1:
+        return None, "entry_family_ambiguous"
+    if execution_claims:
+        execution_item_id = next(iter(execution_claims))
+        referenced_family = _referenced_entry_family_key(
+            plan_item=plan_item,
+            execution_item_id=execution_item_id,
+            session=session,
+        )
+        if referenced_family is None:
+            return None, "entry_family_ambiguous"
+        if referenced_family.startswith("source:"):
+            referenced_source = referenced_family.removeprefix("source:")
+            if source_claims and referenced_source not in source_claims:
+                return None, "entry_family_ambiguous"
+            source_claims.add(referenced_source)
+        elif source_claims or referenced_family != f"execution:{execution_item_id}":
+            return None, "entry_family_ambiguous"
+        else:
+            return referenced_family, None
+    if source_claims:
+        return f"source:{next(iter(source_claims))}", None
+    return None, "entry_family_unavailable"
 
 
 def select_plan_item_family_members(
@@ -111,42 +158,196 @@ def select_plan_item_family_members(
 ) -> list[ExecutionPlanItem]:
     """Select only candidates proven to belong to ``anchor``'s entry family.
 
-    A single unlinked candidate is retained for a genuine one-entry legacy
-    plan. Linked or multi-entry plans never fall back to symbol-only matching.
+    Exact membership requires both the raw entry-family key and normalized
+    decision lane to match. A single candidate with neither identity field is
+    retained only for a genuine one-entry legacy plan. Partial identities and
+    linked or multi-entry plans never fall back to symbol-only matching.
     """
     candidate_list = list(candidates)
     anchor_key = plan_item_entry_family_key(anchor)
-    if anchor_key is not None:
+    anchor_lane = _normalized_decision_lane(
+        plan_item_decision_agent_name(anchor)
+    )
+    if (anchor_key is None) != (anchor_lane is None):
+        return []
+    if anchor_key is not None and anchor_lane is not None:
         exact = [
             candidate
             for candidate in candidate_list
             if plan_item_entry_family_key(candidate) == anchor_key
+            and _normalized_decision_lane(
+                plan_item_decision_agent_name(candidate)
+            )
+            == anchor_lane
         ]
         if exact:
             return exact
-    if any(plan_item_entry_family_key(candidate) is not None for candidate in candidate_list):
+    candidate_identities = [
+        (
+            plan_item_entry_family_key(candidate),
+            _normalized_decision_lane(plan_item_decision_agent_name(candidate)),
+        )
+        for candidate in candidate_list
+    ]
+    if any(family_key is not None or lane is not None for family_key, lane in candidate_identities):
         return []
     if len(candidate_list) != 1 or _same_symbol_entry_count(anchor) > 1:
         return []
     return candidate_list
 
 
-def _entry_family_key_from_payload(payload: object) -> str | None:
-    if not isinstance(payload, dict):
+def plan_item_execution_route_key(
+    plan_item: ExecutionPlanItem,
+) -> tuple[str, str, str, str] | None:
+    """Return a credential-free broker route only from exact persisted binding."""
+    provider = str(plan_item.provider or "kis").strip().lower()
+    if provider in {"korea-investment", "korea_investment"}:
+        provider = "kis"
+    try:
+        raw_risk_context = plan_item.risk_context
+    except DetachedInstanceError:
         return None
+    risk_context = (
+        raw_risk_context if isinstance(raw_risk_context, dict) else {}
+    )
+    exchange = _plan_item_exchange(
+        plan_item=plan_item,
+        risk_context=risk_context,
+    )
+    asset_class = str(plan_item.asset_class or "stock").strip().lower()
+    if provider == "kis":
+        binding = kis_account_route_binding_from_payloads(
+            risk_context,
+            plan_item.quantity_policy,
+        )
+        if binding is None:
+            return None
+        return (
+            provider,
+            exchange,
+            asset_class,
+            binding["configured_route_fingerprint"],
+        )
+    binding = execution_account_scope_binding_from_payloads(
+        risk_context,
+        plan_item.quantity_policy,
+    )
+    if binding is None or binding.get("provider") != provider:
+        return None
+    return provider, exchange, asset_class, str(binding["account_scope"])
+
+
+def plan_item_inventory_scope_key(
+    plan_item: ExecutionPlanItem,
+) -> tuple[str, str, str, str] | None:
+    """Return the account inventory scope while preserving exact order routes.
+
+    KIS reconciles domestic holdings as one account-level KRX inventory even
+    when an individual order is routed through KRX, NXT, or SOR.  The opaque
+    account binding remains part of the key; only the interchangeable domestic
+    execution-route fields are folded.
+    """
+
+    route_key = plan_item_execution_route_key(plan_item)
+    if route_key is None:
+        return None
+    provider, exchange, asset_class, account_binding = route_key
+    if (
+        provider == "kis"
+        and exchange in KRX_EXCHANGES
+        and asset_class in KRX_ASSET_CLASS_ALIASES
+    ):
+        return provider, "KRX", "stock", account_binding
+    return route_key
+
+
+def _plan_item_exchange(
+    *,
+    plan_item: ExecutionPlanItem,
+    risk_context: dict[str, Any],
+) -> str:
+    exchange = risk_context.get("exchange")
+    if isinstance(exchange, str) and exchange.strip():
+        return exchange.strip().upper()
+    venue = str(plan_item.venue or "").strip().upper()
+    if venue in KRX_EXCHANGES | {"AMEX", "NASD", "NYSE", "US", "UPBIT"}:
+        return venue
+    return "KRX"
+
+
+def _normalized_decision_lane(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    lane = value.strip().casefold()
+    return lane or None
+
+
+def _entry_family_claims_from_payload(
+    payload: object,
+) -> tuple[set[str], set[str]]:
+    if not isinstance(payload, dict):
+        return set(), set()
+    source_claims: set[str] = set()
+    execution_claims: set[str] = set()
     linked_key = payload.get("linked_entry_item_key")
     if isinstance(linked_key, str) and linked_key.strip():
-        return f"source:{linked_key.strip()}"
+        source_claims.add(linked_key.strip())
     entry_context = payload.get("entry_context")
     if not isinstance(entry_context, dict):
-        return None
+        return source_claims, execution_claims
     source_key = entry_context.get("source_plan_item_id")
     if isinstance(source_key, str) and source_key.strip():
-        return f"source:{source_key.strip()}"
+        source_claims.add(source_key.strip())
     execution_item_id = entry_context.get("execution_plan_item_id")
     if isinstance(execution_item_id, str) and execution_item_id.strip():
-        return f"execution:{execution_item_id.strip()}"
-    return None
+        execution_claims.add(execution_item_id.strip())
+    return source_claims, execution_claims
+
+
+def _referenced_entry_family_key(
+    *,
+    plan_item: ExecutionPlanItem,
+    execution_item_id: str,
+    session: Session | None = None,
+) -> str | None:
+    candidates: list[ExecutionPlanItem] = []
+    try:
+        plan = plan_item.plan
+        plan_items = plan.items if plan is not None else ()
+    except DetachedInstanceError:
+        plan_items = ()
+    candidates.extend(
+        candidate
+        for candidate in plan_items
+        if str(candidate.id or "").strip() == execution_item_id
+    )
+    lookup_session = session if session is not None else object_session(plan_item)
+    if lookup_session is not None:
+        candidates.extend(
+            candidate
+            for candidate in lookup_session.identity_map.values()
+            if isinstance(candidate, ExecutionPlanItem)
+            and str(candidate.id or "").strip() == execution_item_id
+        )
+        if not candidates:
+            referenced = lookup_session.get(ExecutionPlanItem, execution_item_id)
+            if referenced is not None:
+                candidates.append(referenced)
+    unique_matches = {id(candidate): candidate for candidate in candidates}
+    if len(unique_matches) != 1:
+        return None
+    entry = next(iter(unique_matches.values()))
+    if (
+        str(entry.side or "").strip().lower() != "buy"
+        or str(entry.symbol or "").strip().upper()
+        != str(plan_item.symbol or "").strip().upper()
+    ):
+        return None
+    family_key, error = resolve_plan_item_entry_family_key(
+        entry,
+        session=lookup_session,
+    )
+    return family_key if error is None else None
 
 
 def _same_symbol_entry_count(anchor: ExecutionPlanItem) -> int:
