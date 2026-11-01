@@ -50,6 +50,10 @@ from app.models.runtime import (
 from app.services.account_drawdown_recovery import snapshot_is_fresh_for_recovery
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
+from app.services.corporate_action_quarantine_contract import (
+    ReviewedCorporateActionQuarantineState,
+    validate_reviewed_corporate_action_quarantine,
+)
 from app.services.fill_economics import effective_fill_quantity
 from app.services.fill_idempotency import (
     dedupe_execution_fills,
@@ -11412,6 +11416,12 @@ def _mark_position_monitoring_manual_review(
 def _position_monitoring_is_disabled(position: ExecutionPosition | None) -> bool:
     if position is None:
         return False
+    quarantine_state = validate_reviewed_corporate_action_quarantine(
+        position=position,
+        event=None,
+    )
+    if quarantine_state is not ReviewedCorporateActionQuarantineState.UNRELATED:
+        return True
     raw_payload = position.raw_payload if isinstance(position.raw_payload, dict) else {}
     sync_context = raw_payload.get("_position_sync")
     return bool(

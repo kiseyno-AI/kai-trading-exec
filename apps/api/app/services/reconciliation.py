@@ -52,7 +52,10 @@ from app.services.broker_order_state import (
     broker_order_observed_at_expr,
 )
 from app.services.corporate_action_quarantine_contract import (
-    is_reviewed_corporate_action_quarantine,
+    REVIEWED_CORPORATE_ACTION_INVALID_REASON,
+    REVIEWED_CORPORATE_ACTION_ROUTE_DISPOSITION,
+    ReviewedCorporateActionQuarantineState,
+    load_reviewed_corporate_action_quarantine_state,
 )
 from app.services.execution_account_route import redact_account_references
 from app.services.execution_failures import (
@@ -2993,6 +2996,13 @@ def sync_execution_positions_from_broker_snapshot(
             < _utc_naive(position.last_reconciled_at)
         ):
             continue
+        prior_corporate_action_quarantine_state = (
+            load_reviewed_corporate_action_quarantine_state(
+                db=db,
+                position=position,
+                for_update=True,
+            )
+        )
         if holding is None:
             if _preserve_fresh_kis_krx_flat_proof_during_sync(
                 settings=settings,
@@ -3031,12 +3041,22 @@ def sync_execution_positions_from_broker_snapshot(
                 zeroed += 1
             position.updated_from = "reconciliation"
             position.last_reconciled_at = observed_at
+            corporate_action_quarantine_state = (
+                _post_reconciliation_corporate_action_quarantine_state(
+                    db=db,
+                    position=position,
+                    prior_state=prior_corporate_action_quarantine_state,
+                )
+            )
             position.raw_payload = _position_snapshot_payload(
                 snapshot_payload=snapshot.payload,
                 holding=None,
                 exchange=identity_exchange,
                 identity=position_identity,
                 prior_payload=position.raw_payload,
+                corporate_action_quarantine_state=(
+                    corporate_action_quarantine_state
+                ),
             )
             continue
 
@@ -3059,14 +3079,28 @@ def sync_execution_positions_from_broker_snapshot(
             position.updated_from = "reconciliation"
             changed = True
         position.last_reconciled_at = observed_at
-        monitoring_recovery_evidence = _unpriced_kis_us_holding_recovery_evidence(
-            settings=settings,
-            snapshot=snapshot,
-            holding=holding,
-            exchange=identity_exchange,
-            prior_payload=position.raw_payload,
-            evaluated_at=_observation_time(),
+        corporate_action_quarantine_state = (
+            _post_reconciliation_corporate_action_quarantine_state(
+                db=db,
+                position=position,
+                prior_state=prior_corporate_action_quarantine_state,
+            )
         )
+        monitoring_recovery_evidence = None
+        if (
+            corporate_action_quarantine_state
+            is ReviewedCorporateActionQuarantineState.UNRELATED
+        ):
+            monitoring_recovery_evidence = (
+                _unpriced_kis_us_holding_recovery_evidence(
+                    settings=settings,
+                    snapshot=snapshot,
+                    holding=holding,
+                    exchange=identity_exchange,
+                    prior_payload=position.raw_payload,
+                    evaluated_at=_observation_time(),
+                )
+            )
         position.raw_payload = _position_snapshot_payload(
             snapshot_payload=snapshot.payload,
             holding=holding,
@@ -3074,6 +3108,9 @@ def sync_execution_positions_from_broker_snapshot(
             identity=position_identity,
             prior_payload=position.raw_payload,
             monitoring_recovery_evidence=monitoring_recovery_evidence,
+            corporate_action_quarantine_state=(
+                corporate_action_quarantine_state
+            ),
         )
         if monitoring_recovery_evidence is not None:
             monitoring_recovered_count += 1
@@ -3276,6 +3313,13 @@ def _supersede_kis_krx_flat_proof_from_partial_exposure(
             exchange=identity_exchange,
             identity=identity,
             prior_payload=position.raw_payload,
+            corporate_action_quarantine_state=(
+                load_reviewed_corporate_action_quarantine_state(
+                    db=db,
+                    position=position,
+                    for_update=True,
+                )
+            ),
         )
         superseded_count += 1
     return {
@@ -3711,6 +3755,9 @@ def _position_snapshot_payload(
     holding: BrokerAccountHolding | None,
     exchange: str,
     identity: PositionIdentity,
+    corporate_action_quarantine_state: (
+        ReviewedCorporateActionQuarantineState
+    ) = ReviewedCorporateActionQuarantineState.UNRELATED,
     prior_payload: dict[str, Any] | None = None,
     monitoring_recovery_evidence: dict[str, object] | None = None,
 ) -> dict[str, Any] | None:
@@ -3726,20 +3773,35 @@ def _position_snapshot_payload(
         if isinstance(prior_payload, dict)
         else None
     )
-    reviewed_corporate_action = is_reviewed_corporate_action_quarantine(
-        prior_sync
+    reviewed_corporate_action = (
+        corporate_action_quarantine_state
+        is ReviewedCorporateActionQuarantineState.VERIFIED
+    )
+    invalid_corporate_action = (
+        corporate_action_quarantine_state
+        is ReviewedCorporateActionQuarantineState.INVALID_MARKED
     )
     if holding is None:
         if (
             normalized_exchange in {"NASD", "NYSE", "AMEX"}
-            and isinstance(prior_sync, dict)
-            and prior_sync.get("monitoring_eligible") is False
             and (
-                prior_sync.get("manual_review_required") is True
-                or reviewed_corporate_action
+                invalid_corporate_action
+                or (
+                    isinstance(prior_sync, dict)
+                    and (
+                        reviewed_corporate_action
+                        or (
+                            prior_sync.get("monitoring_eligible") is False
+                            and prior_sync.get("manual_review_required") is True
+                        )
+                    )
+                )
             )
         ):
-            payload["_position_sync"] = dict(prior_sync)
+            payload["_position_sync"] = _preserved_position_sync(
+                prior_sync=prior_sync,
+                invalid_corporate_action=invalid_corporate_action,
+            )
         return payload
     if normalized_exchange not in {"NASD", "NYSE", "AMEX"}:
         return payload
@@ -3762,8 +3824,11 @@ def _position_snapshot_payload(
             if reported_exchange in {"NASD", "NYSE", "AMEX"}
             else "unsupported_overseas_exchange"
         )
-    if reviewed_corporate_action:
-        position_sync = dict(prior_sync)
+    if reviewed_corporate_action or invalid_corporate_action:
+        position_sync = _preserved_position_sync(
+            prior_sync=prior_sync,
+            invalid_corporate_action=invalid_corporate_action,
+        )
     elif (
         isinstance(prior_sync, dict)
         and prior_sync.get("monitoring_eligible") is False
@@ -3782,6 +3847,47 @@ def _position_snapshot_payload(
                 position_sync[key] = prior_sync[key]
     payload["_position_sync"] = position_sync
     return payload
+
+
+def _post_reconciliation_corporate_action_quarantine_state(
+    *,
+    db: Session,
+    position: ExecutionPosition,
+    prior_state: ReviewedCorporateActionQuarantineState,
+) -> ReviewedCorporateActionQuarantineState:
+    if prior_state is ReviewedCorporateActionQuarantineState.INVALID_MARKED:
+        return prior_state
+    if prior_state is ReviewedCorporateActionQuarantineState.UNRELATED:
+        return prior_state
+    return load_reviewed_corporate_action_quarantine_state(
+        db=db,
+        position=position,
+        for_update=True,
+    )
+
+
+def _preserved_position_sync(
+    *,
+    prior_sync: object,
+    invalid_corporate_action: bool,
+) -> dict[str, Any]:
+    preserved = dict(prior_sync) if isinstance(prior_sync, dict) else {}
+    if invalid_corporate_action:
+        preserved.update(
+            {
+                "monitoring_eligible": False,
+                "trade_eligible": False,
+                "manual_review_required": True,
+                "manual_review_reason": (
+                    REVIEWED_CORPORATE_ACTION_INVALID_REASON
+                ),
+                "route_disposition": (
+                    REVIEWED_CORPORATE_ACTION_ROUTE_DISPOSITION
+                ),
+                "quarantine_validation_state": "invalid_marked",
+            }
+        )
+    return preserved
 
 
 def _unpriced_kis_us_holding_recovery_evidence(

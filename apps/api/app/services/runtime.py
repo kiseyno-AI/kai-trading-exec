@@ -39,7 +39,10 @@ from app.services.fill_idempotency import (
     execution_fills_have_relevant_conflicting_identity,
 )
 from app.services.corporate_action_quarantine_contract import (
+    REVIEWED_CORPORATE_ACTION_INVALID_REASON,
     REVIEWED_CORPORATE_ACTION_REASON,
+    ReviewedCorporateActionQuarantineState,
+    load_reviewed_corporate_action_quarantine_states,
 )
 from app.services.fill_economics import (
     ClosedTradeEconomics,
@@ -1804,11 +1807,32 @@ def position_truth_freshness_payload(
         if _position_has_quantity(position)
     }
     manual_review_reasons: dict[str, str] = {}
+    reviewed_corporate_action_symbols: set[str] = set()
+    quarantine_states = load_reviewed_corporate_action_quarantine_states(
+        db=db,
+        positions=positions,
+    )
     for position in sorted(
         positions,
         key=lambda item: (item.symbol, str(item.exchange or ""), item.id),
     ):
         if not _position_has_quantity(position):
+            continue
+        quarantine_state = quarantine_states[position.id]
+        if (
+            quarantine_state
+            is ReviewedCorporateActionQuarantineState.VERIFIED
+        ):
+            reviewed_corporate_action_symbols.add(position.symbol)
+            continue
+        if (
+            quarantine_state
+            is ReviewedCorporateActionQuarantineState.INVALID_MARKED
+        ):
+            manual_review_reasons.setdefault(
+                position.symbol,
+                REVIEWED_CORPORATE_ACTION_INVALID_REASON,
+            )
             continue
         raw_payload = position.raw_payload if isinstance(position.raw_payload, dict) else {}
         sync_context = raw_payload.get("_position_sync")
@@ -1824,6 +1848,7 @@ def position_truth_freshness_payload(
                 or "position_monitoring_not_eligible"
             ),
         )
+    reviewed_corporate_action_symbols.difference_update(manual_review_reasons)
     candidate_symbols = nonzero_position_symbols | evidence_symbols
     trusted_flat_count = sum(
         1
@@ -2020,6 +2045,12 @@ def position_truth_freshness_payload(
             symbol: manual_review_reasons[symbol]
             for symbol in sorted(manual_review_reasons)
         },
+        "reviewed_corporate_action_count": len(
+            reviewed_corporate_action_symbols
+        ),
+        "reviewed_corporate_action_symbols": sorted(
+            reviewed_corporate_action_symbols
+        ),
         "trusted_flat_count": trusted_flat_count,
     }
 
@@ -2305,6 +2336,44 @@ def runtime_actionable_alerts_payload(
                     "message": "execution position truth is stale or missing for symbols with live evidence",
                 }
             )
+        reviewed_corporate_action_symbols = sorted(
+            {
+                str(symbol)
+                for symbol in position_truth.get(
+                    "reviewed_corporate_action_symbols"
+                )
+                or []
+                if str(symbol)
+            }
+        )
+        if reviewed_corporate_action_symbols:
+            alerts.append(
+                {
+                    "kind": "reviewed_corporate_action_holding_quarantined",
+                    "severity": "warning",
+                    "count": len(reviewed_corporate_action_symbols),
+                    "symbols": reviewed_corporate_action_symbols,
+                    "reasons": [
+                        {
+                            "code": REVIEWED_CORPORATE_ACTION_REASON,
+                            "count": len(reviewed_corporate_action_symbols),
+                            "symbols": reviewed_corporate_action_symbols,
+                        }
+                    ],
+                    "runtime_impact": {
+                        "scope": "listed_symbols_only",
+                        "blocks_global_runtime_resume": False,
+                        "blocks_unrelated_krx_new_buys": False,
+                        "quote_strategy_monitoring_expected": False,
+                        "broker_reconciliation_continues": True,
+                    },
+                    "message": (
+                        "reviewed non-tradeable corporate-action holdings "
+                        "remain in broker reconciliation and are intentionally "
+                        "excluded from quote and strategy monitoring"
+                    ),
+                }
+            )
         manual_review_count = int(position_truth.get("manual_review_count") or 0)
         if manual_review_count > 0:
             manual_review_symbols = [
@@ -2323,38 +2392,9 @@ def runtime_actionable_alerts_payload(
                     manual_review_reasons.get(symbol)
                     or "position_monitoring_not_eligible"
                 )
+                if reason == REVIEWED_CORPORATE_ACTION_REASON:
+                    reason = REVIEWED_CORPORATE_ACTION_INVALID_REASON
                 symbols_by_reason.setdefault(reason, []).append(symbol)
-            reviewed_corporate_action_symbols = sorted(
-                symbols_by_reason.pop(REVIEWED_CORPORATE_ACTION_REASON, [])
-            )
-            if reviewed_corporate_action_symbols:
-                alerts.append(
-                    {
-                        "kind": "reviewed_corporate_action_holding_quarantined",
-                        "severity": "warning",
-                        "count": len(reviewed_corporate_action_symbols),
-                        "symbols": reviewed_corporate_action_symbols,
-                        "reasons": [
-                            {
-                                "code": REVIEWED_CORPORATE_ACTION_REASON,
-                                "count": len(reviewed_corporate_action_symbols),
-                                "symbols": reviewed_corporate_action_symbols,
-                            }
-                        ],
-                        "runtime_impact": {
-                            "scope": "listed_symbols_only",
-                            "blocks_global_runtime_resume": False,
-                            "blocks_unrelated_krx_new_buys": False,
-                            "quote_strategy_monitoring_expected": False,
-                            "broker_reconciliation_continues": True,
-                        },
-                        "message": (
-                            "reviewed non-tradeable corporate-action holdings "
-                            "remain in broker reconciliation and are intentionally "
-                            "excluded from quote and strategy monitoring"
-                        ),
-                    }
-                )
             remaining_manual_review_symbols = sorted(
                 symbol
                 for symbols in symbols_by_reason.values()
@@ -3940,6 +3980,8 @@ def build_runtime_status(
             "manual_review_count": 0,
             "manual_review_symbols": [],
             "manual_review_reasons": {},
+            "reviewed_corporate_action_count": 0,
+            "reviewed_corporate_action_symbols": [],
             "trusted_flat_count": 0,
         },
         "broker_orders": {

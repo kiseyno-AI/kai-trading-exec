@@ -2812,11 +2812,13 @@ def apply_reviewed_corporate_action_quarantine(
                 actor=normalized_actor,
                 reason=normalized_reason,
                 evidence_summary={
+                    "mode": position.mode,
                     "position_id": position.id,
                     "symbol": position.symbol,
                     "provider": position.provider,
                     "account_scope": position.account_scope,
                     "exchange": position.exchange,
+                    "asset_class": "us_equity",
                     "quantity": _canonical_attribution_decimal(
                         position.quantity
                     ),
@@ -2829,9 +2831,16 @@ def apply_reviewed_corporate_action_quarantine(
                     "last_reconciled_at": _serialize_datetime(
                         position.last_reconciled_at
                     ),
+                    "updated_from": position.updated_from,
+                    "raw_payload_digest": locked_item[
+                        "raw_payload_digest"
+                    ],
                     "review_evidence": normalized_review,
                     "review_evidence_digest": locked_item[
                         "review_evidence_digest"
+                    ],
+                    "corporate_action_reviewed_at": normalized_review[
+                        "reviewed_at"
                     ],
                     "evidence_fingerprint": locked_fingerprint,
                     "snapshot_evidence_digest": locked_item[
