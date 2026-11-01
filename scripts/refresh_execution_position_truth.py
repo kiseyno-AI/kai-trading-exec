@@ -30,11 +30,13 @@ from app.services.position_truth_remediation import (  # noqa: E402
     analyze_kis_krx_canonical_flat_proof_refresh,
     analyze_legacy_position_attribution,
     analyze_position_truth_remediation,
+    analyze_reviewed_corporate_action_quarantine,
     apply_alpaca_crypto_flat_position_rebind,
     apply_kis_krx_legacy_flat_position_rebind,
     apply_kis_krx_canonical_flat_proof_refresh,
     apply_legacy_position_attribution,
     apply_position_truth_remediation,
+    apply_reviewed_corporate_action_quarantine,
     legacy_attribution_account_scope_source,
 )
 
@@ -83,6 +85,18 @@ def _approved_position_evidence(values: list[str]) -> dict[str, str]:
     return approved
 
 
+def _corporate_action_review_evidence(path: str | None) -> dict[str, object] | None:
+    if path is None:
+        return None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("corporate-action review evidence file is invalid") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit("corporate-action review evidence file must contain an object")
+    return payload
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -129,6 +143,20 @@ def main(argv: list[str] | None = None) -> int:
             "a new complete account snapshot and immutable audit generation."
         ),
     )
+    parser.add_argument(
+        "--reviewed-corporate-action-position",
+        help=(
+            "Analyze one exact, already-attributed live KIS US holding for a "
+            "reviewed non-tradeable corporate-action quarantine."
+        ),
+    )
+    parser.add_argument(
+        "--corporate-action-review-file",
+        help=(
+            "JSON file containing the exact reviewed SEC evidence schema for "
+            "--reviewed-corporate-action-position."
+        ),
+    )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument(
         "--approve-position",
@@ -154,6 +182,16 @@ def main(argv: list[str] | None = None) -> int:
     kis_krx_flat_proof_refresh = (
         args.kis_krx_flat_proof_refresh_symbol is not None
     )
+    reviewed_corporate_action = (
+        args.reviewed_corporate_action_position is not None
+    )
+    review_evidence = _corporate_action_review_evidence(
+        args.corporate_action_review_file
+    )
+    if reviewed_corporate_action != (review_evidence is not None):
+        raise SystemExit(
+            "reviewed corporate-action position and review file are required together"
+        )
     if (
         sum(
             bool(value)
@@ -161,13 +199,13 @@ def main(argv: list[str] | None = None) -> int:
                 kis_krx_flat_rebind,
                 kis_krx_flat_proof_refresh,
                 args.legacy_attribution_exchange,
+                reviewed_corporate_action,
             )
         )
         > 1
     ):
         raise SystemExit(
-            "KIS KRX flat rebind or proof refresh cannot be combined with "
-            "another attribution mode"
+            "position remediation modes cannot be combined"
         )
     kis_krx_symbol = (
         args.kis_krx_flat_rebind_symbol
@@ -192,6 +230,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if (kis_krx_flat_rebind or kis_krx_flat_proof_refresh) and runtime_mode != "live":
         raise SystemExit("KIS KRX flat remediation requires --runtime-mode live")
+    if reviewed_corporate_action and runtime_mode != "live":
+        raise SystemExit(
+            "reviewed corporate-action quarantine requires --runtime-mode live"
+        )
     reject_secret_database_url_argument(args.database_url)
     environment_database_url = (os.getenv("KAI_EXEC_DATABASE_URL") or "").strip()
     database_url = args.database_url or environment_database_url or None
@@ -204,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
             args.legacy_attribution_exchange
             or kis_krx_flat_rebind
             or kis_krx_flat_proof_refresh
+            or reviewed_corporate_action
         )
     )
     if approved_evidence and not approved_position_apply:
@@ -214,6 +257,12 @@ def main(argv: list[str] | None = None) -> int:
     if approved_position_apply and not approved_evidence:
         raise SystemExit(
             "approved position apply requires at least one --approve-position"
+        )
+    if reviewed_corporate_action and args.apply and (
+        set(approved_evidence) != {args.reviewed_corporate_action_position}
+    ):
+        raise SystemExit(
+            "reviewed corporate-action apply requires exactly its position approval"
         )
     if runtime_mode == "live" and not database_url:
         raise SystemExit(
@@ -258,7 +307,26 @@ def main(argv: list[str] | None = None) -> int:
                 if kis_krx_flat_rebind or kis_krx_flat_proof_refresh
                 else None
             )
-            if kis_krx_flat_proof_refresh and args.apply:
+            if reviewed_corporate_action and args.apply:
+                payload = apply_reviewed_corporate_action_quarantine(
+                    settings=settings,
+                    db=db,
+                    position_id=args.reviewed_corporate_action_position,
+                    review_evidence=review_evidence,
+                    approved_fingerprint=approved_evidence[
+                        args.reviewed_corporate_action_position
+                    ],
+                    actor=actor,
+                    reason=reason,
+                )
+            elif reviewed_corporate_action:
+                payload = analyze_reviewed_corporate_action_quarantine(
+                    settings=settings,
+                    db=db,
+                    position_id=args.reviewed_corporate_action_position,
+                    review_evidence=review_evidence,
+                )
+            elif kis_krx_flat_proof_refresh and args.apply:
                 payload = apply_kis_krx_canonical_flat_proof_refresh(
                     settings=settings,
                     db=db,

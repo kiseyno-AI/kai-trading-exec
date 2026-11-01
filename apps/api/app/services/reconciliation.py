@@ -51,6 +51,9 @@ from app.services.broker_order_state import (
     NONTERMINAL_ORDER_STATUSES,
     broker_order_observed_at_expr,
 )
+from app.services.corporate_action_quarantine_contract import (
+    is_reviewed_corporate_action_quarantine,
+)
 from app.services.execution_account_route import redact_account_references
 from app.services.execution_failures import (
     record_actionable_execution_failure,
@@ -3723,12 +3726,18 @@ def _position_snapshot_payload(
         if isinstance(prior_payload, dict)
         else None
     )
+    reviewed_corporate_action = is_reviewed_corporate_action_quarantine(
+        prior_sync
+    )
     if holding is None:
         if (
             normalized_exchange in {"NASD", "NYSE", "AMEX"}
             and isinstance(prior_sync, dict)
             and prior_sync.get("monitoring_eligible") is False
-            and prior_sync.get("manual_review_required") is True
+            and (
+                prior_sync.get("manual_review_required") is True
+                or reviewed_corporate_action
+            )
         ):
             payload["_position_sync"] = dict(prior_sync)
         return payload
@@ -3753,7 +3762,9 @@ def _position_snapshot_payload(
             if reported_exchange in {"NASD", "NYSE", "AMEX"}
             else "unsupported_overseas_exchange"
         )
-    if (
+    if reviewed_corporate_action:
+        position_sync = dict(prior_sync)
+    elif (
         isinstance(prior_sync, dict)
         and prior_sync.get("monitoring_eligible") is False
         and prior_sync.get("manual_review_required") is True

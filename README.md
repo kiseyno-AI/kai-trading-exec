@@ -933,6 +933,55 @@ python3 scripts/refresh_execution_position_truth.py \
   --runtime-mode live
 ```
 
+An already-attributed KIS US holding that has completed dissolution review uses
+a separate fail-closed quarantine. Put the exact reviewed SEC evidence in a
+local JSON file (the v1 schema accepts dissolution only):
+
+```json
+{
+  "source": "operator_reviewed_sec_filings",
+  "issuer_name": "Example Issuer, Inc.",
+  "corporate_action": "dissolution",
+  "effective_date": "2024-02-23",
+  "security_status": "no_longer_publicly_traded_or_outstanding",
+  "evidence_refs": [
+    "https://www.sec.gov/Archives/edgar/data/ISSUER/FILING-1.htm",
+    "https://www.sec.gov/Archives/edgar/data/ISSUER/FILING-2.htm"
+  ],
+  "reviewed_at": "2026-11-01T02:00:00+00:00"
+}
+```
+
+Generate and review the exact account-position fingerprint, then apply only
+that pair:
+
+```bash
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode live \
+  --reviewed-corporate-action-position POSITION_ID \
+  --corporate-action-review-file /secure/path/review.json
+
+.venv/bin/python scripts/refresh_execution_position_truth.py \
+  --runtime-mode live \
+  --reviewed-corporate-action-position POSITION_ID \
+  --corporate-action-review-file /secure/path/review.json \
+  --apply \
+  --approve-position 'POSITION_ID=64HEX_FROM_DRY_RUN' \
+  --actor 'operator-name' \
+  --reason 'SEC dissolution evidence reviewed against exact KIS holding'
+```
+
+The dry-run requires fresh complete KIS holdings and open-order evidence, exact
+account/route/symbol/quantity/average-price agreement, zero current price, zero
+reported valuation when present, and no matching open order. Apply takes the
+same account and position locks and rejects any fingerprint, row, review, or
+cross-exchange symbol drift. It preserves account identity, quantity, and
+average price, writes one audit event, performs no broker API call, and marks
+the holding non-trading/non-monitoring. Normal broker reconciliation continues,
+while quote and strategy worksets exclude the holding and runtime status emits
+a distinct reviewed-corporate-action warning instead of an unresolved critical
+manual-review alert.
+
 A historical flat KRX row with null provider/account/exchange fields needs the
 separate, single-symbol current-flat workflow. Drain every writer first. The
 dry-run accepts only a canonical six-digit symbol and emits one position ID and

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import importlib.util
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import ANY
@@ -54,6 +55,124 @@ def _stub_runtime(monkeypatch: pytest.MonkeyPatch) -> tuple[object, _EngineStub]
         lambda engine: lambda: nullcontext(db),
     )
     return db, engine
+
+
+def _write_corporate_action_review(path: Path) -> dict[str, object]:
+    evidence = {
+        "source": "operator_reviewed_sec_filings",
+        "issuer_name": "Bellicum Pharmaceuticals, Inc.",
+        "corporate_action": "dissolution",
+        "effective_date": "2024-02-23",
+        "security_status": "no_longer_publicly_traded_or_outstanding",
+        "evidence_refs": [
+            "https://www.sec.gov/Archives/edgar/data/1358403/first.htm",
+            "https://www.sec.gov/Archives/edgar/data/1358403/second.htm",
+        ],
+        "reviewed_at": "2026-11-01T02:00:00+00:00",
+    }
+    path.write_text(json.dumps(evidence), encoding="utf-8")
+    return evidence
+
+
+def test_reviewed_corporate_action_routes_exact_live_dry_run_without_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db, engine = _stub_runtime(monkeypatch)
+    evidence_path = tmp_path / "review.json"
+    evidence = _write_corporate_action_review(evidence_path)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        cli,
+        "KisBrokerAdapter",
+        lambda **kwargs: pytest.fail("corporate-action dry-run opened broker adapter"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "analyze_reviewed_corporate_action_quarantine",
+        lambda **kwargs: calls.append(kwargs) or {"mode": "dry-run"},
+    )
+    monkeypatch.setattr(
+        cli,
+        "apply_reviewed_corporate_action_quarantine",
+        lambda **kwargs: pytest.fail("corporate-action dry-run attempted mutation"),
+    )
+
+    assert cli.main(
+        [
+            "--database-url",
+            "sqlite:///test.db",
+            "--runtime-mode",
+            "live",
+            "--reviewed-corporate-action-position",
+            "position-1",
+            "--corporate-action-review-file",
+            str(evidence_path),
+        ]
+    ) == 0
+
+    assert calls == [
+        {
+            "settings": ANY,
+            "db": db,
+            "position_id": "position-1",
+            "review_evidence": evidence,
+        }
+    ]
+    assert engine.disposed is True
+
+
+def test_reviewed_corporate_action_apply_routes_one_exact_approval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db, engine = _stub_runtime(monkeypatch)
+    evidence_path = tmp_path / "review.json"
+    evidence = _write_corporate_action_review(evidence_path)
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        cli,
+        "KisBrokerAdapter",
+        lambda **kwargs: pytest.fail("corporate-action apply opened broker adapter"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "apply_reviewed_corporate_action_quarantine",
+        lambda **kwargs: calls.append(kwargs) or {"mode": "apply"},
+    )
+
+    assert cli.main(
+        [
+            "--database-url",
+            "sqlite:///test.db",
+            "--runtime-mode",
+            "live",
+            "--reviewed-corporate-action-position",
+            "position-1",
+            "--corporate-action-review-file",
+            str(evidence_path),
+            "--apply",
+            "--approve-position",
+            f"position-1={'A' * 64}",
+            "--actor",
+            "operator",
+            "--reason",
+            "SEC evidence reviewed",
+        ]
+    ) == 0
+
+    assert calls == [
+        {
+            "settings": ANY,
+            "db": db,
+            "position_id": "position-1",
+            "review_evidence": evidence,
+            "approved_fingerprint": "a" * 64,
+            "actor": "operator",
+            "reason": "SEC evidence reviewed",
+        }
+    ]
+    assert engine.disposed is True
 
 
 def test_alpaca_legacy_cli_adapter_authenticates_the_us_equity_lane(

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 import hmac
 import json
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.engine import make_url
@@ -30,6 +31,15 @@ from app.models.runtime import (
 from app.services.account_drawdown_recovery import recovery_account_fingerprint
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_order_state import ACTIONABLE_OPEN_ORDER_STATUSES
+from app.services.corporate_action_quarantine_contract import (
+    REVIEWED_CORPORATE_ACTION_CANDIDATE_TYPE,
+    REVIEWED_CORPORATE_ACTION_OUTCOME,
+    REVIEWED_CORPORATE_ACTION_REASON,
+    REVIEWED_CORPORATE_ACTION_REVIEW_SOURCE,
+    REVIEWED_CORPORATE_ACTION_ROUTE_DISPOSITION,
+    REVIEWED_CORPORATE_ACTION_SAFETY_POLICY_VERSION,
+    REVIEWED_CORPORATE_ACTION_SECURITY_STATUS,
+)
 from app.services.fifo_inventory import fifo_route_scope_from_order
 from app.services.kis_krx_flat_rebind_contract import (
     KIS_KRX_FLAT_PROOF_REFRESH_CANDIDATE_TYPE,
@@ -2620,6 +2630,682 @@ def apply_legacy_position_attribution(
             for item in approved_items
         ],
     }
+
+
+def analyze_reviewed_corporate_action_quarantine(
+    *,
+    settings: Settings,
+    db: Session,
+    position_id: str,
+    review_evidence: dict[str, object],
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Build an exact, read-only approval fingerprint for one reviewed holding."""
+    if settings.runtime_mode != "live":
+        raise ValueError("reviewed corporate-action quarantine requires live mode")
+    normalized_position_id = str(position_id or "").strip()
+    if not normalized_position_id:
+        raise ValueError("reviewed corporate-action quarantine requires position_id")
+    evaluated_at = now or datetime.now(UTC)
+    normalized_review = _validated_corporate_action_review_evidence(
+        review_evidence,
+        evaluated_at=evaluated_at,
+        settings=settings,
+    )
+    position = db.get(ExecutionPosition, normalized_position_id)
+    if position is None or position.mode != settings.runtime_mode:
+        raise PositionIdentityConflictError(
+            "reviewed corporate-action quarantine position is unavailable"
+        )
+    _reject_corporate_action_route_collisions(
+        settings=settings,
+        db=db,
+        position=position,
+        lock=False,
+    )
+    item = _reviewed_corporate_action_quarantine_item(
+        settings=settings,
+        position=position,
+        review_evidence=normalized_review,
+        evaluated_at=evaluated_at,
+    )
+    return _reviewed_corporate_action_quarantine_payload(
+        mode="dry-run",
+        settings=settings,
+        evaluated_at=evaluated_at,
+        item=item,
+    )
+
+
+def apply_reviewed_corporate_action_quarantine(
+    *,
+    settings: Settings,
+    db: Session,
+    position_id: str,
+    review_evidence: dict[str, object],
+    approved_fingerprint: str,
+    actor: str,
+    reason: str,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Quarantine one exact reviewed holding without any broker mutation."""
+    normalized_actor = str(actor or "").strip()
+    normalized_reason = str(reason or "").strip()
+    normalized_fingerprint = str(approved_fingerprint or "").strip().lower()
+    if not normalized_actor or not normalized_reason:
+        raise ValueError(
+            "reviewed corporate-action quarantine requires actor and reason"
+        )
+    if not is_lower_hex_sha256(normalized_fingerprint):
+        raise ValueError(
+            "reviewed corporate-action quarantine approval is invalid"
+        )
+
+    evaluated_at = now or datetime.now(UTC)
+    serialization = None
+    try:
+        current = analyze_reviewed_corporate_action_quarantine(
+            settings=settings,
+            db=db,
+            position_id=position_id,
+            review_evidence=review_evidence,
+            now=evaluated_at,
+        )
+        item = current["item"]
+        assert isinstance(item, dict)
+        current_fingerprint = item.get("evidence_fingerprint")
+        if (
+            item.get("eligible") is not True
+            or not isinstance(current_fingerprint, str)
+            or not hmac.compare_digest(
+                normalized_fingerprint,
+                current_fingerprint,
+            )
+        ):
+            raise PositionIdentityConflictError(
+                "approved corporate-action evidence no longer matches current "
+                "account truth"
+            )
+
+        db.rollback()
+        serialization = _acquire_legacy_attribution_apply_serialization(
+            settings=settings,
+            db=db,
+            provider=str(item["provider"]),
+            account_scope=str(item["account_scope"]),
+            exchange=str(item["exchange"]),
+        )
+        try:
+            position = db.scalar(
+                select(ExecutionPosition)
+                .where(
+                    ExecutionPosition.id == str(item["position_id"]),
+                    ExecutionPosition.mode == settings.runtime_mode,
+                )
+                .with_for_update(nowait=True)
+                .execution_options(populate_existing=True)
+            )
+        except DBAPIError as exc:
+            raise PositionIdentityConflictError(
+                "reviewed corporate-action position is busy; retry from a new dry-run"
+            ) from exc
+        if position is None:
+            raise PositionIdentityConflictError(
+                "approved corporate-action position is unavailable"
+            )
+        _reject_corporate_action_route_collisions(
+            settings=settings,
+            db=db,
+            position=position,
+            lock=True,
+        )
+        normalized_review = _validated_corporate_action_review_evidence(
+            review_evidence,
+            evaluated_at=evaluated_at,
+            settings=settings,
+        )
+        locked_item = _reviewed_corporate_action_quarantine_item(
+            settings=settings,
+            position=position,
+            review_evidence=normalized_review,
+            evaluated_at=evaluated_at,
+        )
+        locked_fingerprint = locked_item.get("evidence_fingerprint")
+        if (
+            locked_item.get("eligible") is not True
+            or not isinstance(locked_fingerprint, str)
+            or not hmac.compare_digest(
+                normalized_fingerprint,
+                locked_fingerprint,
+            )
+        ):
+            raise PositionIdentityConflictError(
+                "approved corporate-action position changed while quarantine "
+                "was pending"
+            )
+
+        prior_payload = dict(position.raw_payload or {})
+        prior_sync = dict(prior_payload.get("_position_sync") or {})
+        prior_payload["pre_corporate_action_position_sync"] = prior_sync
+        prior_payload["_position_sync"] = {
+            "asset_class": "us_equity",
+            "exchange": position.exchange,
+            "monitoring_eligible": False,
+            "trade_eligible": False,
+            "manual_review_required": False,
+            "manual_review_reason": REVIEWED_CORPORATE_ACTION_REASON,
+            "route_disposition": REVIEWED_CORPORATE_ACTION_ROUTE_DISPOSITION,
+            "corporate_action_reviewed_at": normalized_review["reviewed_at"],
+            "review_evidence_digest": locked_item["review_evidence_digest"],
+            "safety_policy_version": (
+                REVIEWED_CORPORATE_ACTION_SAFETY_POLICY_VERSION
+            ),
+        }
+        position.raw_payload = prior_payload
+        db.add(
+            RuntimeRemediationEvent(
+                mode=settings.runtime_mode,
+                candidate_type=REVIEWED_CORPORATE_ACTION_CANDIDATE_TYPE,
+                candidate_key=position.id,
+                subject_id=position.id,
+                outcome=REVIEWED_CORPORATE_ACTION_OUTCOME,
+                actor=normalized_actor,
+                reason=normalized_reason,
+                evidence_summary={
+                    "position_id": position.id,
+                    "symbol": position.symbol,
+                    "provider": position.provider,
+                    "account_scope": position.account_scope,
+                    "exchange": position.exchange,
+                    "quantity": _canonical_attribution_decimal(
+                        position.quantity
+                    ),
+                    "base_quantity": _canonical_attribution_decimal(
+                        position.base_quantity
+                    ),
+                    "average_price": _canonical_attribution_decimal(
+                        position.average_price
+                    ),
+                    "last_reconciled_at": _serialize_datetime(
+                        position.last_reconciled_at
+                    ),
+                    "review_evidence": normalized_review,
+                    "review_evidence_digest": locked_item[
+                        "review_evidence_digest"
+                    ],
+                    "evidence_fingerprint": locked_fingerprint,
+                    "snapshot_evidence_digest": locked_item[
+                        "snapshot_evidence_digest"
+                    ],
+                    "snapshot_evidence": locked_item["snapshot_evidence"],
+                    "route_disposition": (
+                        REVIEWED_CORPORATE_ACTION_ROUTE_DISPOSITION
+                    ),
+                    "safety_policy_version": (
+                        REVIEWED_CORPORATE_ACTION_SAFETY_POLICY_VERSION
+                    ),
+                    "safety_invariants": locked_item["safety_invariants"],
+                    "orders_submitted": 0,
+                    "orders_amended": 0,
+                    "orders_canceled": 0,
+                },
+                occurred_at=evaluated_at,
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        if serialization is not None:
+            serialization.close()
+
+    return _reviewed_corporate_action_quarantine_payload(
+        mode="apply",
+        settings=settings,
+        evaluated_at=evaluated_at,
+        item={**locked_item, "outcome": REVIEWED_CORPORATE_ACTION_OUTCOME},
+    )
+
+
+def _validated_corporate_action_review_evidence(
+    evidence: dict[str, object],
+    *,
+    evaluated_at: datetime,
+    settings: Settings,
+) -> dict[str, object]:
+    required_keys = {
+        "source",
+        "issuer_name",
+        "corporate_action",
+        "effective_date",
+        "security_status",
+        "evidence_refs",
+        "reviewed_at",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != required_keys:
+        raise ValueError(
+            "corporate-action review evidence must match the exact v1 schema"
+        )
+    if evidence.get("source") != REVIEWED_CORPORATE_ACTION_REVIEW_SOURCE:
+        raise ValueError("corporate-action review source is not authoritative")
+    issuer_name = str(evidence.get("issuer_name") or "").strip()
+    if not issuer_name or len(issuer_name) > 256:
+        raise ValueError("corporate-action issuer_name is invalid")
+    if evidence.get("corporate_action") != "dissolution":
+        raise ValueError("corporate-action review supports exact dissolution only")
+    if evidence.get("security_status") != REVIEWED_CORPORATE_ACTION_SECURITY_STATUS:
+        raise ValueError("corporate-action security_status is invalid")
+    try:
+        effective_date = date.fromisoformat(str(evidence.get("effective_date") or ""))
+    except ValueError as exc:
+        raise ValueError("corporate-action effective_date is invalid") from exc
+    reviewed_at = _aware_iso_datetime(
+        evidence.get("reviewed_at"),
+        field="corporate-action reviewed_at",
+    )
+    normalized_evaluated_at = _aware_datetime(
+        evaluated_at,
+        field="corporate-action evaluated_at",
+    )
+    future_skew = timedelta(
+        seconds=settings.account_drawdown_recovery_max_snapshot_future_skew_seconds
+    )
+    if reviewed_at > normalized_evaluated_at + future_skew:
+        raise ValueError("corporate-action reviewed_at is in the future")
+    if effective_date > reviewed_at.date():
+        raise ValueError("corporate-action effective_date follows reviewed_at")
+
+    raw_refs = evidence.get("evidence_refs")
+    if not isinstance(raw_refs, list) or len(raw_refs) < 2:
+        raise ValueError(
+            "corporate-action review requires at least two SEC evidence refs"
+        )
+    refs: list[str] = []
+    for value in raw_refs:
+        ref = str(value or "").strip()
+        parsed = urlparse(ref)
+        if (
+            parsed.scheme != "https"
+            or (parsed.hostname or "").lower() not in {"sec.gov", "www.sec.gov"}
+            or not parsed.path.strip("/")
+        ):
+            raise ValueError("corporate-action evidence ref must be an SEC HTTPS URL")
+        refs.append(ref)
+    if len(set(refs)) != len(refs):
+        raise ValueError("corporate-action evidence refs must be unique")
+
+    return {
+        "source": REVIEWED_CORPORATE_ACTION_REVIEW_SOURCE,
+        "issuer_name": issuer_name,
+        "corporate_action": "dissolution",
+        "effective_date": effective_date.isoformat(),
+        "security_status": REVIEWED_CORPORATE_ACTION_SECURITY_STATUS,
+        "evidence_refs": sorted(refs),
+        "reviewed_at": reviewed_at.astimezone(UTC).isoformat(),
+    }
+
+
+def _reviewed_corporate_action_quarantine_item(
+    *,
+    settings: Settings,
+    position: ExecutionPosition,
+    review_evidence: dict[str, object],
+    evaluated_at: datetime,
+) -> dict[str, object]:
+    identity: PositionIdentity | None = None
+    payload_identity: PositionIdentity | None = None
+    expected_identity: PositionIdentity | None = None
+    reason: str | None = None
+    if not isinstance(position.raw_payload, dict):
+        reason = "position_payload_invalid"
+    else:
+        try:
+            identity = position_identity_from_columns(position)
+            payload_identity = position_identity_from_payload(position.raw_payload)
+            if identity is not None:
+                expected_identity = build_position_identity(
+                    settings=settings,
+                    provider="kis",
+                    exchange=identity.exchange,
+                )
+        except PositionIdentityConflictError:
+            reason = "position_route_invalid"
+    if reason is None and (
+        identity is None
+        or payload_identity is None
+        or identity != payload_identity
+        or expected_identity is None
+        or identity != expected_identity
+        or identity.provider != "kis"
+        or identity.exchange not in {"NASD", "NYSE", "AMEX"}
+    ):
+        reason = "position_route_mismatch"
+    if reason is None and (
+        str(position.symbol or "").strip()
+        != _normalized_position_symbol(position.symbol)
+    ):
+        reason = "position_symbol_not_canonical"
+    if reason is None and (
+        position.quantity <= 0
+        or position.base_quantity not in {None, Decimal("0")}
+        or not _positive_finite_attribution_decimal(position.average_price)
+    ):
+        reason = "position_quantity_or_average_price_invalid"
+    if reason is None and isinstance(position.raw_payload, dict):
+        sync_context = position.raw_payload.get("_position_sync")
+        if not (
+            isinstance(sync_context, dict)
+            and sync_context.get("asset_class") == "us_equity"
+            and str(sync_context.get("exchange") or "").strip().upper()
+            == identity.exchange
+            and sync_context.get("monitoring_eligible") is False
+            and sync_context.get("manual_review_required") is True
+            and sync_context.get("manual_review_reason")
+            == "unpriced_overseas_holding"
+            and sync_context.get("trade_eligible") is not False
+            and sync_context.get("route_disposition") is None
+            and "pre_corporate_action_position_sync" not in position.raw_payload
+        ):
+            reason = "position_not_in_unpriced_manual_review"
+    if reason is None and not _position_reconciliation_is_fresh(
+        position=position,
+        settings=settings,
+        evaluated_at=evaluated_at,
+    ):
+        reason = "position_reconciliation_stale"
+
+    snapshot_evidence: dict[str, object] | None = None
+    if reason is None:
+        snapshot_evidence, reason = _corporate_action_snapshot_evidence(
+            settings=settings,
+            position=position,
+        )
+    safety_invariants = {
+        "broker_actions_allowed": False,
+        "collision_scope": "mode_provider_account_symbol_any_exchange",
+        "provider": "kis",
+        "account_identity_preserved": True,
+        "position_quantity_preserved": True,
+        "position_average_price_preserved": True,
+        "broker_reconciliation_continues": True,
+        "quote_strategy_monitoring_allowed": False,
+        "route_disposition": REVIEWED_CORPORATE_ACTION_ROUTE_DISPOSITION,
+    }
+    review_evidence_digest = _legacy_payload_digest(review_evidence)
+    snapshot_evidence_digest = (
+        _legacy_payload_digest(snapshot_evidence)
+        if snapshot_evidence is not None
+        else None
+    )
+    evidence_material = {
+        "safety_policy_version": (
+            REVIEWED_CORPORATE_ACTION_SAFETY_POLICY_VERSION
+        ),
+        "safety_invariants": safety_invariants,
+        "review_evidence": review_evidence,
+        "review_evidence_digest": review_evidence_digest,
+        "snapshot_evidence_digest": snapshot_evidence_digest,
+        "mode": position.mode,
+        "position_id": position.id,
+        "provider": position.provider,
+        "account_scope": position.account_scope,
+        "exchange": position.exchange,
+        "symbol": position.symbol,
+        "quantity": _canonical_attribution_decimal(position.quantity),
+        "base_quantity": _canonical_attribution_decimal(position.base_quantity),
+        "average_price": _canonical_attribution_decimal(position.average_price),
+        "updated_from": position.updated_from,
+        "last_reconciled_at": _serialize_datetime(position.last_reconciled_at),
+        "raw_payload_digest": _legacy_payload_digest(position.raw_payload),
+    }
+    eligible = reason is None
+    fingerprint = (
+        _legacy_payload_digest(evidence_material) if eligible else None
+    )
+    return {
+        **evidence_material,
+        "eligible": eligible,
+        "reason": "exact_reviewed_corporate_action_match" if eligible else reason,
+        "evidence_fingerprint": fingerprint,
+        "snapshot_evidence": snapshot_evidence,
+        "monitoring_eligible": False,
+        "trading_eligible": False,
+        "manual_review_required": False,
+        "disposition": REVIEWED_CORPORATE_ACTION_ROUTE_DISPOSITION,
+    }
+
+
+def _corporate_action_snapshot_evidence(
+    *,
+    settings: Settings,
+    position: ExecutionPosition,
+) -> tuple[dict[str, object] | None, str | None]:
+    payload = position.raw_payload
+    if not isinstance(payload, dict):
+        return None, "position_payload_invalid"
+    exchange = str(position.exchange or "").strip().upper()
+    if (
+        str(payload.get("currency") or "").strip().upper() != "USD"
+        or str(payload.get("exchange") or "").strip().upper() != exchange
+        or payload.get("holdings_coverage") != "complete"
+        or payload.get("open_orders_coverage") != "complete"
+    ):
+        return None, "broker_snapshot_coverage_incomplete"
+    account_mask = str(payload.get("account_number_masked") or "").strip()
+    if not account_mask or not account_mask.startswith("****"):
+        return None, "broker_account_mask_missing"
+    configured_account = str(settings.kis_account_number or "").strip()
+    if configured_account:
+        expected_mask = (
+            configured_account
+            if len(configured_account) <= 4
+            else f"{'*' * (len(configured_account) - 4)}{configured_account[-4:]}"
+        )
+        if account_mask != expected_mask:
+            return None, "broker_account_mask_mismatch"
+    balance = payload.get("balance")
+    open_orders = payload.get("open_orders")
+    if (
+        not isinstance(balance, dict)
+        or str(balance.get("rt_cd") or "").strip() != "0"
+        or not isinstance(open_orders, dict)
+        or str(open_orders.get("rt_cd") or "").strip() != "0"
+    ):
+        return None, "broker_snapshot_business_status_invalid"
+    balance_rows = _dict_rows(balance.get("output1"))
+    matches = [
+        row
+        for row in balance_rows
+        if str(row.get("ovrs_pdno") or "").strip().upper() == position.symbol
+        and str(row.get("ovrs_excg_cd") or "").strip().upper() == exchange
+    ]
+    if len(matches) != 1:
+        return None, "broker_holding_identity_not_exact"
+    holding = matches[0]
+    holding_quantity = _corporate_action_decimal(holding.get("ovrs_cblc_qty"))
+    sellable_quantity = _corporate_action_decimal(holding.get("ord_psbl_qty"))
+    average_price = _corporate_action_decimal(holding.get("pchs_avg_pric"))
+    current_price = _corporate_action_decimal(holding.get("now_pric2"))
+    if (
+        holding_quantity != Decimal(position.quantity)
+        or sellable_quantity != holding_quantity
+        or average_price != Decimal(position.average_price)
+        or current_price != Decimal("0")
+    ):
+        return None, "broker_holding_economics_not_exact"
+    for field in ("now_pric", "current_price", "prpr", "last_price"):
+        if field not in holding:
+            continue
+        if _corporate_action_decimal(holding.get(field)) != Decimal("0"):
+            return None, "broker_holding_price_conflict"
+    for field in ("ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt"):
+        if field not in holding:
+            continue
+        if _corporate_action_decimal(holding.get(field)) != Decimal("0"):
+            return None, "broker_holding_valuation_conflict"
+
+    for row in _dict_rows(open_orders.get("output")):
+        open_symbol = str(
+            row.get("pdno") or row.get("ovrs_pdno") or ""
+        ).strip().upper()
+        if open_symbol != position.symbol:
+            continue
+        remaining_value = row.get("nccs_qty")
+        if remaining_value is None:
+            remaining_value = row.get("ord_uncc_qty")
+        remaining_quantity = _corporate_action_decimal(remaining_value)
+        if remaining_quantity is None or remaining_quantity > 0:
+            return None, "broker_open_order_present_or_ambiguous"
+    return {
+        "account_number_masked": account_mask,
+        "exchange": exchange,
+        "symbol": position.symbol,
+        "broker_instrument_name": str(
+            holding.get("prdt_name")
+            or holding.get("prdt_name120")
+            or ""
+        ).strip()
+        or None,
+        "quantity": _canonical_attribution_decimal(holding_quantity),
+        "sellable_quantity": _canonical_attribution_decimal(sellable_quantity),
+        "average_price": _canonical_attribution_decimal(average_price),
+        "current_price": _canonical_attribution_decimal(current_price),
+        "holdings_coverage": "complete",
+        "open_orders_coverage": "complete",
+        "matching_open_order": False,
+    }, None
+
+
+def _reviewed_corporate_action_quarantine_payload(
+    *,
+    mode: str,
+    settings: Settings,
+    evaluated_at: datetime,
+    item: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "mode": mode,
+        "runtime_mode": settings.runtime_mode,
+        "generated_at": _serialize_datetime(evaluated_at),
+        "summary": {
+            "candidate_count": 1,
+            "eligible_count": int(item.get("eligible") is True),
+            "quarantined_count": int(
+                mode == "apply"
+                and item.get("outcome") == REVIEWED_CORPORATE_ACTION_OUTCOME
+            ),
+            "broker_api_mutation_count": 0,
+        },
+        "item": item,
+    }
+
+
+def _reject_corporate_action_route_collisions(
+    *,
+    settings: Settings,
+    db: Session,
+    position: ExecutionPosition,
+    lock: bool,
+) -> None:
+    if (
+        not str(position.provider or "").strip()
+        or not str(position.account_scope or "").strip()
+        or not str(position.symbol or "").strip()
+    ):
+        raise PositionIdentityConflictError(
+            "reviewed corporate-action position route is incomplete"
+        )
+    query = (
+        select(ExecutionPosition.id)
+        .where(
+            ExecutionPosition.id != position.id,
+            func.lower(func.trim(ExecutionPosition.mode))
+            == settings.runtime_mode.strip().lower(),
+            func.lower(func.trim(ExecutionPosition.provider))
+            == str(position.provider).strip().lower(),
+            func.lower(func.trim(ExecutionPosition.account_scope))
+            == str(position.account_scope).strip().lower(),
+            func.upper(func.trim(ExecutionPosition.symbol))
+            == _normalized_position_symbol(position.symbol),
+        )
+        .order_by(ExecutionPosition.id.asc())
+    )
+    if lock:
+        query = query.with_for_update(nowait=True)
+    try:
+        collisions = db.scalars(query).all()
+    except DBAPIError as exc:
+        raise PositionIdentityConflictError(
+            "reviewed corporate-action collision check is busy; retry from a new dry-run"
+        ) from exc
+    if collisions:
+        raise PositionIdentityConflictError(
+            "reviewed corporate-action route has a symbol collision"
+        )
+
+
+def _position_reconciliation_is_fresh(
+    *,
+    position: ExecutionPosition,
+    settings: Settings,
+    evaluated_at: datetime,
+) -> bool:
+    if position.updated_from != "reconciliation":
+        return False
+    reconciled_at = position.last_reconciled_at
+    if not isinstance(reconciled_at, datetime):
+        return False
+    normalized_reconciled_at = (
+        reconciled_at.replace(tzinfo=UTC)
+        if reconciled_at.tzinfo is None or reconciled_at.utcoffset() is None
+        else reconciled_at.astimezone(UTC)
+    )
+    normalized_evaluated_at = _aware_datetime(
+        evaluated_at,
+        field="corporate-action evaluated_at",
+    )
+    age = normalized_evaluated_at - normalized_reconciled_at
+    return bool(
+        age
+        <= timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
+        and age
+        >= -timedelta(
+            seconds=settings.account_drawdown_recovery_max_snapshot_future_skew_seconds
+        )
+    )
+
+
+def _dict_rows(value: object) -> list[dict[str, object]]:
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [row for row in value if isinstance(row, dict)]
+    return []
+
+
+def _corporate_action_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _aware_iso_datetime(value: object, *, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} is invalid") from exc
+    return _aware_datetime(parsed, field=field)
+
+
+def _aware_datetime(value: datetime, *, field: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field} must be timezone-aware")
+    return value.astimezone(UTC)
 
 
 def _acquire_legacy_attribution_apply_serialization(

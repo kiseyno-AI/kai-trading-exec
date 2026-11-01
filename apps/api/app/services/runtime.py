@@ -38,6 +38,9 @@ from app.services.fill_idempotency import (
     execution_fill_dedupe_key,
     execution_fills_have_relevant_conflicting_identity,
 )
+from app.services.corporate_action_quarantine_contract import (
+    REVIEWED_CORPORATE_ACTION_REASON,
+)
 from app.services.fill_economics import (
     ClosedTradeEconomics,
     closed_trade_economics,
@@ -2321,40 +2324,77 @@ def runtime_actionable_alerts_payload(
                     or "position_monitoring_not_eligible"
                 )
                 symbols_by_reason.setdefault(reason, []).append(symbol)
-            structured_reasons = [
-                {
-                    "code": reason,
-                    "count": len(symbols),
-                    "symbols": sorted(symbols),
-                }
-                for reason, symbols in sorted(symbols_by_reason.items())
-            ]
-            if set(symbols_by_reason) == {"unpriced_overseas_holding"}:
-                message = (
-                    "held positions cannot be protected automatically because a usable "
-                    "positive broker price is unavailable"
-                )
-            else:
-                message = (
-                    "held positions cannot be protected automatically until their "
-                    "quote and execution route are reviewed"
-                )
-            alerts.append(
-                {
-                    "kind": "position_monitoring_manual_review_required",
-                    "severity": "critical",
-                    "count": manual_review_count,
-                    "symbols": manual_review_symbols,
-                    "reasons": structured_reasons,
-                    "runtime_impact": {
-                        "scope": "listed_symbols_only",
-                        "blocks_global_runtime_resume": False,
-                        "blocks_unrelated_krx_new_buys": False,
-                        "blocks_affected_position_monitoring": True,
-                    },
-                    "message": message,
-                }
+            reviewed_corporate_action_symbols = sorted(
+                symbols_by_reason.pop(REVIEWED_CORPORATE_ACTION_REASON, [])
             )
+            if reviewed_corporate_action_symbols:
+                alerts.append(
+                    {
+                        "kind": "reviewed_corporate_action_holding_quarantined",
+                        "severity": "warning",
+                        "count": len(reviewed_corporate_action_symbols),
+                        "symbols": reviewed_corporate_action_symbols,
+                        "reasons": [
+                            {
+                                "code": REVIEWED_CORPORATE_ACTION_REASON,
+                                "count": len(reviewed_corporate_action_symbols),
+                                "symbols": reviewed_corporate_action_symbols,
+                            }
+                        ],
+                        "runtime_impact": {
+                            "scope": "listed_symbols_only",
+                            "blocks_global_runtime_resume": False,
+                            "blocks_unrelated_krx_new_buys": False,
+                            "quote_strategy_monitoring_expected": False,
+                            "broker_reconciliation_continues": True,
+                        },
+                        "message": (
+                            "reviewed non-tradeable corporate-action holdings "
+                            "remain in broker reconciliation and are intentionally "
+                            "excluded from quote and strategy monitoring"
+                        ),
+                    }
+                )
+            remaining_manual_review_symbols = sorted(
+                symbol
+                for symbols in symbols_by_reason.values()
+                for symbol in symbols
+            )
+            if remaining_manual_review_symbols:
+                structured_reasons = [
+                    {
+                        "code": reason,
+                        "count": len(symbols),
+                        "symbols": sorted(symbols),
+                    }
+                    for reason, symbols in sorted(symbols_by_reason.items())
+                ]
+                if set(symbols_by_reason) == {"unpriced_overseas_holding"}:
+                    message = (
+                        "held positions cannot be protected automatically because a "
+                        "usable positive broker price is unavailable"
+                    )
+                else:
+                    message = (
+                        "held positions cannot be protected automatically until their "
+                        "quote and execution route are reviewed"
+                    )
+                alerts.append(
+                    {
+                        "kind": "position_monitoring_manual_review_required",
+                        "severity": "critical",
+                        "count": len(remaining_manual_review_symbols),
+                        "symbols": remaining_manual_review_symbols,
+                        "reasons": structured_reasons,
+                        "runtime_impact": {
+                            "scope": "listed_symbols_only",
+                            "blocks_global_runtime_resume": False,
+                            "blocks_unrelated_krx_new_buys": False,
+                            "blocks_affected_position_monitoring": True,
+                        },
+                        "message": message,
+                    }
+                )
 
     last_cycle = monitoring.get("last_cycle")
     if not isinstance(last_cycle, dict):
