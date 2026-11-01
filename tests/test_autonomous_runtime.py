@@ -1067,6 +1067,90 @@ def test_session_active_monitoring_symbols_keeps_only_us_equities_during_us_sess
 
 
 @pytest.mark.parametrize(
+    ("now", "settings_updates"),
+    [
+        (
+            datetime(2026, 9, 26, 1, 0, tzinfo=UTC),  # Saturday 10:00 Asia/Seoul
+            {},
+        ),
+        (
+            datetime(2026, 9, 23, 1, 0, tzinfo=UTC),  # Wednesday 10:00 Asia/Seoul
+            {"krx_market_holiday_dates": "2026-09-23"},
+        ),
+        (
+            datetime(2026, 9, 22, 7, 0, tzinfo=UTC),  # Tuesday 16:00 Asia/Seoul
+            {},
+        ),
+    ],
+    ids=["weekend", "holiday", "after-close"],
+)
+def test_domestic_only_closed_session_reconciles_without_quote_or_strategy_monitoring(
+    now: datetime,
+    settings_updates: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        runtime_broker_provider="kis",
+    ).model_copy(update=settings_updates)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=lambda: None,  # type: ignore[arg-type,return-value]
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=now,
+        symbols=["005930"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition(
+                symbol="005930", quantity=1, exchange="KRX"
+            )
+        },
+        items=[],
+        filled_today_symbols=[],
+    )
+    position_reconciliation_calls: list[datetime] = []
+    order_reconciliation_calls: list[set[str]] = []
+    quote_calls: list[list[str]] = []
+    strategy_calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        coordinator,
+        "_reconcile_and_refresh_monitoring_snapshot_if_due",
+        lambda observed_at: position_reconciliation_calls.append(observed_at) or True,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_reconcile_monitoring_orders_if_due",
+        lambda **kwargs: order_reconciliation_calls.append(set(kwargs["symbols"]))
+        or False,
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_load_monitoring_prices",
+        lambda **kwargs: quote_calls.append(list(kwargs["symbols"])) or [],
+    )
+    monkeypatch.setattr(
+        autonomous_runtime,
+        "run_autonomous_monitoring_cycle",
+        lambda **kwargs: strategy_calls.append(list(kwargs["symbols"])),
+    )
+
+    payload = coordinator._monitoring_cycle_sync(now)
+
+    assert position_reconciliation_calls == [now]
+    assert order_reconciliation_calls == [{"005930"}]
+    assert quote_calls == []
+    assert strategy_calls == []
+    assert payload["idle"] is True
+    assert payload["monitored_symbols"] == []
+    assert payload["session_active_symbols"] == []
+    assert payload["session_inactive_symbols"] == ["005930"]
+    assert payload["market_sessions"]["domestic"]["active"] is False
+
+
+@pytest.mark.parametrize(
     (
         "worker_key",
         "settings_updates",

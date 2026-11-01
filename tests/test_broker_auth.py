@@ -508,6 +508,32 @@ class StaticMonitoringPriceSource:
         ]
 
 
+KRX_OPEN_TEST_AT = datetime(2026, 10, 30, 1, 0, tzinfo=UTC)
+
+
+def _freeze_autonomous_runtime_at_krx_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> datetime:
+    class FrozenKrxOpenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return KRX_OPEN_TEST_AT.replace(tzinfo=None)
+            return KRX_OPEN_TEST_AT.astimezone(tz)
+
+    monkeypatch.setattr(
+        autonomous_runtime_service,
+        "datetime",
+        FrozenKrxOpenDateTime,
+    )
+    monkeypatch.setattr(
+        monitoring_service,
+        "datetime",
+        FrozenKrxOpenDateTime,
+    )
+    return KRX_OPEN_TEST_AT
+
+
 def build_test_app(
     *,
     settings: Settings,
@@ -10393,8 +10419,10 @@ def test_autonomous_monitoring_cycle_evaluates_watch_buy_without_position() -> N
     engine.dispose()
 
 
-def test_autonomous_monitoring_rearms_blocked_sell_only_from_trusted_fresh_quote() -> None:
-    started_at = datetime.now(UTC)
+def test_autonomous_monitoring_rearms_blocked_sell_only_from_trusted_fresh_quote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started_at = _freeze_autonomous_runtime_at_krx_open(monkeypatch)
 
     class MutableSellPriceSource:
         trusted = False
@@ -21763,7 +21791,10 @@ def test_autonomous_dispatch_loop_progresses_due_plan_without_manual_dispatch(
     engine.dispose()
 
 
-def test_autonomous_monitoring_loop_triggers_target_sell_from_price_source() -> None:
+def test_autonomous_monitoring_loop_triggers_target_sell_from_price_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_autonomous_runtime_at_krx_open(monkeypatch)
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
             provider="kis",
@@ -22084,7 +22115,10 @@ def test_autonomous_monitoring_prices_same_symbols_selected_for_evaluation() -> 
     engine.dispose()
 
 
-def test_autonomous_monitoring_loop_reports_degraded_status_when_live_source_fails() -> None:
+def test_autonomous_monitoring_loop_reports_degraded_status_when_live_source_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_autonomous_runtime_at_krx_open(monkeypatch)
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
             provider="kis",
@@ -22190,7 +22224,9 @@ def test_autonomous_monitoring_loop_reports_degraded_status_when_live_source_fai
 
 def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_no_quotes(
     tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    started_at = _freeze_autonomous_runtime_at_krx_open(monkeypatch)
     database_url = f"sqlite:///{tmp_path / 'autonomous-monitoring-restart.db'}"
     first_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -22303,7 +22339,7 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_
         order_placement=build_order_placement(broker_order_id="kis-monitor-restarted-2"),
         account_snapshot=BrokerAccountSnapshot(
             available_cash=Decimal("1000000.00"),
-            observed_at=datetime.now(UTC),
+            observed_at=started_at,
             source="stub:restart-position-truth",
             holdings=[
                 BrokerAccountHolding(

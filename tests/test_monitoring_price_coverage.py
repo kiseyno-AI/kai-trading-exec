@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import threading
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.broker.base import (
@@ -25,6 +26,7 @@ from app.services.position_identity import build_position_identity
 from test_broker_auth import (
     KIS_PAPER_API_BASE_URL,
     StubBrokerAdapter,
+    _freeze_autonomous_runtime_at_krx_open,
     build_order_placement,
     build_test_app,
     build_token_grant,
@@ -1002,7 +1004,10 @@ def test_kis_price_source_ignores_zero_intraday_high_low_from_quote_payload() ->
     engine.dispose()
 
 
-def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() -> None:
+def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started_at = _freeze_autonomous_runtime_at_krx_open(monkeypatch)
     broker_adapter = SymbolScopedQuoteErrorAdapter(
         config=BrokerConfig(
             provider="kis",
@@ -1090,7 +1095,7 @@ def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() 
                         quantity=1,
                         average_price=Decimal("120000.0000"),
                         updated_from="reconciliation",
-                        last_reconciled_at=datetime.now(UTC),
+                        last_reconciled_at=started_at,
                         raw_payload={"source": "broker"},
                     ),
                     ExecutionPosition(
@@ -1102,7 +1107,7 @@ def test_autonomous_monitoring_keeps_partial_prices_when_one_live_quote_fails() 
                         quantity=1,
                         average_price=Decimal("88000.0000"),
                         updated_from="reconciliation",
-                        last_reconciled_at=datetime.now(UTC),
+                        last_reconciled_at=started_at,
                         raw_payload={"source": "broker"},
                     ),
                 ]

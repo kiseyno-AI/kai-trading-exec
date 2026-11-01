@@ -3318,9 +3318,9 @@ def _session_active_monitoring_symbols(
     """Partition mixed domestic/overseas worksets by market session.
 
     Domestic and overseas quote failures must never be coupled by polling one
-    market's symbols during the other market's session. Domestic-only worksets
-    retain their existing coordinator cadence; overseas symbols are always
-    restricted to the US regular session.
+    market's symbols during the other market's session. Every symbol is
+    restricted to its own active market session, including domestic-only
+    worksets on weekends, holidays, and outside configured KRX order windows.
     """
     observed_at = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
     exchanges_by_symbol = {
@@ -3337,11 +3337,6 @@ def _session_active_monitoring_symbols(
         now=observed_at,
         domestic_trading_days=domestic_trading_days,
     )
-    has_overseas_symbols = any(
-        exchanges_by_symbol.get(symbol) in US_EQUITY_EXCHANGES
-        for symbol in snapshot.symbols
-    )
-
     active: list[str] = []
     inactive: list[str] = []
     for symbol in snapshot.symbols:
@@ -3354,7 +3349,6 @@ def _session_active_monitoring_symbols(
             inactive.append(symbol)
         elif (
             is_domestic_equity
-            and has_overseas_symbols
             and not market_sessions["domestic"]["active"]
         ):
             inactive.append(symbol)
