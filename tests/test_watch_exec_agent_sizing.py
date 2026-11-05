@@ -46,6 +46,7 @@ from app.models.runtime import (
     ExecutionPlanItemAudit,
     ExecutionPosition,
 )
+from app.services import core_handoff_v4
 from app.services import watch_exec_agent_sizing as watch_sizing
 from app.services.openclaw_runtime_contract import runtime_contract_proof_is_valid
 from openclaw_contract_test_support import (
@@ -906,6 +907,7 @@ def test_reopens_same_day_subjective_reject_once_but_keeps_structural_reject() -
                 "exchange": "KRX",
                 "target_price": "78000",
                 "stop_loss_price": "69000",
+                **{f"saturated_context_{index}": index for index in range(70)},
             },
         )
         subjective.provider = "kis"
@@ -913,14 +915,39 @@ def test_reopens_same_day_subjective_reject_once_but_keeps_structural_reject() -
         subjective.asset_class = "stock"
         original_policy = dict(subjective.quantity_policy)
         subjective.status = "exec_agent_rejected"
+        subjective_decision = {
+            "source": "openclaw_exec_agent_watch_sizing",
+            "action": "reject",
+            "decision": "rejected",
+            "execution_plan_item_id": subjective.id,
+            "symbol": subjective.symbol,
+            "quantity": 0,
+            "approved_quantity": 0,
+            "approved_notional_krw": None,
+            "sizing_price": None,
+            "reference_price": None,
+            "confidence": None,
+            "target_profile": None,
+            "target_tag": None,
+            "reason_code": "DELEGATED_LIQUIDITY_GATE_NOT_CONFIRMED",
+            "reason_family": "liquidity",
+            "rejection_disposition": "terminal",
+            "reason": "subjective liquidity veto",
+        }
         subjective.quantity_policy = {
             "kind": "exec_agent_rejected",
             "source": "exec_agent_watch_sizing",
-            "reason": "subjective continuation veto",
-            "reason_code": "continuation_quality_below_threshold",
-            "reason_family": "agent_rejection",
+            "reason": "subjective liquidity veto",
+            "reason_code": "DELEGATED_LIQUIDITY_GATE_NOT_CONFIRMED",
+            "reason_family": "liquidity",
             "rejection_disposition": "terminal",
             "effective_stop_policy_version": "server_effective_stop_v1",
+            "exec_agent_decision": subjective_decision,
+            "short_term_exec_agent_decision": dict(subjective_decision),
+            "exec_agent_decision_audit": {
+                "event_type": "watch_exec_agent_sizing_decision",
+                "storage": "execution_plan_item_audits",
+            },
             "previous_policy": original_policy,
         }
 
@@ -937,13 +964,28 @@ def test_reopens_same_day_subjective_reject_once_but_keeps_structural_reject() -
         structural.venue = "KRX"
         structural.asset_class = "stock"
         structural.status = "exec_agent_rejected"
+        structural_decision = {
+            **subjective_decision,
+            "execution_plan_item_id": structural.id,
+            "symbol": structural.symbol,
+            "reason": "stop is missing",
+            "reason_code": "missing_stop_price",
+            "reason_family": "agent_rejection",
+        }
         structural.quantity_policy = {
             "kind": "exec_agent_rejected",
             "source": "exec_agent_watch_sizing",
-            "reason": "same-lane holding exists",
-            "reason_code": "allowed_action_envelope_blocked",
-            "reason_family": "account_state",
+            "reason": "stop is missing",
+            "reason_code": "missing_stop_price",
+            "reason_family": "agent_rejection",
             "rejection_disposition": "terminal",
+            "effective_stop_policy_version": "server_effective_stop_v1",
+            "exec_agent_decision": structural_decision,
+            "short_term_exec_agent_decision": dict(structural_decision),
+            "exec_agent_decision_audit": {
+                "event_type": "watch_exec_agent_sizing_decision",
+                "storage": "execution_plan_item_audits",
+            },
             "previous_policy": dict(structural.quantity_policy),
         }
 
@@ -966,6 +1008,30 @@ def test_reopens_same_day_subjective_reject_once_but_keeps_structural_reject() -
             now=datetime(2026, 10, 14, 1, 0, tzinfo=UTC),
         )
         session.commit()
+        assert subjective.risk_context[
+            watch_sizing.SUBJECTIVE_WATCH_REOPEN_MARKER_KEY
+        ]["reason_code"] == "DELEGATED_LIQUIDITY_GATE_NOT_CONFIRMED"
+
+        # A later terminal write must not make the one-time recovery eligible
+        # again. The durable marker lives outside the replaced quantity policy.
+        subjective.status = "exec_agent_rejected"
+        subjective.quantity_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": "subjective liquidity veto",
+            "reason_code": "DELEGATED_LIQUIDITY_GATE_NOT_CONFIRMED",
+            "reason_family": "liquidity",
+            "rejection_disposition": "terminal",
+            "effective_stop_policy_version": "server_effective_stop_v1",
+            "exec_agent_decision": subjective_decision,
+            "short_term_exec_agent_decision": dict(subjective_decision),
+            "exec_agent_decision_audit": {
+                "event_type": "watch_exec_agent_sizing_decision",
+                "storage": "execution_plan_item_audits",
+            },
+            "previous_policy": original_policy,
+        }
+        session.commit()
         second = watch_sizing._reopen_price_watch_terminal_rejections(
             db=session,
             settings=settings,
@@ -975,8 +1041,7 @@ def test_reopens_same_day_subjective_reject_once_but_keeps_structural_reject() -
 
         assert first == [subjective.id]
         assert second == []
-        assert subjective.status == watch_sizing.WATCH_SIZING_PENDING_STATUS
-        assert subjective.quantity_policy == original_policy
+        assert subjective.status == "exec_agent_rejected"
         assert structural.status == "exec_agent_rejected"
         audits = session.scalars(
             select(ExecutionPlanItemAudit).where(
@@ -4247,6 +4312,102 @@ def test_verified_intraday_agent_reject_cannot_veto_core_wait_authority() -> Non
     assert persisted_verified_watch_sizing_provenance(item.quantity_policy)
 
 
+def test_quantity_only_override_keeps_repairable_canonical_audit_and_raw_reject(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'quantity-only-override.db'}",
+        runtime_mode="paper",
+        exec_agent_watch_sizing_min_notional_krw=Decimal("150000"),
+        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("150000"),
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    try:
+        with session_factory() as session:
+            item = _watch_item(
+                item_id="quantity-only-audit",
+                symbol="005930",
+                risk_context={"target_price": "78000", "stop_price": "69000"},
+            )
+            plan = ExecutionPlan(
+                external_plan_id="plan-quantity-only-audit",
+                source="core-signal-decider",
+                market_date=date(2026, 6, 4),
+                mode="paper",
+                items=[item],
+            )
+            session.add(plan)
+            session.flush()
+
+            summary = _apply_decisions(
+                db=session,
+                settings=settings,
+                plan=plan,
+                account_context=_fresh_account_context(),
+                expected_item_ids={item.id},
+                request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
+                decision_payload={
+                    "version": "manual-exec-agent-watch-sizing-v1",
+                    "_runtime_provenance": _verified_sizing_runtime(
+                        settings,
+                        session_id="quantity-only-audit-session",
+                    ),
+                    "decisions": [
+                        {
+                            "execution_plan_item_id": item.id,
+                            "symbol": item.symbol,
+                            "action": "reject",
+                            "quantity": 0,
+                            "approved_notional_krw": 0,
+                            "sizing_price": "71500",
+                            "confidence": 0.25,
+                            "target_profile": "short_swing",
+                            "reason_code": "liquidity_not_confirmed",
+                            "reason": "subjective liquidity veto",
+                        }
+                    ],
+                },
+            )
+            session.flush()
+
+            assert summary["approved"] == 1
+            audits = session.scalars(
+                select(ExecutionPlanItemAudit).where(
+                    ExecutionPlanItemAudit.execution_plan_item_id == item.id
+                )
+            ).all()
+            canonical = next(
+                audit
+                for audit in audits
+                if audit.event_type == "watch_exec_agent_sizing_decision"
+            )
+            override = next(
+                audit
+                for audit in audits
+                if audit.event_type
+                == "watch_exec_agent_quantity_only_override_v1"
+            )
+            assert override.payload["raw_agent_decision"]["action"] == "reject"
+            assert override.payload["final_decision"]["action"] == "approve"
+            assert canonical.payload["agent_decision"]["action"] == "approve"
+            assert set(canonical.payload["deterministic_context"]) == {
+                "allowed_action_envelope",
+                "sizing_adjustment",
+            }
+            assert core_handoff_v4._sizing_audit_decisions_match_item(
+                item=item,
+                quantity_policy=item.quantity_policy,
+                summary=canonical.summary,
+                agent_decision=canonical.payload["agent_decision"],
+                final_decision=canonical.payload["final_decision"],
+                deterministic_context=canonical.payload["deterministic_context"],
+            )
+    finally:
+        engine.dispose()
+
+
 def test_unverified_intraday_agent_reject_remains_fail_closed() -> None:
     settings = Settings(runtime_mode="paper")
     item = _watch_item(
@@ -5204,8 +5365,16 @@ def test_concurrent_watch_sizing_cycles_with_large_risk_contexts_do_not_lock(tmp
             ExecutionPlanItem.status == "watch_monitoring_active"
         ).count()
         assert active_count == 12
-        audit_count = session.query(watch_sizing.ExecutionPlanItemAudit).count()
-        assert audit_count == 12
+        sizing_audit_count = session.query(ExecutionPlanItemAudit).filter(
+            ExecutionPlanItemAudit.event_type
+            == "watch_exec_agent_sizing_decision"
+        ).count()
+        override_audit_count = session.query(ExecutionPlanItemAudit).filter(
+            ExecutionPlanItemAudit.event_type
+            == "watch_exec_agent_quantity_only_override_v1"
+        ).count()
+        assert sizing_audit_count == 12
+        assert override_audit_count == 12
 
 
 def test_short_transaction_rejects_agent_decision_after_candidate_state_changes(
@@ -7207,6 +7376,51 @@ def test_live_sizing_envelope_reports_missing_cost_policy_without_vetoing_monito
     assert "transaction_cost_evidence_missing" not in envelope["hard_reject_reasons"]
     assert "transaction_cost_evidence_missing" in envelope["soft_warnings"]
     assert "buy" in envelope["allowed_actions"]
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["transaction_cost_evidence_invalid", "economic_value_out_of_range"],
+)
+def test_quantity_only_watch_keeps_malformed_economics_as_hard_reject(
+    monkeypatch,
+    reason: str,
+) -> None:
+    monkeypatch.setattr(
+        watch_sizing,
+        "assess_buy_economics",
+        lambda **_: SimpleNamespace(
+            reason=reason,
+            minimum_reward_risk=Decimal("1.3"),
+            gross_reward_risk=None,
+            net_reward_risk=None,
+            gross_expected_edge_bps=None,
+            net_expected_edge_bps=None,
+            estimated_round_trip_cost_bps=None,
+            cost_evidence_source=None,
+        ),
+    )
+    candidate = _candidate_payload(
+        _watch_item(
+            risk_context={"target_price": "76000", "stop_price": "69000"}
+        )
+    )
+
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="live"),
+        candidate=candidate,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert reason in envelope["hard_reject_reasons"]
+    assert reason not in envelope["soft_warnings"]
+    assert "buy" not in envelope["allowed_actions"]
 
 
 def test_live_sizing_uses_risk_exchange_when_kis_is_the_broker_venue() -> None:

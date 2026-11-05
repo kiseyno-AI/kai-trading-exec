@@ -117,6 +117,7 @@ WATCH_EXEC_AGENT_RESPONSE_VERSION = "manual-exec-agent-watch-sizing-v1"
 WATCH_EXEC_AGENT_BINDING_VERSION = "watch-exec-agent-binding-v2"
 SERVER_EFFECTIVE_STOP_POLICY_VERSION = "server_effective_stop_v1"
 QUANTITY_ONLY_WATCH_SIZING_POLICY_VERSION = "quantity_only_watch_sizing_v1"
+SUBJECTIVE_WATCH_REOPEN_MARKER_KEY = "quantity_only_watch_reopen_v1"
 WATCH_EXEC_AGENT_DEFER_KEY = "watch_exec_agent_deferred"
 WATCH_EXEC_AGENT_DEFER_SECONDS = 300
 WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS = 60
@@ -160,10 +161,29 @@ _NO_TRADE_TERMINAL_ENTRY_STATUSES = frozenset({
     "watch_cancelled",
     "watch_expired",
 })
-_SUBJECTIVE_WATCH_REJECTION_FAMILIES = frozenset({
-    "agent_rejection",
-    "liquidity",
-    "reward_risk",
+_SUBJECTIVE_WATCH_REJECTION_REASON_CODES = frozenset({
+    "delegated_liquidity_gate_not_confirmed",
+    "delegated_liquidity_gate_not_passed",
+    "delegated_liquidity_gate_unconfirmed",
+    "delegated_gates_not_passed",
+    "execution_blocker_and_minimum_notional_failure",
+    "hard_gate_reward_risk_below_minimum",
+    "hard_gates_reward_risk_and_liquidity",
+    "hard_reject_net_reward_risk",
+    "liquidity_and_reward_risk_block",
+    "liquidity_gate_and_feasibility_block",
+    "minimum_notional_and_execution_quality_block",
+    "minimum_notional_conflicts_with_allowed_cap",
+    "reject_delegated_gates_not_confirmed",
+    "reject_reward_risk_gate_unconfirmed",
+    "reward_risk_below_minimum",
+    "very_weak_liquidity_no_continuation",
+})
+_QUANTITY_ONLY_ADVISORY_ECONOMICS_REASONS = frozenset({
+    "reward_risk_below_minimum",
+    "net_reward_risk_below_minimum",
+    "net_expected_edge_nonpositive",
+    "transaction_cost_evidence_missing",
 })
 
 
@@ -1504,9 +1524,10 @@ def _reopen_subjective_watch_sizing_terminal_rejections(
             or policy.get("rejection_disposition") != "terminal"
             or policy.get("effective_stop_policy_version")
             != SERVER_EFFECTIVE_STOP_POLICY_VERSION
-            or policy.get("reason_family")
-            not in _SUBJECTIVE_WATCH_REJECTION_FAMILIES
-            or policy.get("reason_code") == "deterministic_retry_exhausted"
+            or not _subjective_watch_rejection_is_reopenable(
+                item=item,
+                policy=policy,
+            )
             or not isinstance(previous_policy, dict)
             or not is_exec_agent_sizing_policy(previous_policy)
             or expires_at is None
@@ -1515,8 +1536,22 @@ def _reopen_subjective_watch_sizing_terminal_rejections(
             continue
 
         prior_policy = compact_json_object(policy)
-        item.quantity_policy = compact_json_object(previous_policy)
         _clear_watch_exec_agent_defer(item)
+        risk_context = {
+            SUBJECTIVE_WATCH_REOPEN_MARKER_KEY: {
+                "policy_version": QUANTITY_ONLY_WATCH_SIZING_POLICY_VERSION,
+                "reason_code": policy.get("reason_code"),
+                "reason_family": policy.get("reason_family"),
+                "reopened_at": checked_at.isoformat(),
+            },
+            **(
+                dict(item.risk_context)
+                if isinstance(item.risk_context, dict)
+                else {}
+            ),
+        }
+        item.risk_context = compact_json_object(risk_context)
+        item.quantity_policy = compact_json_object(previous_policy)
         apply_plan_item_status(
             plan_item=item,
             status=WATCH_SIZING_PENDING_STATUS,
@@ -1539,6 +1574,41 @@ def _reopen_subjective_watch_sizing_terminal_rejections(
         )
         reopened_ids.append(item.id)
     return reopened_ids
+
+
+def _subjective_watch_rejection_is_reopenable(
+    *,
+    item: ExecutionPlanItem,
+    policy: dict[str, object],
+) -> bool:
+    reason_code = str(policy.get("reason_code") or "").strip()
+    decision = policy.get("exec_agent_decision")
+    decision_mirror = policy.get("short_term_exec_agent_decision")
+    audit_pointer = policy.get("exec_agent_decision_audit")
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    if (
+        reason_code.casefold() not in _SUBJECTIVE_WATCH_REJECTION_REASON_CODES
+        or SUBJECTIVE_WATCH_REOPEN_MARKER_KEY in risk_context
+        or not isinstance(decision, dict)
+        or decision_mirror != decision
+        or not isinstance(audit_pointer, dict)
+        or audit_pointer.get("event_type") != "watch_exec_agent_sizing_decision"
+        or audit_pointer.get("storage") != "execution_plan_item_audits"
+    ):
+        return False
+    return bool(
+        str(decision.get("source") or "").strip()
+        in TERMINAL_REJECTION_DECISION_SOURCES
+        and decision.get("action") == "reject"
+        and decision.get("decision") == "rejected"
+        and decision.get("execution_plan_item_id") == item.id
+        and decision.get("symbol") == item.symbol
+        and decision.get("quantity") == 0
+        and decision.get("approved_quantity") == 0
+        and str(decision.get("reason_code") or "").strip() == reason_code
+        and decision.get("reason_family") == policy.get("reason_family")
+        and decision.get("rejection_disposition") == "terminal"
+    )
 
 
 def _quarantine_provider_mismatched_items(
@@ -4259,6 +4329,7 @@ def _apply_decisions(
             version=str(decision_payload.get("version") or ""),
             runtime_provenance=runtime_provenance,
         )
+        canonical_agent_record = agent_record
         if (
             action == "approve"
             and not runtime_is_verified
@@ -4344,6 +4415,7 @@ def _apply_decisions(
                     version=str(decision_payload.get("version") or ""),
                     runtime_provenance=runtime_provenance,
                 )
+                canonical_agent_record = record
         if action == "approve":
             was_triggered_blocked = item.status == "watch_buy_triggered_blocked"
             quantity = _positive_int(decision.get("quantity"))
@@ -4576,18 +4648,24 @@ def _apply_decisions(
             _add_final_sizing_decision_audit(
                 db=db,
                 item=item,
-                agent_record=agent_record,
+                agent_record=canonical_agent_record,
                 final_record=record,
                 deterministic_context={
                     "allowed_action_envelope": envelope,
                     "sizing_adjustment": sizing["adjustment"],
-                    **(
-                        {"quantity_only_override": quantity_only_override}
-                        if quantity_only_override is not None
-                        else {}
-                    ),
                 },
             )
+            if quantity_only_override is not None:
+                _add_quantity_only_override_audit(
+                    db=db,
+                    item=item,
+                    raw_agent_record=agent_record,
+                    normalized_agent_record=canonical_agent_record,
+                    final_record=record,
+                    allowed_action_envelope=envelope,
+                    sizing_adjustment=sizing["adjustment"],
+                    override=quantity_only_override,
+                )
         elif action == "reject":
             envelope = _allowed_action_envelope_for_item(
                 settings=settings,
@@ -4841,6 +4919,41 @@ def _add_final_sizing_decision_audit(
         event_type="watch_exec_agent_sizing_decision",
         summary=_decision_summary(final_record),
         payload=payload,
+    )
+
+
+def _add_quantity_only_override_audit(
+    *,
+    db: Session | None,
+    item: ExecutionPlanItem,
+    raw_agent_record: dict[str, object],
+    normalized_agent_record: dict[str, object],
+    final_record: dict[str, object],
+    allowed_action_envelope: dict[str, object],
+    sizing_adjustment: dict[str, object],
+    override: dict[str, object],
+) -> None:
+    """Retain the raw veto without corrupting the canonical repair audit."""
+
+    _add_plan_item_audit(
+        db=db,
+        item=item,
+        event_type="watch_exec_agent_quantity_only_override_v1",
+        summary={
+            "symbol": item.symbol,
+            "policy_version": QUANTITY_ONLY_WATCH_SIZING_POLICY_VERSION,
+            "raw_reason_code": raw_agent_record.get("reason_code"),
+            "final_quantity": final_record.get("quantity"),
+        },
+        payload={
+            "schema_version": "watch_exec_agent_quantity_only_override_v1",
+            "override": override,
+            "raw_agent_decision": raw_agent_record,
+            "normalized_agent_decision": normalized_agent_record,
+            "final_decision": final_record,
+            "allowed_action_envelope": allowed_action_envelope,
+            "sizing_adjustment": sizing_adjustment,
+        },
     )
 
 
@@ -5436,13 +5549,14 @@ def _allowed_action_envelope_for_candidate(
         ),
         require_cost_evidence=settings.runtime_mode == "live",
     )
-    if (
-        economics.reason is not None
-        and economics.reason != "invalid_target_stop_geometry"
-    ):
+    if economics.reason is not None:
         destination = (
             soft_warnings
-            if quantity_only_intraday_watch
+            if (
+                quantity_only_intraday_watch
+                and economics.reason
+                in _QUANTITY_ONLY_ADVISORY_ECONOMICS_REASONS
+            )
             else hard_reject_reasons
         )
         if economics.reason not in destination:
