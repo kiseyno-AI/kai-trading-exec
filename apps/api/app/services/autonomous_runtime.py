@@ -32,6 +32,7 @@ from app.services.execution_jobs import dispatch_due_execution_jobs
 from app.services.execution_account_route import classify_kis_account_route
 from app.services.execution_semantics import (
     KRX_EXCHANGES,
+    is_canonical_krx_short_code,
     watch_buy_direction_from_payloads,
 )
 from app.services.monitoring import (
@@ -3393,11 +3394,7 @@ def _monitoring_market_sessions(
 
 
 def _is_krx_symbol(symbol: str) -> bool:
-    normalized = str(symbol or "").strip()
-    return bool(
-        len(normalized) == 6
-        and all("0" <= character <= "9" for character in normalized)
-    )
+    return is_canonical_krx_short_code(symbol)
 
 
 def _select_monitoring_symbol_batch(

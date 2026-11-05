@@ -430,7 +430,9 @@ def test_watch_sizing_feedback_fails_closed_without_stable_live_account_scope(
 
 def test_krx_symbol_filter_excludes_alpaca_symbols() -> None:
     assert _is_krx_symbol("005930") is True
+    assert _is_krx_symbol("0017J0") is True
     assert _is_krx_symbol("AFIB") is False
+    assert _is_krx_symbol("A017J0") is False
     assert _is_krx_symbol("FRTX/CVR1") is False
 
 
@@ -2275,6 +2277,58 @@ def test_sqlite_local_desired_symbols_include_older_active_watch_when_newer_plan
         assert coordinator._load_local_desired_monitoring_symbols_from_sqlite()[:2] == [
             "111111",
             "222222",
+        ]
+    finally:
+        engine.dispose()
+
+
+def test_sqlite_local_desired_symbols_include_alphanumeric_krx_watch(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'alphanumeric-krx-watch.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+
+    try:
+        with session_factory() as session:
+            session.add(
+                ExecutionPlan(
+                    external_plan_id="sqlite-alphanumeric-krx-watch",
+                    source="kai-trading-core",
+                    market_date=date(2026, 8, 10),
+                    mode="paper",
+                    status="accepted",
+                    items=[
+                        ExecutionPlanItem(
+                            plan_item_index=0,
+                            symbol="0017J0",
+                            side="buy",
+                            intent="intraday_watch_buy",
+                            status="watch_monitoring_active",
+                            provider="kis",
+                            venue="KRX",
+                            asset_class="stock",
+                            risk_context={"exchange": "KRX"},
+                            quantity_policy={"kind": "shares", "quantity": 1},
+                            trigger_price=Decimal("2500.0000"),
+                            time_in_force="day",
+                        )
+                    ],
+                )
+            )
+            session.commit()
+
+        assert coordinator._load_local_desired_monitoring_symbols_from_sqlite() == [
+            "0017J0"
         ]
     finally:
         engine.dispose()

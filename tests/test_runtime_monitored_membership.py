@@ -184,6 +184,31 @@ def test_membership_returns_full_db_set_beyond_monitoring_cycle_batch() -> None:
     engine.dispose()
 
 
+def test_membership_accepts_canonical_alphanumeric_krx_short_code() -> None:
+    settings = _settings()
+    app, engine, session_factory = _app(settings)
+    with session_factory() as db:
+        plan = ExecutionPlan(
+            external_plan_id="alphanumeric-krx-membership",
+            source="test",
+            mode=settings.runtime_mode,
+            status="accepted",
+            market_date=_current_krx_market_date(),
+            items=[_monitored_item(settings, symbol="0017J0")],
+        )
+        db.add(plan)
+        db.commit()
+
+    response = TestClient(app).get("/runtime/monitored-symbol-membership")
+
+    assert response.status_code == 200
+    assert response.json()["membership_complete"] is True
+    assert response.json()["symbols"] == ["0017J0"]
+    assert response.json()["coverage"]["reason"] is None
+
+    engine.dispose()
+
+
 def test_membership_includes_only_quote_monitorable_sizing_deferrals() -> None:
     settings = _settings()
     app, engine, session_factory = _app(settings)
@@ -313,7 +338,7 @@ def test_membership_includes_scoped_positive_base_quantity_position() -> None:
     engine.dispose()
 
 
-@pytest.mark.parametrize("symbol", ["AAPL", "００５９３０"])
+@pytest.mark.parametrize("symbol", ["AAPL", "A017J0", "12A456", "００５９３０"])
 def test_membership_fails_closed_for_invalid_krx_position_symbol(
     symbol: str,
 ) -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 
 CANONICAL_INTRADAY_WATCH_BUY_INTENT = "intraday_watch_buy"
 INTRADAY_WATCH_BUY_INTENTS = frozenset(
@@ -31,6 +33,19 @@ WATCH_BUY_AT_OR_ABOVE_ALIASES = frozenset(
 WATCH_BUY_AT_OR_BELOW_ALIASES = frozenset(
     {"down", "below", "pullback", "dip", "<=", "at_or_below"}
 )
+KRX_SHORT_CODE_PATTERN = re.compile(r"[0-9]{4}[0-9A-Z]{2}\Z")
+
+
+def is_canonical_krx_short_code(value: object) -> bool:
+    """Return whether value is one canonical KRX six-character short code."""
+
+    raw = str(value or "").strip()
+    return bool(
+        raw
+        and raw == raw.upper()
+        and raw.isascii()
+        and KRX_SHORT_CODE_PATTERN.fullmatch(raw) is not None
+    )
 
 
 def canonical_watch_buy_intent(intent: object, *, side: object = "buy") -> str:

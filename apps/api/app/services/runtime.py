@@ -111,7 +111,11 @@ from app.services.execution_account_route import (
     classify_kis_account_route,
     validate_execution_account_scope,
 )
-from app.services.execution_semantics import KRX_EXCHANGES, WATCH_BUY_INTENTS
+from app.services.execution_semantics import (
+    KRX_EXCHANGES,
+    WATCH_BUY_INTENTS,
+    is_canonical_krx_short_code,
+)
 from app.services.schema import check_runtime_schema, execution_position_readiness
 from app.services.runtime_controls import (
     ensure_runtime_control_state,
@@ -3138,8 +3142,7 @@ def _runtime_membership_identity_exchange(*, provider: str, exchange: str) -> st
 
 
 def _runtime_is_ascii_krx_symbol(symbol: object) -> bool:
-    text = str(symbol or "")
-    return len(text) == 6 and all("0" <= character <= "9" for character in text)
+    return is_canonical_krx_short_code(symbol)
 
 
 def _runtime_membership_indeterminate_position_count(

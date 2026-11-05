@@ -80,6 +80,7 @@ from app.services.execution_semantics import (
     KRX_EXCHANGES,
     WATCH_BUY_INTENTS,
     canonical_execution_asset_class,
+    is_canonical_krx_short_code,
     is_delegated_exec_agent_sizing_policy,
     is_exec_agent_sizing_policy,
     is_short_term_watch_buy_intent,
@@ -1787,8 +1788,7 @@ def _quarantine_invalid_sell_monitor_routes(
 
 
 def _is_krx_equity_symbol(symbol: object) -> bool:
-    normalized = str(symbol or "").strip()
-    return len(normalized) == 6 and normalized.isdigit()
+    return is_canonical_krx_short_code(symbol)
 
 
 def list_autonomous_monitoring_symbols(
@@ -2585,10 +2585,7 @@ def _validated_core_observation_only_symbols(
         if not isinstance(raw_symbol, str):
             return []
         symbol = raw_symbol.strip()
-        if (
-            len(symbol) != 6
-            or any(character < "0" or character > "9" for character in symbol)
-        ):
+        if not is_canonical_krx_short_code(symbol):
             return []
         if symbol not in seen:
             observation_only_symbols.append(symbol)
@@ -11382,7 +11379,7 @@ def _existing_position_monitoring_route(
             "asset_class": "us_equity",
             "manual_review_reason": str(reason) if reason else None,
         }
-    if exchange == "KRX" and position.symbol.isdigit() and len(position.symbol) == 6:
+    if exchange == "KRX" and is_canonical_krx_short_code(position.symbol):
         return {
             "exchange": "KRX",
             "venue": "krx",

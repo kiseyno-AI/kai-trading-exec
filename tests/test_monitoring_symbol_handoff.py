@@ -121,6 +121,26 @@ def test_core_observation_only_handoff_requires_fresh_same_day_non_actionable_it
     assert list(handoff.observation_only_symbols) == ["032080"]
 
 
+def test_core_observation_only_handoff_accepts_alphanumeric_krx_short_code(
+    monkeypatch,
+) -> None:
+    now = datetime(2026, 10, 26, 0, 1, tzinfo=UTC)
+    payload = _observation_payload(now=now, symbols=["0017J0"])
+    monkeypatch.setattr(
+        monitoring,
+        "urlopen",
+        lambda *_args, **_kwargs: _CoreMonitoringResponse(payload),
+    )
+
+    handoff = monitoring._load_core_monitoring_symbol_handoff(
+        settings=_settings(),
+        observed_at=now,
+    )
+
+    assert list(handoff.desired_symbols) == ["0017J0"]
+    assert list(handoff.observation_only_symbols) == ["0017J0"]
+
+
 def test_environment_priority_never_becomes_observation_only_authority(
     monkeypatch,
 ) -> None:

@@ -4819,6 +4819,146 @@ def test_watch_candidates_are_ranked_before_round_robin_without_pre_limit(monkey
         engine.dispose()
 
 
+def test_alphanumeric_krx_watch_candidate_enters_autonomous_monitoring() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        monitoring_expire_prior_market_watch_buys_enabled=False,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    try:
+        with session_factory() as db:
+            db.add(
+                ExecutionPlan(
+                    external_plan_id="alphanumeric-krx-watch",
+                    source="test",
+                    market_date=date(2026, 9, 8),
+                    mode="live",
+                    status="accepted",
+                    items=[
+                        ExecutionPlanItem(
+                            plan_item_index=0,
+                            symbol="0017J0",
+                            side="buy",
+                            intent="intraday_watch_buy",
+                            status="watch_monitoring_active",
+                            provider="kis",
+                            venue="KRX",
+                            asset_class="stock",
+                            risk_context={"exchange": "KRX"},
+                        )
+                    ],
+                )
+            )
+            db.commit()
+
+            candidates = list_autonomous_monitoring_symbols(
+                settings=settings,
+                db=db,
+                current_market_date=date(2026, 9, 8),
+            )
+
+        assert candidates == ["0017J0"]
+    finally:
+        engine.dispose()
+
+
+def test_alphanumeric_krx_watch_resolves_kis_quote_context() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    try:
+        with session_factory() as db:
+            db.add(
+                ExecutionPlan(
+                    external_plan_id="alphanumeric-krx-quote-context",
+                    source="test",
+                    market_date=date(2026, 9, 8),
+                    mode="live",
+                    status="accepted",
+                    items=[
+                        ExecutionPlanItem(
+                            plan_item_index=0,
+                            symbol="0017J0",
+                            side="buy",
+                            intent="intraday_watch_buy",
+                            status="watch_monitoring_active",
+                            provider="kis",
+                            venue="KRX",
+                            asset_class="stock",
+                            risk_context={"exchange": "KRX"},
+                        )
+                    ],
+                )
+            )
+            db.commit()
+
+            contexts = (
+                monitoring_price_source._load_monitoring_execution_context_by_symbol(
+                    settings=settings,
+                    db=db,
+                    symbols=["0017J0"],
+                )
+            )
+
+        assert contexts["0017J0"]["provider"] == "kis"
+        assert contexts["0017J0"]["exchange"] == "KRX"
+        assert contexts["0017J0"]["order_contexts"] == [
+            {"side": "buy", "purpose": "intraday_watch_buy"}
+        ]
+    finally:
+        engine.dispose()
+
+
+def test_alphanumeric_krx_position_retains_post_fill_monitoring_route() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+        execution_position_account_scope="test-kis-account",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    identity = build_position_identity(
+        settings=settings,
+        provider="kis",
+        exchange="KRX",
+    )
+
+    try:
+        with session_factory() as db:
+            position = ExecutionPosition(
+                mode="live",
+                provider=identity.provider,
+                account_scope=identity.account_scope,
+                exchange=identity.exchange,
+                symbol="0017J0",
+                quantity=1,
+            )
+            db.add(position)
+            db.flush()
+
+            route = monitoring_service._existing_position_monitoring_route(
+                settings=settings,
+                db=db,
+                position=position,
+            )
+
+        assert route == {
+            "exchange": "KRX",
+            "venue": "krx",
+            "asset_class": "stock",
+            "manual_review_reason": None,
+        }
+    finally:
+        engine.dispose()
+
+
 def test_watch_candidates_are_not_hidden_when_held_symbols_exceed_cycle_cap() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",

@@ -27,6 +27,7 @@ from app.core.config import Settings
 from app.models.runtime import ExecutionPlan, ExecutionPlanItem, ExecutionPosition
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.domestic_order_router import resolve_domestic_order_route
+from app.services.execution_semantics import is_canonical_krx_short_code
 from app.services.position_identity import (
     PositionIdentityConflictError,
     build_position_identity,
@@ -748,8 +749,7 @@ def _load_monitoring_execution_context_by_symbol(
         elif (
             item.provider in {None, "kis"}
             and item.asset_class != "us_equity"
-            and item.symbol.isdigit()
-            and len(item.symbol) == 6
+            and is_canonical_krx_short_code(item.symbol)
         ):
             resolved_exchange = "KRX"
         if resolved_exchange is None:
@@ -843,7 +843,7 @@ def _load_monitoring_execution_context_by_symbol(
     # KIS quote to KRX. Keep that deterministic fallback for direct diagnostic
     # quote requests; never infer a US venue from a bare symbol.
     for symbol in symbols:
-        if symbol not in contexts and symbol.isdigit() and len(symbol) == 6:
+        if symbol not in contexts and is_canonical_krx_short_code(symbol):
             contexts[symbol] = {
                 "provider": "kis",
                 "exchange": "KRX",
