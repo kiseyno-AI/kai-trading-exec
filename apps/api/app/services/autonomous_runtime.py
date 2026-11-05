@@ -36,6 +36,7 @@ from app.services.execution_semantics import (
     watch_buy_direction_from_payloads,
 )
 from app.services.monitoring import (
+    LOADABLE_WATCH_BUY_STATUSES,
     PENDING_DISPATCH_MONITORING_STATUSES,
     SELL_MONITORED_INTENTS,
     WATCH_BUY_INTENTS,
@@ -47,6 +48,7 @@ from app.services.monitoring import (
     _quote_stale_reason,
     _sync_positions_for_monitoring_routes,
     _watch_buy_payload_is_quote_monitorable,
+    _retired_trigger_time_buy_agent_payload_is_rearmable,
     list_autonomous_monitoring_symbols,
     run_autonomous_monitoring_cycle,
     _load_core_monitoring_symbol_handoff,
@@ -55,7 +57,6 @@ from app.services.monitoring_price_source import is_us_regular_session
 from app.services.runtime_transitions import (
     ACTIVE_SELL_MONITORING_STATUSES,
     AGENT_ACTIVE_MONITORING_STATUSES,
-    LIVE_WATCH_ENTRY_STATUSES,
     SELL_TRIGGERED_BLOCKED_STATUSES,
     SELL_TRIGGERED_PENDING_DISPATCH_STATUSES,
 )
@@ -2062,7 +2063,7 @@ class AutonomousRuntimeCoordinator:
                 execution_scope=_active_kis_execution_scope_payload(self.settings),
             )
         symbol_placeholders = ",".join("?" for _ in symbols)
-        watch_status_placeholders = ",".join("?" for _ in LIVE_WATCH_ENTRY_STATUSES)
+        watch_status_placeholders = ",".join("?" for _ in LOADABLE_WATCH_BUY_STATUSES)
         watch_intent_placeholders = ",".join("?" for _ in WATCH_BUY_INTENTS)
         sell_statuses = ACTIVE_SELL_MONITORING_STATUSES
         sell_status_placeholders = ",".join("?" for _ in sell_statuses)
@@ -2108,7 +2109,7 @@ class AutonomousRuntimeCoordinator:
                     [
                         self.settings.runtime_mode,
                         loaded_at.astimezone(KRX_TIMEZONE).date().isoformat(),
-                        *LIVE_WATCH_ENTRY_STATUSES,
+                        *LOADABLE_WATCH_BUY_STATUSES,
                         *WATCH_BUY_INTENTS,
                         *symbols,
                     ],
@@ -2141,10 +2142,17 @@ class AutonomousRuntimeCoordinator:
         buy_item_rows = [
             row
             for row in buy_item_rows
-            if _watch_buy_payload_is_quote_monitorable(
-                status=row[3],
-                risk_context=_cached_json_object(row[5]),
-                quantity_policy=_cached_json_object(row[6]),
+            if (
+                _watch_buy_payload_is_quote_monitorable(
+                    status=row[3],
+                    risk_context=_cached_json_object(row[5]),
+                    quantity_policy=_cached_json_object(row[6]),
+                )
+                or _retired_trigger_time_buy_agent_payload_is_rearmable(
+                    status=row[3],
+                    intent=row[2],
+                    risk_context=_cached_json_object(row[5]),
+                )
             )
         ]
         scoped_item_rows = [
@@ -2203,7 +2211,7 @@ class AutonomousRuntimeCoordinator:
         # KRX-only so it cannot absorb Alpaca positions from a shared database.
         if self.settings.kis_us_trading_enabled:
             return []
-        buy_statuses = tuple(LIVE_WATCH_ENTRY_STATUSES)
+        buy_statuses = tuple(LOADABLE_WATCH_BUY_STATUSES)
         buy_status_placeholders = ",".join("?" for _ in buy_statuses)
         buy_intent_placeholders = ",".join("?" for _ in WATCH_BUY_INTENTS)
         active_scope = _active_kis_position_scope(self.settings)
@@ -2272,10 +2280,17 @@ class AutonomousRuntimeCoordinator:
             if (
                 not _is_krx_symbol(symbol)
                 or symbol in seen
-                or not _watch_buy_payload_is_quote_monitorable(
-                    status=row[7],
-                    risk_context=_cached_json_object(row[4]),
-                    quantity_policy=_cached_json_object(row[5]),
+                or not (
+                    _watch_buy_payload_is_quote_monitorable(
+                        status=row[7],
+                        risk_context=_cached_json_object(row[4]),
+                        quantity_policy=_cached_json_object(row[5]),
+                    )
+                    or _retired_trigger_time_buy_agent_payload_is_rearmable(
+                        status=row[7],
+                        intent="intraday_watch_buy",
+                        risk_context=_cached_json_object(row[4]),
+                    )
                 )
                 or not _cached_item_matches_active_kis_route(
                     settings=self.settings,
@@ -2392,7 +2407,7 @@ class AutonomousRuntimeCoordinator:
                 ExecutionPlan.market_date
                 <= loaded_at.astimezone(KRX_TIMEZONE).date(),
                 ExecutionPlanItem.side == "buy",
-                ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
+                ExecutionPlanItem.status.in_(tuple(LOADABLE_WATCH_BUY_STATUSES)),
                 ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
                 ExecutionPlanItem.symbol.in_(symbols or [""]),
             )
@@ -2422,10 +2437,17 @@ class AutonomousRuntimeCoordinator:
         buy_item_rows = [
             item
             for item in buy_item_rows
-            if _watch_buy_payload_is_quote_monitorable(
-                status=item.status,
-                risk_context=item.risk_context,
-                quantity_policy=item.quantity_policy,
+            if (
+                _watch_buy_payload_is_quote_monitorable(
+                    status=item.status,
+                    risk_context=item.risk_context,
+                    quantity_policy=item.quantity_policy,
+                )
+                or _retired_trigger_time_buy_agent_payload_is_rearmable(
+                    status=item.status,
+                    intent=item.intent,
+                    risk_context=item.risk_context,
+                )
             )
         ]
         item_rows = [

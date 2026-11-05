@@ -266,13 +266,13 @@ def market_scoped_automated_buy_submission_block_reason(
         or normalized_exchange not in KRX_BUY_EXCHANGES
     ):
         return None
-    if state.hourly_risk_off_active:
-        return "hourly_plan_risk_off"
     # Current-session market evidence is a live-order authority fence.  Paper
-    # simulations retain their historical deterministic fixtures and cannot
-    # mutate a real account even when no live observer is running.
+    # simulations retain their deterministic fixtures and must not inherit a
+    # live KRX latch when the shared state row is mode-synchronized.
     if str(state.mode or "").strip().lower() != "live":
         return None
+    if state.hourly_risk_off_active:
+        return "hourly_plan_risk_off"
     return hourly_market_observation_block_reason(
         settings=settings,
         state=state,

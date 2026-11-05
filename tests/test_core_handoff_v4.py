@@ -3080,7 +3080,7 @@ def test_every_terminal_watch_writer_preserves_core_v4_contract_proof(
                 db=session,
                 settings=settings,
                 plan=plan,
-                now=datetime(2026, 9, 10, 0, 0, tzinfo=UTC),
+                now=datetime(2026, 9, 11, 0, 0, tzinfo=UTC),
             )
             assert result["rejected"] == 1
             assert result["no_trade"]["completed"] is True

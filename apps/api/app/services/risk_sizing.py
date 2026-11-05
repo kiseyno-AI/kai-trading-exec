@@ -68,6 +68,7 @@ def resolve_risk_based_buy_quantity(
     daily_new_buy_notional_used: Decimal = Decimal("0"),
     vol_corr_context: dict[str, object] | None = None,
     market_regime_context: dict[str, object] | None = None,
+    account_context: dict[str, object] | None = None,
     market_date: object | None = None,
     evaluated_at: datetime | None = None,
 ) -> RiskSizingDecision:
@@ -187,6 +188,7 @@ def resolve_risk_based_buy_quantity(
         original_quantity=quantity,
         original_notional=entry_price * Decimal(quantity),
         reference_price=entry_price,
+        account_context=account_context,
         now=evaluated_at,
     )
     if market_regime_guardrail.rejected:

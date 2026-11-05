@@ -8,6 +8,7 @@ from app.services.risk_sizing import (
     effective_stop_price,
     resolve_risk_based_buy_quantity,
 )
+from app.services.market_regime_guardrails import evaluate_market_regime_guardrail
 
 
 def test_default_exec_sizing_uses_three_x_short_term_budget_caps() -> None:
@@ -46,6 +47,152 @@ def test_default_downside_guardrails_are_conservative_after_loss_week() -> None:
     assert settings.account_drawdown_gate_enabled is True
     assert settings.exec_agent_trigger_time_timeout_seconds == 900
     assert settings.exec_agent_watch_sizing_timeout_seconds == 900
+
+
+def test_live_market_regime_omits_stale_plan_day_sector_context() -> None:
+    evaluated_at = datetime(2026, 7, 15, 0, 5, tzinfo=UTC)
+    result = evaluate_market_regime_guardrail(
+        settings=Settings(
+            runtime_mode="live",
+            automation_enabled=True,
+            market_regime_live_missing_breadth_behavior="neutral_with_warning",
+        ),
+        context={
+            "sector_context": {
+                "sector_name": "semiconductor",
+                "relative_state": "weak",
+                "market_date": "2026-07-14",
+                "observed_at": "2026-07-14T05:00:00+00:00",
+            }
+        },
+        market_date="2026-07-15",
+        original_notional=Decimal("1000000"),
+        original_quantity=10,
+        reference_price=Decimal("100000"),
+        now=evaluated_at,
+    )
+
+    assert result.action == "allow"
+    assert result.multiplier == Decimal("1")
+    assert result.audit["sector"] is None
+    assert result.audit["sector_source"].endswith(":stale_omitted")
+    assert "sector_context_stale" in result.audit["warnings"]
+
+
+def test_live_market_regime_uses_fresh_current_session_sector_context() -> None:
+    evaluated_at = datetime(2026, 7, 15, 0, 5, tzinfo=UTC)
+    result = evaluate_market_regime_guardrail(
+        settings=Settings(
+            runtime_mode="live",
+            automation_enabled=True,
+            market_regime_live_missing_breadth_behavior="neutral_with_warning",
+        ),
+        context={
+            "sector_context": {
+                "sector_name": "semiconductor",
+                "relative_state": "weak",
+                "market_date": "2026-07-15",
+                "observed_at": "2026-07-15T00:04:30+00:00",
+            }
+        },
+        market_date="2026-07-15",
+        original_notional=Decimal("1000000"),
+        original_quantity=10,
+        reference_price=Decimal("100000"),
+        now=evaluated_at,
+    )
+
+    assert result.action == "downsize"
+    assert result.reason_code == "sector_weakness_or_crowding_downsize"
+    assert result.audit["sector"]["relative_state"] == "weak"
+    assert "sector_context_stale" not in result.audit["warnings"]
+
+
+def test_sector_crowding_uses_distinct_current_holdings_and_open_buys() -> None:
+    evaluated_at = datetime(2026, 7, 15, 0, 5, tzinfo=UTC)
+    result = evaluate_market_regime_guardrail(
+        settings=Settings(
+            runtime_mode="live",
+            automation_enabled=True,
+            market_regime_live_missing_breadth_behavior="neutral_with_warning",
+        ),
+        context={
+            "sector_context": {
+                "sector_name": "semiconductor",
+                "relative_state": "neutral",
+                "market_date": "2026-07-15",
+                "observed_at": "2026-07-15T00:04:30+00:00",
+            }
+        },
+        account_context={
+            "sector_mapping_complete": True,
+            "holdings": [
+                {"symbol": "005930", "quantity": 2, "sector_name": "semiconductor"},
+            ],
+            "open_orders": [
+                {
+                    "symbol": "005930",
+                    "side": "buy",
+                    "remaining_quantity": 1,
+                    "sector_name": "semiconductor",
+                },
+                {
+                    "symbol": "000660",
+                    "side": "buy",
+                    "remaining_quantity": 1,
+                    "sector_name": "semiconductor",
+                },
+                {
+                    "symbol": "042700",
+                    "side": "sell",
+                    "remaining_quantity": 1,
+                    "sector_name": "semiconductor",
+                },
+            ],
+        },
+        market_date="2026-07-15",
+        original_notional=Decimal("1000000"),
+        original_quantity=10,
+        reference_price=Decimal("100000"),
+        now=evaluated_at,
+    )
+
+    assert result.action == "downsize"
+    assert result.audit["sector"]["same_sector_exposure_count"] == 2
+    assert "same_sector_exposure_present" in result.audit["warnings"]
+
+
+def test_missing_sector_mapping_is_unknown_not_zero_exposure() -> None:
+    evaluated_at = datetime(2026, 7, 15, 0, 5, tzinfo=UTC)
+    result = evaluate_market_regime_guardrail(
+        settings=Settings(
+            runtime_mode="live",
+            automation_enabled=True,
+            market_regime_live_missing_breadth_behavior="neutral_with_warning",
+        ),
+        context={
+            "sector_context": {
+                "sector_name": "semiconductor",
+                "relative_state": "neutral",
+                "market_date": "2026-07-15",
+                "observed_at": "2026-07-15T00:04:30+00:00",
+            }
+        },
+        account_context={
+            "sector_mapping_complete": False,
+            "holdings": [{"symbol": "005930", "quantity": 2}],
+            "open_orders": [],
+        },
+        market_date="2026-07-15",
+        original_notional=Decimal("1000000"),
+        original_quantity=10,
+        reference_price=Decimal("100000"),
+        now=evaluated_at,
+    )
+
+    assert result.action == "allow"
+    assert result.audit["sector"]["same_sector_exposure_count"] is None
+    assert "sector_account_exposure_unavailable" in result.audit["warnings"]
 
 
 def test_effective_stop_uses_the_declared_configured_stop_policy_without_a_hidden_floor() -> None:

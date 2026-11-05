@@ -40,12 +40,26 @@ def evaluate_market_regime_guardrail(
     evaluated_at = now or datetime.now(UTC)
     enabled = bool(getattr(settings, "market_regime_guard_enabled", True))
     payload = context if isinstance(context, dict) else {}
+    warnings: list[str] = []
     breadth, breadth_source = _extract_market_breadth(payload)
     sector, sector_source = _extract_sector_context(payload)
+    if (
+        sector is not None
+        and settings.runtime_mode == "live"
+        and bool(settings.automation_enabled)
+        and not _sector_context_is_current(
+            settings=settings,
+            sector=sector,
+            market_date=market_date,
+            evaluated_at=evaluated_at,
+        )
+    ):
+        warnings.append("sector_context_stale")
+        sector = None
+        sector_source = f"{sector_source or 'unknown'}:stale_omitted"
     market = _text(_first_present(payload, ("market", "exchange", "market_name"))) or _text(
         breadth.get("market") if isinstance(breadth, dict) else None
     ) or "KRX"
-    warnings: list[str] = []
 
     if not enabled:
         audit = _audit_payload(
@@ -259,9 +273,11 @@ def _sector_adjustment(
         return "allow", "sector_context_missing_warning", Decimal("1")
     exposure_count = _sector_exposure_count(sector=sector, account_context=account_context)
     weak = _sector_is_weak(settings=settings, sector=sector)
-    if exposure_count > 0:
+    if exposure_count is None:
+        warnings.append("sector_account_exposure_unavailable")
+    elif exposure_count > 0:
         warnings.append("same_sector_exposure_present")
-    if not weak and exposure_count <= 0:
+    if not weak and (exposure_count is None or exposure_count <= 0):
         return "allow", "sector_context_neutral", Decimal("1")
     behavior = str(settings.market_regime_sector_weak_behavior).lower()
     if weak and behavior == "reject":
@@ -372,6 +388,51 @@ def _breadth_stale(
         return True
     max_age = int(settings.market_regime_breadth_max_age_seconds)
     return age_seconds > max_age
+
+
+def _sector_context_is_current(
+    *,
+    settings: Settings,
+    sector: dict[str, object],
+    market_date: date | str | None,
+    evaluated_at: datetime,
+) -> bool:
+    observed_at = _datetime_value(
+        _first_present(
+            sector,
+            ("observed_at", "source_observed_at", "as_of", "updated_at"),
+        )
+    )
+    observed_date = _date_value(
+        _first_present(
+            sector,
+            ("market_date", "date", "as_of_date", "trading_date"),
+        )
+    )
+    if observed_at is None or observed_at.tzinfo is None or observed_date is None:
+        return False
+    market_timezone = ZoneInfo(settings.market_timezone)
+    normalized_evaluated_at = (
+        evaluated_at
+        if evaluated_at.tzinfo is not None
+        else evaluated_at.replace(tzinfo=UTC)
+    )
+    expected_date = _date_value(market_date) or normalized_evaluated_at.astimezone(
+        market_timezone
+    ).date()
+    if observed_date != expected_date:
+        return False
+    if observed_at.astimezone(market_timezone).date() != observed_date:
+        return False
+    age_seconds = (
+        normalized_evaluated_at.astimezone(UTC) - observed_at.astimezone(UTC)
+    ).total_seconds()
+    if age_seconds < -_MARKET_BREADTH_MAX_FUTURE_SKEW_SECONDS:
+        return False
+    # Sector evidence participates in live execution authority, so it cannot
+    # inherit the broader end-of-day breadth tolerance.
+    max_age = min(int(settings.market_regime_breadth_max_age_seconds), 360)
+    return age_seconds <= max_age
 
 
 def _audit_payload(
@@ -535,7 +596,11 @@ def _sector_audit(sector: dict[str, object] | None, *, account_context: dict[str
     }
 
 
-def _sector_exposure_count(*, sector: dict[str, object], account_context: dict[str, object] | None) -> int:
+def _sector_exposure_count(
+    *,
+    sector: dict[str, object],
+    account_context: dict[str, object] | None,
+) -> int | None:
     direct = _decimal_value(
         _first_present(
             sector,
@@ -550,19 +615,46 @@ def _sector_exposure_count(*, sector: dict[str, object], account_context: dict[s
     if direct is not None:
         return max(0, int(direct))
     if not isinstance(account_context, dict):
-        return 0
+        return None
     sector_name = _text(_first_present(sector, ("sector_name", "name", "category", "industry")))
     if sector_name is None:
-        return 0
-    count = 0
-    for key in ("holdings", "open_orders"):
-        rows = account_context.get(key)
-        if not isinstance(rows, list):
+        return None
+    if account_context.get("sector_mapping_complete") is not True:
+        return None
+    holdings = account_context.get("holdings")
+    open_orders = account_context.get("open_orders")
+    if not isinstance(holdings, list) or not isinstance(open_orders, list):
+        return None
+
+    exposed_symbols: set[str] = set()
+    for row in holdings:
+        if not isinstance(row, dict):
+            return None
+        row_sector = _text(row.get("sector_name") or row.get("sector"))
+        symbol = _text(row.get("symbol"))
+        quantity = _decimal_value(row.get("quantity"))
+        if row_sector is None or symbol is None:
+            return None
+        if row_sector == sector_name and quantity is not None and quantity > 0:
+            exposed_symbols.add(symbol.upper())
+    for row in open_orders:
+        if not isinstance(row, dict):
+            return None
+        side = _text(row.get("side"))
+        remaining_quantity = _decimal_value(
+            row.get("remaining_quantity")
+            if row.get("remaining_quantity") is not None
+            else row.get("quantity")
+        )
+        if side is None or side.lower() != "buy" or remaining_quantity is None or remaining_quantity <= 0:
             continue
-        for row in rows:
-            if isinstance(row, dict) and _text(row.get("sector_name") or row.get("sector")) == sector_name:
-                count += 1
-    return count
+        row_sector = _text(row.get("sector_name") or row.get("sector"))
+        symbol = _text(row.get("symbol"))
+        if row_sector is None or symbol is None:
+            return None
+        if row_sector == sector_name:
+            exposed_symbols.add(symbol.upper())
+    return len(exposed_symbols)
 
 
 def _adjusted_notional(

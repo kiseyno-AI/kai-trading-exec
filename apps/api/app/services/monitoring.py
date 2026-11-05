@@ -84,6 +84,7 @@ from app.services.execution_semantics import (
     is_delegated_exec_agent_sizing_policy,
     is_exec_agent_sizing_policy,
     is_short_term_watch_buy_intent,
+    is_trigger_time_exec_agent_sizing_policy,
     resolve_execution_market_scope,
     watch_buy_direction_from_payloads,
 )
@@ -128,7 +129,14 @@ from app.services.risk_sizing import (
     resolve_risk_based_buy_quantity,
 )
 from app.services.market_regime_guardrails import evaluate_market_regime_guardrail, market_regime_context_from_item_payloads
-from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
+from app.services.live_market_context import (
+    enrich_account_context_with_live_sector_identity,
+    load_live_market_regime_context,
+    load_live_sector_regime_context,
+    market_regime_account_context_from_snapshot,
+    merge_live_market_regime_context,
+    merge_live_sector_regime_context,
+)
 from app.services.monitoring_price_source import (
     _fetch_live_market_context,
     _is_trusted_exchange_freshness_source,
@@ -201,6 +209,7 @@ AGENT_DELAY_STATUS = trigger_time_exec_agent.AGENT_DELAY_STATUS
 AGENT_REJECTED_STATUS = trigger_time_exec_agent.AGENT_REJECTED_STATUS
 AGENT_APPROVED_PENDING_SUBMIT_STATUS = trigger_time_exec_agent.AGENT_APPROVED_PENDING_SUBMIT_STATUS
 AGENT_ACTIVE_STATUSES = trigger_time_exec_agent.AGENT_ACTIVE_STATUSES
+LOADABLE_WATCH_BUY_STATUSES = LIVE_WATCH_ENTRY_STATUSES | {AGENT_REJECTED_STATUS}
 MAX_PROTECTIVE_STOP_COVERAGE_DETAILS = 20
 TRIGGER_TIME_LIQUIDITY_EVIDENCE_KEY = "exec_trigger_time_liquidity_evidence_v1"
 TRIGGER_TIME_FULL_COST_ECONOMICS_KEY = "exec_trigger_time_full_cost_economics_v1"
@@ -232,6 +241,12 @@ DYNAMIC_WATCH_BUY_APPROVAL_REASONS = frozenset(
         "vol_corr_min_lot_rejected",
         "exec_agent_approved_notional_exhausted",
         "reserved_cash_exhausted",
+        "market_breadth_incomplete_caution",
+        "market_breadth_caution",
+        "market_breadth_below_normal",
+        "market_breadth_missing_caution",
+        "market_breadth_missing_risk_off",
+        "sector_weakness_or_crowding_downsize",
     }
 )
 RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
@@ -1992,12 +2007,16 @@ def list_autonomous_monitoring_symbols(
             effective_plan_filter,
             ExecutionPlanItem.side == "buy",
             ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-            ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
+            ExecutionPlanItem.status.in_(tuple(LOADABLE_WATCH_BUY_STATUSES)),
         )
         .options(
             load_only(
                 ExecutionPlanItem.id,
+                ExecutionPlanItem.execution_plan_id,
+                ExecutionPlanItem.plan_item_index,
                 ExecutionPlanItem.symbol,
+                ExecutionPlanItem.side,
+                ExecutionPlanItem.intent,
                 ExecutionPlanItem.status,
                 ExecutionPlanItem.provider,
                 ExecutionPlanItem.venue,
@@ -2005,10 +2024,13 @@ def list_autonomous_monitoring_symbols(
                 ExecutionPlanItem.risk_context,
                 ExecutionPlanItem.quantity_policy,
                 ExecutionPlanItem.asset_class,
+                ExecutionPlanItem.source_market_date,
             ),
             selectinload(ExecutionPlanItem.plan).load_only(
                 ExecutionPlan.id,
                 ExecutionPlan.market_date,
+                ExecutionPlan.requested_at,
+                ExecutionPlan.accepted_at,
             ),
         )
         .order_by(ExecutionPlanItem.symbol.asc(), ExecutionPlanItem.id.asc())
@@ -2025,8 +2047,25 @@ def list_autonomous_monitoring_symbols(
     active_watch_items = [
         item
         for item in active_watch_items
-        if _watch_buy_item_is_quote_monitorable(item)
-        and classify_kis_account_route(
+        if (
+            _watch_buy_item_is_quote_monitorable(item)
+            or _retired_trigger_time_buy_agent_rearmable(item)
+        )
+    ]
+    active_watch_items = _canonicalize_loaded_active_watch_buys(
+        active_watch_items,
+        settings=settings,
+        current_market_date=resolved_market_date,
+        effective_at=(
+            resolved_effective_at
+            if effective_at is not None or current_market_date is None
+            else None
+        ),
+    )
+    active_watch_items = [
+        item
+        for item in active_watch_items
+        if classify_kis_account_route(
             settings=settings,
             provider=str(item.provider or "kis").strip().lower(),
             risk_context=_loaded_risk_context(
@@ -3084,7 +3123,11 @@ def _evaluate_monitoring_cycle(
     drawdown_recovery_sources_by_scope: dict[str, BrokerOrder | None] = {}
 
     for item in items:
-        if item.status in NON_MONITORABLE_PLAN_ITEM_STATUSES:
+        retired_buy_agent_rearmable = _retired_trigger_time_buy_agent_rearmable(item)
+        if (
+            item.status in NON_MONITORABLE_PLAN_ITEM_STATUSES
+            and not retired_buy_agent_rearmable
+        ):
             continue
         if _is_watch_buy_item(item) and _position_monitoring_is_disabled(
             positions_by_symbol.get(item.symbol)
@@ -3133,8 +3176,16 @@ def _evaluate_monitoring_cycle(
             )
             continue
 
-        if _is_watch_buy_item(item) and item.status in AGENT_ACTIVE_STATUSES:
+        if _is_watch_buy_item(item) and (
+            item.status in AGENT_ACTIVE_STATUSES
+            or retired_buy_agent_rearmable
+        ):
             previous_status = item.status
+            _normalize_retired_trigger_time_buy_agent_authority(
+                item=item,
+                previous_status=previous_status,
+                recorded_at=triggered_at,
+            )
             item.status = _monitoring_status(item.intent)
             recovery_event = {
                 "event": "retired_trigger_time_buy_agent_state_rearmed",
@@ -4814,7 +4865,10 @@ def expire_prior_market_date_unfilled_watch_buys(
 
 def _watch_buy_max_age_trading_sessions(settings: Settings) -> int | None:
     if settings.runtime_mode == "live":
-        return settings.monitoring_watch_buy_max_age_trading_sessions
+        # Live WAIT authority is revoked or superseded by a newer decision,
+        # not by wall-clock age.  Expiring an untouched price watch silently
+        # removes an otherwise valid trigger from production monitoring.
+        return None
     if settings.monitoring_expire_prior_market_watch_buys_enabled:
         return 1
     return None
@@ -4971,7 +5025,7 @@ def _active_watch_route_key(
         )
     except ValueError:
         asset_class = str(raw_asset_class).strip().lower()
-    exchange = _plan_item_exchange(item)
+    exchange = _plan_item_exchange(item) or ("KRX" if is_krx_equity else "")
     decision_agent_name = str(
         plan_item_decision_agent_name(item) or "unknown"
     ).strip().casefold()
@@ -7127,7 +7181,7 @@ def _load_monitored_items(
                     ExecutionPlanItem.symbol.in_(symbol_list),
                     ExecutionPlanItem.side == "buy",
                     ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                    ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
+                    ExecutionPlanItem.status.in_(tuple(LOADABLE_WATCH_BUY_STATUSES)),
                     provider_filter,
                     effective_plan_filter,
                 )
@@ -7218,7 +7272,7 @@ def _load_monitored_items(
                 ExecutionPlanItem.symbol.in_(symbol_list),
                 ExecutionPlanItem.side == "buy",
                 ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-                ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
+                ExecutionPlanItem.status.in_(tuple(LOADABLE_WATCH_BUY_STATUSES)),
                 provider_filter,
                 effective_plan_filter,
             )
@@ -7417,7 +7471,10 @@ def _canonicalize_loaded_active_watch_buys(
         if not (
             item.side == "buy"
             and item.intent in WATCH_BUY_INTENTS
-            and not _watch_buy_item_is_quote_monitorable(item)
+            and not (
+                _watch_buy_item_is_quote_monitorable(item)
+                or _retired_trigger_time_buy_agent_rearmable(item)
+            )
         )
     ]
     resolved_market_date = current_market_date or datetime.now(KRX_TIMEZONE).date()
@@ -7456,13 +7513,18 @@ def _canonicalize_loaded_active_watch_buys(
     )
     items = _canonicalize_loaded_sell_monitors(items)
     canonical_by_route: dict[tuple[str, str, str, str, str], ExecutionPlanItem] = {}
+    canonical_population_ids: set[str] = set()
     for item in items:
         if (
             item.side != "buy"
             or item.intent not in WATCH_BUY_INTENTS
-            or not _watch_buy_item_is_quote_monitorable(item)
+            or not (
+                _watch_buy_item_is_quote_monitorable(item)
+                or _retired_trigger_time_buy_agent_rearmable(item)
+            )
         ):
             continue
+        canonical_population_ids.add(item.id)
         route_key = _active_watch_route_key(item)
         current = canonical_by_route.get(route_key)
         if (
@@ -7471,12 +7533,27 @@ def _canonicalize_loaded_active_watch_buys(
         ):
             canonical_by_route[route_key] = item
     canonical_ids = {item.id for item in canonical_by_route.values()}
+    recorded_at = _normalize_utc(effective_at or datetime.now(UTC)).isoformat()
+    for item in items:
+        if (
+            item.id in canonical_population_ids
+            and item.id not in canonical_ids
+        ):
+            prior_status = item.status
+            item.status = "superseded"
+            _record_monitoring_event(
+                item=item,
+                event={
+                    "event": "duplicate_watch_buy_superseded",
+                    "reason": "newer_active_watch_buy_exists",
+                    "prior_status": prior_status,
+                    "recorded_at": recorded_at,
+                },
+            )
     return [
         item
         for item in items
-        if item.side != "buy"
-        or item.intent not in WATCH_BUY_INTENTS
-        or not _watch_buy_item_is_quote_monitorable(item)
+        if item.id not in canonical_population_ids
         or item.id in canonical_ids
     ]
 
@@ -10309,7 +10386,7 @@ def _monitored_item_filter():
         and_(
             ExecutionPlanItem.side == "buy",
             ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
-            ExecutionPlanItem.status.in_(tuple(LIVE_WATCH_ENTRY_STATUSES)),
+            ExecutionPlanItem.status.in_(tuple(LOADABLE_WATCH_BUY_STATUSES)),
         ),
     )
 
@@ -13990,6 +14067,46 @@ def _dynamic_buy_filter_market_date(
     return item.plan.market_date if item.plan is not None else None
 
 
+def _live_market_regime_context_for_item(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    evaluated_at: datetime,
+) -> dict[str, object]:
+    context = market_regime_context_from_item_payloads(
+        _loaded_risk_context(item),
+        item.quantity_policy,
+    )
+    context = merge_live_market_regime_context(
+        context,
+        load_live_market_regime_context(settings=settings, now=evaluated_at),
+    )
+    return merge_live_sector_regime_context(
+        context,
+        load_live_sector_regime_context(
+            settings=settings,
+            symbol=item.symbol,
+            source_market_date=item.source_market_date,
+            now=evaluated_at,
+        ),
+    )
+
+
+def _live_sector_account_context(
+    *,
+    settings: Settings,
+    snapshot: BrokerAccountSnapshot,
+    source_market_date: date | None,
+    evaluated_at: datetime,
+) -> dict[str, object]:
+    return enrich_account_context_with_live_sector_identity(
+        settings=settings,
+        account_context=market_regime_account_context_from_snapshot(snapshot),
+        source_market_date=source_market_date,
+        now=evaluated_at,
+    )
+
+
 def _resolve_watch_buy_order(
     *,
     settings: Settings,
@@ -14180,10 +14297,16 @@ def _resolve_watch_buy_order(
                 message="exec-agent approved notional cannot buy one share at the current entry price",
                 details=details,
             )
-    market_regime_context = market_regime_context_from_item_payloads(_loaded_risk_context(item), item.quantity_policy)
-    market_regime_context = merge_live_market_regime_context(
-        market_regime_context,
-        load_live_market_regime_context(settings=settings),
+    market_regime_context = _live_market_regime_context_for_item(
+        settings=settings,
+        item=item,
+        evaluated_at=live_veto_recorded_at,
+    )
+    market_regime_account_context = _live_sector_account_context(
+        settings=settings,
+        snapshot=snapshot,
+        source_market_date=item.source_market_date,
+        evaluated_at=live_veto_recorded_at,
     )
     risk_decision = resolve_risk_based_buy_quantity(
         settings=settings,
@@ -14202,6 +14325,7 @@ def _resolve_watch_buy_order(
             market_date=item.plan.market_date,
         ),
         market_regime_context=market_regime_context,
+        account_context=market_regime_account_context,
         market_date=live_filter_market_date,
         evaluated_at=live_veto_recorded_at,
     )
@@ -14327,10 +14451,10 @@ def _live_watch_buy_submission_veto(
 ) -> WatchBuyOrderApproval | None:
     if not _live_watch_buy_veto_applies(settings=settings, item=item):
         return None
-    market_context = market_regime_context_from_item_payloads(_loaded_risk_context(item), item.quantity_policy)
-    market_context = merge_live_market_regime_context(
-        market_context,
-        load_live_market_regime_context(settings=settings, now=recorded_at),
+    market_context = _live_market_regime_context_for_item(
+        settings=settings,
+        item=item,
+        evaluated_at=recorded_at,
     )
     live_market_authority, authority_reason = (
         trigger_time_exec_agent.evaluate_live_market_buy_authority_gate(
@@ -14870,6 +14994,88 @@ def _parse_buy_quantity(quantity_policy: dict[str, object] | None) -> int | None
     if quantity_policy.get("kind") != "shares":
         return None
     return _parse_positive_int(quantity_policy.get("quantity"))
+
+
+def _retired_trigger_time_buy_agent_rearmable(item: ExecutionPlanItem) -> bool:
+    return _retired_trigger_time_buy_agent_payload_is_rearmable(
+        status=item.status,
+        intent=item.intent,
+        risk_context=_loaded_risk_context(item),
+    )
+
+
+def _retired_trigger_time_buy_agent_payload_is_rearmable(
+    *,
+    status: object,
+    intent: object,
+    risk_context: object,
+) -> bool:
+    if (
+        str(status or "").strip() != AGENT_REJECTED_STATUS
+        or str(intent or "").strip() not in WATCH_BUY_INTENTS
+        or not isinstance(risk_context, dict)
+    ):
+        return False
+    if isinstance(risk_context.get("last_trigger_time_exec_agent_interaction"), dict):
+        return True
+    interactions = risk_context.get("trigger_time_exec_agent_interactions")
+    return bool(
+        isinstance(interactions, list)
+        and any(isinstance(interaction, dict) for interaction in interactions)
+    )
+
+
+def _normalize_retired_trigger_time_buy_agent_authority(
+    *,
+    item: ExecutionPlanItem,
+    previous_status: str,
+    recorded_at: datetime,
+) -> None:
+    """Remove retired BUY-agent authority while preserving deterministic budget inputs."""
+
+    policy = dict(item.quantity_policy) if isinstance(item.quantity_policy, dict) else {}
+    original_policy = str(policy.get("type") or policy.get("kind") or "").strip()
+    delegated_policy = is_trigger_time_exec_agent_sizing_policy(policy)
+    if delegated_policy:
+        # The retired trigger-time path persisted its decision in risk_context,
+        # not in quantity_policy.  Remove only fields that could turn an old
+        # interaction into fixed order authority.  Keep hard safety caps such
+        # as max_quantity/max_safe_notional and the original budget inputs.
+        for key in (
+            "quantity",
+            "approved_quantity",
+            "approved_notional",
+            "approved_notional_krw",
+        ):
+            policy.pop(key, None)
+        policy.update(
+            {
+                "type": "risk_based",
+                "kind": "risk_based",
+                "source": "retired_trigger_time_buy_agent_rearm",
+                "original_delegated_policy": original_policy or None,
+                "rearmed_at": recorded_at.isoformat(),
+            }
+        )
+        item.quantity_policy = compact_json_object(policy)
+
+    risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    removed_authority_fields: list[str] = []
+    for key in (
+        "last_trigger_time_exec_agent_interaction",
+        "trigger_time_exec_agent_interactions",
+    ):
+        if key in risk_context:
+            removed_authority_fields.append(key)
+            risk_context.pop(key, None)
+    risk_context["retired_trigger_time_buy_agent_rearm"] = {
+        "previous_status": previous_status,
+        "original_delegated_policy": original_policy or None,
+        "delegated_policy_migrated": delegated_policy,
+        "removed_authority_fields": removed_authority_fields,
+        "recorded_at": recorded_at.isoformat(),
+    }
+    item.risk_context = compact_json_object(risk_context)
 
 
 def _watch_buy_requires_exec_agent_sizing(item: ExecutionPlanItem) -> bool:
@@ -16343,7 +16549,8 @@ def _plan_item_status_from_order_payload(order_payload: object) -> str | None:
 
 def _placement_preserves_current_plan_status(payload: dict[str, object]) -> bool:
     return bool(
-        payload.get("preserve_plan_item_status") is True
+        payload.get("permanent_rejection") is True
+        or payload.get("preserve_plan_item_status") is True
         or payload.get("manual_review_required") is True
         or payload.get("block_reason") in {
             "execution_plan_item_state_changed",

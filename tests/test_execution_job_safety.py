@@ -148,6 +148,17 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _live_hourly_risk_off_block_reason(
+    control_state: RuntimeControlState,
+    **_kwargs: object,
+) -> str | None:
+    return (
+        "hourly_plan_risk_off"
+        if control_state.hourly_risk_off_active
+        else None
+    )
+
+
 def _stub_retry_submission(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -230,6 +241,11 @@ def test_risk_off_blocks_scheduled_next_open_dispatch_until_confirmed_recovery(
     monkeypatch,
     tmp_path,
 ) -> None:
+    monkeypatch.setattr(
+        execution_jobs,
+        "market_scoped_automated_buy_submission_block_reason",
+        _live_hourly_risk_off_block_reason,
+    )
     app, engine, adapter, item_id = _next_open_app(
         tmp_path,
         plan_id="plan-next-open-risk-off-dispatch",
@@ -509,6 +525,11 @@ def test_risk_off_defers_claimable_buy_retry_without_io_until_recovery(
     monkeypatch,
     tmp_path,
 ) -> None:
+    monkeypatch.setattr(
+        execution_jobs,
+        "market_scoped_automated_buy_submission_block_reason",
+        _live_hourly_risk_off_block_reason,
+    )
     app, engine, adapter, item_id = _next_open_app(
         tmp_path,
         plan_id="plan-risk-off-claimable-buy-retry",
@@ -1054,6 +1075,122 @@ def test_superseded_dispatch_cannot_finish_a_newer_job_lease(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
+    "operator_status",
+    ("watch_cancelled", "manual_review_required", "revoked"),
+)
+def test_finish_job_does_not_revive_operator_or_terminal_plan_item(
+    tmp_path,
+    operator_status: str,
+) -> None:
+    app, engine, _adapter, item_id = _next_open_app(
+        tmp_path,
+        plan_id="plan-finish-race-operator-cancelled",
+    )
+    lease = datetime(2026, 7, 28, 0, 0, tzinfo=UTC)
+
+    with app.state.db_session_factory() as worker_db:
+        item = worker_db.get(ExecutionPlanItem, item_id)
+        job = worker_db.scalar(
+            select(ExecutionJob).where(
+                ExecutionJob.execution_plan_item_id == item_id
+            )
+        )
+        assert item is not None
+        assert job is not None
+        item.status = "next_open_buy_dispatching"
+        job.status = "running"
+        job.locked_at = lease
+        job.attempts = 1
+        worker_db.commit()
+
+        # Keep the worker identity map alive across the independently committed
+        # operator transition.  Completion must reload and honor broker/operator
+        # truth instead of writing its stale retry result over the cancellation.
+        assert worker_db.get(ExecutionPlanItem, item_id).status == (
+            "next_open_buy_dispatching"
+        )
+        with app.state.db_session_factory() as operator_db:
+            operator_item = operator_db.get(ExecutionPlanItem, item_id)
+            assert operator_item is not None
+            operator_item.status = operator_status
+            operator_db.commit()
+
+        result = execution_jobs._finish_job(
+            db=worker_db,
+            job_id=job.id,
+            expected_locked_at=lease,
+            status="scheduled",
+            last_error="current-session market evidence is temporarily stale",
+            plan_item_status="next_open_buy_retry_pending",
+            scheduled_for=lease + timedelta(seconds=5),
+        )
+
+    assert result == "superseded"
+    with app.state.db_session_factory() as db:
+        item = db.get(ExecutionPlanItem, item_id)
+        job = db.scalar(
+            select(ExecutionJob).where(
+                ExecutionJob.execution_plan_item_id == item_id
+            )
+        )
+        assert item is not None
+        assert job is not None
+        assert item.status == operator_status
+        assert job.status == "superseded"
+        assert job.locked_at is None
+        assert job.last_error == (
+            "execution job result ignored because the plan item changed after dispatch"
+        )
+
+    engine.dispose()
+
+
+def test_finish_job_restores_retry_state_when_dispatch_claim_is_unchanged(
+    tmp_path,
+) -> None:
+    app, engine, _adapter, item_id = _next_open_app(
+        tmp_path,
+        plan_id="plan-finish-race-unchanged",
+    )
+    lease = datetime(2026, 7, 28, 0, 0, tzinfo=UTC)
+    retry_at = lease + timedelta(seconds=5)
+    with app.state.db_session_factory() as db:
+        item = db.get(ExecutionPlanItem, item_id)
+        job = db.scalar(
+            select(ExecutionJob).where(
+                ExecutionJob.execution_plan_item_id == item_id
+            )
+        )
+        assert item is not None
+        assert job is not None
+        item.status = "next_open_buy_dispatching"
+        job.status = "running"
+        job.locked_at = lease
+        job.attempts = 1
+        db.commit()
+
+        result = execution_jobs._finish_job(
+            db=db,
+            job_id=job.id,
+            expected_locked_at=lease,
+            status="scheduled",
+            last_error="current-session market evidence is temporarily stale",
+            plan_item_status="next_open_buy_retry_pending",
+            scheduled_for=retry_at,
+        )
+
+        db.refresh(item)
+        db.refresh(job)
+        assert result == "scheduled"
+        assert item.status == "next_open_buy_retry_pending"
+        assert job.status == "scheduled"
+        assert _utc(job.scheduled_for) == retry_at
+        assert job.locked_at is None
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
     "plan_item_status",
     ["revoked", "manual_review_required", "contract_quarantined"],
 )
@@ -1307,6 +1444,7 @@ def test_account_drawdown_state_change_reschedules_job_in_safe_retry_state(
 
 
 def test_stale_running_job_keeps_retryable_item_under_active_hourly_risk_off(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
     app, engine, adapter, item_id = _next_open_app(
@@ -1343,6 +1481,17 @@ def test_stale_running_job_keeps_retryable_item_under_active_hourly_risk_off(
             "cooldown_satisfied": False,
         }
         db.commit()
+
+    original_market_block = execution_jobs.market_scoped_automated_buy_submission_block_reason
+    monkeypatch.setattr(
+        execution_jobs,
+        "market_scoped_automated_buy_submission_block_reason",
+        lambda state, **kwargs: (
+            "hourly_plan_risk_off"
+            if state.hourly_risk_off_active
+            else original_market_block(state, **kwargs)
+        ),
+    )
 
     with app.state.db_session_factory() as db:
         result = dispatch_due_execution_jobs(

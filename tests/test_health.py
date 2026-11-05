@@ -88,6 +88,16 @@ from app.services.runtime_transitions import (
 )
 
 
+def _use_historical_broker_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep explicitly historical execution fixtures on their simulated clock."""
+
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        lambda *, requested_at, **_kwargs: requested_at,
+    )
+
+
 def build_test_app(
     settings: Settings | None = None,
     *,
@@ -4560,7 +4570,10 @@ def test_autonomous_monitoring_includes_older_active_sell_monitor_without_same_i
     engine.dispose()
 
 
-def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() -> None:
+def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     app, engine = build_test_app(
         Settings(
             database_url="sqlite:///:memory:",
@@ -4743,7 +4756,10 @@ def test_autonomous_monitoring_repairs_rejected_latest_stop_before_dispatch() ->
     engine.dispose()
 
 
-def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection() -> None:
+def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     app, engine = build_test_app(
         Settings(
             database_url="sqlite:///:memory:",
@@ -4964,7 +4980,9 @@ def test_autonomous_monitoring_rearms_retry_pending_stop_after_session_rejection
 def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
     recover_on_call: int | None,
     expected_final_status: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     class RejectOnceThenSubmitAdapter(StubMonitoringBrokerAdapter):
         def place_order(
             self,
@@ -5200,7 +5218,10 @@ def test_autonomous_monitoring_retries_each_terminal_session_rejection_once(
     engine.dispose()
 
 
-def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_capacity_is_limited() -> None:
+def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_capacity_is_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     app, engine = build_test_app(
         Settings(
             database_url="sqlite:///:memory:",
@@ -5361,7 +5382,10 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
     engine.dispose()
 
 
-def test_same_tick_two_lane_watch_buys_share_aggregate_exposure_without_cross_lane_dedupe() -> None:
+def test_same_tick_two_lane_watch_buys_share_aggregate_exposure_without_cross_lane_dedupe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     observed_at = datetime(2026, 10, 23, 1, 5, tzinfo=UTC)
     broker_adapter = StubMonitoringBrokerAdapter(
         account_snapshot=BrokerAccountSnapshot(

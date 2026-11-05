@@ -55,7 +55,11 @@ from app.services.runtime_controls import (
     market_scoped_automated_buy_submission_block_reason,
     runtime_safety_payload,
 )
-from app.services.runtime_transitions import set_execution_job_status, set_plan_item_status
+from app.services.runtime_transitions import (
+    plan_item_status_for_broker_order_status,
+    set_execution_job_status,
+    set_plan_item_status,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -993,10 +997,14 @@ def _dispatch_job(
 
     order_payload = result.payload.get("order")
     order_status = None
+    broker_order_pk = None
     if isinstance(order_payload, dict):
         raw_status = order_payload.get("status")
         if isinstance(raw_status, str):
             order_status = raw_status
+        raw_broker_order_pk = order_payload.get("broker_order_pk")
+        if isinstance(raw_broker_order_pk, str) and raw_broker_order_pk.strip():
+            broker_order_pk = raw_broker_order_pk.strip()
 
     if (
         job.job_type == BROKER_ORDER_RETRY_JOB_TYPE
@@ -1012,6 +1020,7 @@ def _dispatch_job(
                 or "broker retry requires manual reconciliation"
             ),
             plan_item_status="manual_review_required",
+            broker_order_pk=broker_order_pk,
         )
     if result.payload.get("permanent_rejection") is True:
         return _finish_job(
@@ -1021,6 +1030,7 @@ def _dispatch_job(
             status="failed",
             last_error=str(result.payload.get("message") or "broker order rejected permanently"),
             plan_item_status=_failed_plan_item_status(job.job_type),
+            broker_order_pk=broker_order_pk,
         )
     if result.status_code == 409 and "block_reason" in result.payload:
         retry_after_at = _response_retry_after_at(result.payload)
@@ -1029,7 +1039,19 @@ def _dispatch_job(
             _is_account_drawdown_recovery_block(result.payload)
             and block_reason not in RETRYABLE_ACCOUNT_DRAWDOWN_BLOCK_REASONS
         )
-        if is_transient_market_buy_filter_reason(block_reason):
+        if isinstance(result.payload.get("account_drawdown_gate"), dict):
+            plan_item_status = (
+                "new_buy_blocked"
+                if job.job_type == NEXT_OPEN_BUY_JOB_TYPE
+                else _retrying_plan_item_status(job.job_type)
+            )
+            if retry_after_at is None:
+                # Recovery owns its own cooldown and distinct-observation
+                # hysteresis.  Leave the job claimable for the next dispatch
+                # cycle; the recovery gate itself decides whether enough time
+                # or a new snapshot has arrived.
+                retry_after_at = dispatch_reference_at
+        elif is_transient_market_buy_filter_reason(block_reason):
             plan_item_status = _retrying_plan_item_status(job.job_type)
             if retry_after_at is None:
                 retry_after_at = dispatch_reference_at + timedelta(
@@ -1042,7 +1064,18 @@ def _dispatch_job(
                 else _retrying_plan_item_status(job.job_type)
             )
         else:
-            plan_item_status = None
+            # Every non-terminal 409 must release the dispatching state.  The
+            # next cycle may re-evaluate the transient boundary, whereas a
+            # scheduled job paired with *_dispatching is not claimable and is
+            # therefore a permanent retry sink.
+            plan_item_status = _retrying_plan_item_status(job.job_type)
+            if retry_after_at is None:
+                retry_after_at = dispatch_reference_at + timedelta(
+                    seconds=max(
+                        settings.dispatch_loop_interval_seconds,
+                        settings.monitoring_watch_buy_retry_cooldown_seconds,
+                    )
+                )
         return _finish_job(
             db=db,
             job_id=job_id,
@@ -1051,6 +1084,7 @@ def _dispatch_job(
             last_error=str(result.payload.get("message") or "dispatch blocked by safety controls"),
             plan_item_status=plan_item_status,
             scheduled_for=retry_after_at,
+            broker_order_pk=broker_order_pk,
         )
     if order_status is None:
         order_status = _load_order_status(
@@ -1065,6 +1099,7 @@ def _dispatch_job(
         job_type=job.job_type,
         payload=result.payload,
         order_status=order_status,
+        broker_order_pk=broker_order_pk,
     )
     if finished_from_order_status is not None:
         return finished_from_order_status
@@ -1076,6 +1111,7 @@ def _dispatch_job(
             status="failed",
             last_error="duplicate broker order exists with an unrecognized status",
             plan_item_status=_failed_plan_item_status(job.job_type),
+            broker_order_pk=broker_order_pk,
         )
     return _finish_job(
         db=db,
@@ -1084,6 +1120,7 @@ def _dispatch_job(
         status="failed",
         last_error=str(result.payload.get("message") or "broker order submission failed"),
         plan_item_status=_failed_plan_item_status(job.job_type),
+        broker_order_pk=broker_order_pk,
     )
 
 
@@ -1096,14 +1133,68 @@ def _finish_job(
     last_error: str | None,
     plan_item_status: str | None,
     scheduled_for: datetime | None = None,
+    broker_order_pk: str | None = None,
 ) -> str:
-    job = _lock_current_job_lease(
-        db=db,
-        job_id=job_id,
-        expected_locked_at=expected_locked_at,
-    )
-    if job is None:
-        return "superseded"
+    effective_plan_item_status = plan_item_status
+    if plan_item_status is None:
+        job = _lock_current_job_lease(
+            db=db,
+            job_id=job_id,
+            expected_locked_at=expected_locked_at,
+        )
+        if job is None:
+            return "superseded"
+    else:
+        locked = _lock_current_job_lease_and_plan_item(
+            db=db,
+            job_id=job_id,
+            expected_locked_at=expected_locked_at,
+        )
+        if locked is None:
+            return "superseded"
+        job, plan_item = locked
+        expected_dispatching_status = _dispatching_plan_item_status(job.job_type)
+        if plan_item.status == plan_item_status:
+            # The broker boundary may already have persisted the same retry or
+            # terminal truth. Finish only the job; do not emit a duplicate plan
+            # transition.
+            effective_plan_item_status = None
+        elif _plan_item_status_matches_persisted_broker_truth(
+            db=db,
+            plan_item=plan_item,
+            broker_order_pk=broker_order_pk,
+        ):
+            # Broker truth is the expected intermediate transition from this
+            # dispatch. Let the job project that truth into its own workflow
+            # status (for example next_open_buy_retry_pending).
+            pass
+        elif plan_item.status != expected_dispatching_status:
+            # An operator or reconciliation writer changed the plan item after
+            # this worker left the serialized submission boundary. The late
+            # result cannot resurrect that item into a claimable state.
+            set_execution_job_status(
+                db=db,
+                job=job,
+                status="superseded",
+                source="execution_job_dispatch",
+                last_error=(
+                    "execution job result ignored because the plan item changed "
+                    "after dispatch"
+                ),
+                plan_item_status=None,
+                reason=(
+                    "execution job result ignored because the plan item changed "
+                    "after dispatch"
+                ),
+                payload={
+                    "execution_job_id": job.id,
+                    "expected_plan_item_status": expected_dispatching_status,
+                    "observed_plan_item_status": plan_item.status,
+                    "discarded_plan_item_status": plan_item_status,
+                },
+            )
+            db.commit()
+            return "superseded"
     if scheduled_for is not None:
         job.scheduled_for = scheduled_for
     set_execution_job_status(
@@ -1112,12 +1203,90 @@ def _finish_job(
         status=status,
         source="execution_job_dispatch",
         last_error=last_error,
-        plan_item_status=plan_item_status,
+        plan_item_status=effective_plan_item_status,
         reason=last_error,
         payload={"execution_job_id": job.id},
     )
     db.commit()
     return status
+
+
+def _plan_item_status_matches_persisted_broker_truth(
+    *,
+    db: Session,
+    plan_item: ExecutionPlanItem,
+    broker_order_pk: str | None,
+) -> bool:
+    """Recognize the broker transition written by this dispatch.
+
+    Broker submission persists its normalized order status before the job
+    worker finishes. That authoritative transition is not an operator race and
+    must not make the late job result look superseded.
+    """
+
+    if broker_order_pk is None:
+        return False
+    order_status = db.scalar(
+        select(BrokerOrder.status).where(
+            BrokerOrder.id == broker_order_pk,
+            BrokerOrder.execution_plan_item_id == plan_item.id,
+        )
+    )
+    return bool(
+        order_status is not None
+        and plan_item_status_for_broker_order_status(order_status)
+        == plan_item.status
+    )
+
+
+def _lock_current_job_lease_and_plan_item(
+    *,
+    db: Session,
+    job_id: str,
+    expected_locked_at: datetime,
+) -> tuple[ExecutionJob, ExecutionPlanItem] | None:
+    """Lock plan item before job so late completion cannot beat cancellation.
+
+    This mirrors the broker-submission boundary lock order. The initial lookup
+    reads only the immutable foreign key; authority comes from the subsequent
+    locked, populate-existing plan-item row and current job lease.
+    """
+
+    with db.no_autoflush:
+        plan_item_id = db.scalar(
+            select(ExecutionJob.execution_plan_item_id).where(
+                ExecutionJob.id == job_id
+            )
+        )
+        if plan_item_id is None:
+            db.rollback()
+            return None
+        if db.get_bind().dialect.name == "sqlite":
+            reservation = db.execute(
+                update(ExecutionPlanItem)
+                .where(ExecutionPlanItem.id == plan_item_id)
+                .values(id=ExecutionPlanItem.id)
+            )
+            if reservation.rowcount != 1:
+                db.rollback()
+                return None
+        plan_item = db.scalar(
+            select(ExecutionPlanItem)
+            .where(ExecutionPlanItem.id == plan_item_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if plan_item is None:
+            db.rollback()
+            return None
+        job = _lock_current_job_lease(
+            db=db,
+            job_id=job_id,
+            expected_locked_at=expected_locked_at,
+        )
+    if job is None:
+        return None
+    return job, plan_item
 
 
 def _renew_job_lease(
@@ -1257,6 +1426,7 @@ def _finish_job_from_order_status(
     job_type: str,
     payload: dict[str, object],
     order_status: str | None,
+    broker_order_pk: str | None,
 ) -> str | None:
     if order_status in COMPLETED_JOB_ORDER_STATUSES:
         return _finish_job(
@@ -1266,6 +1436,7 @@ def _finish_job_from_order_status(
             status="completed",
             last_error=None,
             plan_item_status=None,
+            broker_order_pk=broker_order_pk,
         )
     if order_status in RETRYING_JOB_ORDER_STATUSES:
         return _finish_job(
@@ -1275,6 +1446,7 @@ def _finish_job_from_order_status(
             status="retrying",
             last_error=_retrying_job_message(payload=payload, order_status=order_status),
             plan_item_status=_retrying_plan_item_status(job_type),
+            broker_order_pk=broker_order_pk,
         )
     if order_status in FAILED_JOB_ORDER_STATUSES:
         return _finish_job(
@@ -1284,6 +1456,7 @@ def _finish_job_from_order_status(
             status="failed",
             last_error=_failed_job_message(payload=payload, order_status=order_status),
             plan_item_status=_failed_plan_item_status(job_type),
+            broker_order_pk=broker_order_pk,
         )
     return None
 
@@ -1884,22 +2057,22 @@ def _guard_initial_next_open_submission(
     deadline = (expected_open or _normalize_utc(job.scheduled_for)) + timedelta(
         seconds=settings.next_open_buy_initial_submission_grace_seconds
     )
-    within_submission_window = (
-        market_date is not None
-        and local_date == market_date
-        and expected_open is not None
-        and expected_open <= triggered_at <= deadline
-    )
-    if not within_submission_window:
-        expired = _expire_initial_next_open_job(
-            db=db,
-            job=job,
-            triggered_at=triggered_at,
-            last_error="missed_next_open_submission_window",
-            reason="initial next-open submission missed its configured grace window",
-        )
-        return "expired" if expired else "state_changed"
     if is_us_equity:
+        within_submission_window = (
+            market_date is not None
+            and local_date == market_date
+            and expected_open is not None
+            and expected_open <= triggered_at <= deadline
+        )
+        if not within_submission_window:
+            expired = _expire_initial_next_open_job(
+                db=db,
+                job=job,
+                triggered_at=triggered_at,
+                last_error="missed_next_open_submission_window",
+                reason="initial next-open submission missed its configured grace window",
+            )
+            return "expired" if expired else "state_changed"
         evaluated_at = _monotonic_cycle_reference_at(
             triggered_at=triggered_at,
             dispatch_started=dispatch_started,
@@ -1925,6 +2098,20 @@ def _guard_initial_next_open_submission(
             )
             return "expired" if expired else "state_changed"
         return None
+    if (
+        market_date is None
+        or expected_open is None
+        or local_date != market_date
+        or triggered_at < expected_open
+    ):
+        expired = _expire_initial_next_open_job(
+            db=db,
+            job=job,
+            triggered_at=triggered_at,
+            last_error="krx_plan_market_date_mismatch",
+            reason="KRX next-open plan is not for the current orderable session",
+        )
+        return "expired" if expired else "state_changed"
     if market_date.weekday() >= 5:
         expired = _expire_initial_next_open_job(
             db=db,
@@ -1960,35 +2147,9 @@ def _guard_initial_next_open_submission(
         triggered_at=triggered_at,
         dispatch_started=dispatch_started,
     )
-    if evaluated_at > deadline:
-        elapsed_error = (
-            "krx_calendar_unavailable_at_deadline"
-            if market_open is None
-            else (
-                "krx_session_not_authoritatively_open"
-                if market_open is False
-                else "missed_next_open_submission_window"
-            )
-        )
-        expired = _expire_initial_next_open_job(
-            db=db,
-            job=job,
-            triggered_at=evaluated_at,
-            last_error=elapsed_error,
-            reason=(
-                "KRX calendar proof remained unavailable through the grace window"
-                if market_open is None
-                else (
-                    "KRX calendar did not authorize the requested session date"
-                    if market_open is False
-                    else "initial next-open market proof completed after the grace window"
-                )
-            ),
-        )
-        return "expired" if expired else "state_changed"
     if market_open is True:
         return None
-    if market_open is None and evaluated_at < deadline:
+    if market_open is None:
         if not _lock_initial_next_open_guard_mutation(db=db, job=job):
             return "state_changed"
         set_execution_job_status(
@@ -2001,19 +2162,14 @@ def _guard_initial_next_open_submission(
             reason="KRX calendar proof is temporarily unavailable",
             occurred_at=evaluated_at,
         )
-        job.scheduled_for = min(evaluated_at + timedelta(seconds=15), deadline)
+        job.scheduled_for = evaluated_at + timedelta(seconds=15)
         db.commit()
         return "deferred"
-    terminal_error = (
-        "krx_calendar_unavailable_at_deadline"
-        if market_open is None
-        else "krx_session_not_authoritatively_open"
-    )
     expired = _expire_initial_next_open_job(
         db=db,
         job=job,
         triggered_at=triggered_at,
-        last_error=terminal_error,
+        last_error="krx_session_not_authoritatively_open",
         reason="KRX calendar did not authorize the requested session date",
     )
     return "expired" if expired else "state_changed"

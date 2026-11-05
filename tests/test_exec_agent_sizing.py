@@ -53,6 +53,16 @@ from app.services.position_identity import (
 )
 
 
+def _use_historical_broker_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep explicitly historical execution fixtures on their simulated clock."""
+
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        lambda *, requested_at, **_kwargs: requested_at,
+    )
+
+
 class StubBrokerAdapter:
     provider = "kis"
 
@@ -975,7 +985,10 @@ def test_strict_and_legacy_short_term_exec_agent_confidence_multipliers_stay_ali
         )
 
 
-def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitoring() -> None:
+def test_short_term_exec_agent_approves_market_open_buy_and_materializes_monitoring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
     app, engine = build_test_app(adapter)
     client = TestClient(app)
@@ -1212,7 +1225,10 @@ def test_prefill_monitor_keeps_missing_source_market_date_as_lineage_only() -> N
     assert monitor.risk_context["entry_market_date_status"] == "provisional"
 
 
-def test_market_buy_capital_gate_prefers_verified_exec_agent_audit_over_legacy_context() -> None:
+def test_market_buy_capital_gate_prefers_verified_exec_agent_audit_over_legacy_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
     app, engine = build_test_app(adapter)
     client = TestClient(app)
@@ -3149,7 +3165,10 @@ def test_short_term_auto_buy_fails_closed_when_runtime_resumed_without_contract(
     engine.dispose()
 
 
-def test_max_holding_close_exit_is_monitored_across_days_and_submits_sell() -> None:
+def test_max_holding_close_exit_is_monitored_across_days_and_submits_sell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     adapter = StubBrokerAdapter(available_cash=Decimal("500000"))
     app, engine = build_test_app(adapter)
     client = TestClient(app)

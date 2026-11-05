@@ -31,17 +31,18 @@ It is not persisted and it is not itself an admission authority.
 | Bootstrap pause | Blocked | Active | Active | Explicit operator resume after readiness review |
 | Operator pause | Blocked | Active | Active | Explicit operator resume |
 | Kill switch | Blocked | Active | Blocked | Compare-and-swap reset using the current kill-switch event ID; runtime remains paused until explicit resume |
-| Hourly risk-off | Blocked | Active | Active | Configured distinct healthy observations, observation interval, cooldown, and completed item projection |
+| Hourly KRX risk-off | Blocked only for live KRX new/increasing buys | Active; candidates and trigger geometry are preserved | Active | Configured distinct healthy observations, observation interval, and cooldown |
 | Core buy-authority fence | Blocked for the bound live KIS/KRX scope | Active | Active | Configured distinct fresh authoritative allow observations |
 | Account-drawdown latch | Blocked for the exact account/currency lane | Active | Active | Cooldown plus distinct healthy account snapshots; release requires a fresh candidate and never revives the rejected order |
 | Process shutdown fence | Blocked in the draining process | Draining | No new submission | New process generation after startup; no durable pause is written |
 
-A due buy job is checked against pause and hourly risk-off before claim,
-calendar lookup, authentication, quote lookup, account lookup, or broker-order
-creation. Its attempt counter and durable job/item state remain unchanged. A due
-sell retry in the same batch is still claimable. Pause release is an explicit
-resume; hourly risk-off schedules its next check at the calculated recovery
-deadline instead of spinning on a past-due buy job.
+A due live-KRX buy job is checked against pause, hourly risk-off, and a fresh
+current-session market observation before claim, calendar lookup,
+authentication, quote lookup, account lookup, or broker-order creation. Its
+attempt counter and durable job/item state remain unchanged. A due sell retry
+in the same batch is still claimable. Pause release is an explicit resume;
+hourly risk-off schedules its next check at the calculated recovery deadline
+instead of spinning on a past-due buy job.
 
 A startup recovery may clear only the exact historical pause written by the
 retired `lifespan_shutdown` path and only when its linked applied event, actor,
@@ -53,13 +54,10 @@ switch.
 | Situation | Required state | Eligible worker | Next state or outcome |
 | --- | --- | --- | --- |
 | Core delegates pre-monitor sizing with `exec_agent_sized` | `watch_sizing_pending` | Watch-sizing worker only | Verified approval becomes a fixed-share policy and active monitoring (or one scheduled next-open job); transient failure stays sizing-pending; terminal rejection stays terminal |
-| Core delegates trigger-time sizing with `trigger_time_exec_agent_sized` | Active watch state | Quote monitor, then trigger-time agent | No quantity can be inferred before the trigger; verified trigger-time result may authorize the final buy path |
+| Legacy Core delegates trigger-time BUY sizing with `trigger_time_exec_agent_sized` | Legacy active or agent-terminal watch state | Quote monitor recovery | Remove retired BUY-agent authority, preserve deterministic budget caps, and return the candidate to price-line monitoring; no new BUY trigger calls an agent |
 | Fixed quantity and valid trigger geometry | `watch_monitoring_pending` or `watch_monitoring_active` | Quote monitor | Trigger state, final safety checks, then broker submission |
-| Quote/trigger reached while a buy gate is active | Triggered/blocked or risk-off-expired state | Monitor/recovery worker | Retry only after the owning gate's release rule; final broker boundary rechecks every gate |
-| Hourly risk-off starts during pre-monitor sizing | `watch_expired` with exact prior-state evidence | Risk-off recovery | Restores `watch_sizing_pending`, never active monitoring, after confirmed recovery |
-| Trigger-time agent call is in flight | `triggered_pending_agent` | Monitor | Fresh state remains locked; after `EXEC_AGENT_TRIGGER_TIME_TIMEOUT_SECONDS` (default 900 seconds), return to the intent's monitoring state and request a fresh decision |
-| Agent requests a delay | `agent_delay` | Monitor | Stay locked until the decision's timezone-aware `valid_until`; if absent, use `MONITORING_WATCH_BUY_RETRY_COOLDOWN_SECONDS` (default 5 seconds), then return to monitoring and request a fresh decision |
-| Agent approved but the process stopped before submission | `agent_approved_pending_submit` | Monitor | Fresh state remains locked; after the trigger-time timeout, discard the stale approval, return to monitoring, and request a fresh decision |
+| Quote/trigger reached while a dynamic buy gate is active | `watch_buy_triggered_blocked` or a retry-pending job state | Monitor/recovery worker | Preserve the candidate and retry only after the owning gate's release rule; final broker boundary rechecks every gate |
+| Hourly KRX risk-off starts during pre-monitor sizing or monitoring | Existing sizing/monitoring/job state is preserved | Existing owner | Keep observing; block only BUY submission until confirmed recovery, then re-evaluate every current gate |
 | Watch is submitted, rejected, expired, cancelled, or superseded | Terminal state | None | Excluded from monitored liveness and duplicate-watch preservation |
 
 The pre-monitor policy wins if legacy `type` and `kind` aliases conflict. A
@@ -87,8 +85,10 @@ sellable quantity, the correct account/route, session and quote validity, and a
 final broker-boundary check. The kill switch blocks it; an entry pause or
 buy-only risk fence does not.
 
-The three agent-active states follow the same expiry rules for target and
-max-holding sells. A deterministic emergency stop bypasses the agent. Fresh
+The three agent-active states (`triggered_pending_agent`, `agent_delay`, and
+`agent_approved_pending_submit`) are protective-exit states only. They follow
+the same expiry rules for target and max-holding sells. A deterministic
+emergency stop bypasses the agent. Fresh
 agent-active rows count as protective coverage and are never cloned or rearmed;
 expired rows return to monitoring for a fresh decision. Older-plan live sell
 rows remain in held-position reconciliation, including triggered-blocked,
@@ -146,8 +146,8 @@ discarded before any recovery-critical field.
 | Kill switch | Blocked | Blocked | Current kill event ID; reset event leaves pause in force |
 | Due BUY and SELL retry coexist during pause/risk-off | BUY remains unclaimed with no provider I/O | SELL remains dispatchable | Per-side result plus unchanged BUY attempts/lock/state |
 | Missing sizing quantity | Blocked before quote monitoring | Unaffected | `watch_sizing_pending` and retry/audit evidence |
-| Fresh trigger-agent pending/delay/approved state | No duplicate agent call or order | Same for non-emergency exits | Original state and decision/claim timestamp retained |
-| Expired trigger-agent pending/delay/approved state | Fresh agent decision required before any order | Fresh agent decision, except deterministic stop bypass | Recovery event records prior state and exact expiry reason |
+| Fresh protective-exit agent pending/delay/approved state | BUY does not use this state | No duplicate agent call or order for a non-emergency exit | Original state and decision/claim timestamp retained |
+| Expired protective-exit agent pending/delay/approved state | BUY does not use this state | Fresh exit-agent decision, except deterministic stop bypass | Recovery event records prior state and exact expiry reason |
 | Stale/unavailable market authority | Blocked | Eligible when risk-reducing | Active buy fence and observation/recovery counters |
 | Ambiguous activation response | Blocked from activation, not revoked | Existing exits unaffected | Exact pending activation proof and replay summaries |
 | Terminal watch row | Not monitored or revived | Existing independent position exits only | Terminal status retained |

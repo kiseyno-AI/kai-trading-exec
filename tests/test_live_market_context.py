@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -6,9 +6,13 @@ import pytest
 from app.core.config import Settings
 from app.services import live_market_context
 from app.services.live_market_context import (
+    enrich_account_context_with_live_sector_identity,
+    load_cached_live_sector_regime_context,
     load_live_market_regime_context,
+    load_live_sector_regime_context,
     market_regime_context_from_market_snapshot,
     merge_live_market_regime_context,
+    merge_live_sector_regime_context,
 )
 
 
@@ -379,7 +383,7 @@ def test_merge_rejects_conflicting_base_market_identity() -> None:
     assert "market_breadth" not in merged["market_regime_context"]
 
 
-def test_live_context_overrides_stale_breadth_but_preserves_sector_context() -> None:
+def test_live_context_overrides_stale_breadth_and_drops_unrefreshed_sector_context() -> None:
     merged = merge_live_market_regime_context(
         {
             "market": "KOSPI",
@@ -399,7 +403,7 @@ def test_live_context_overrides_stale_breadth_but_preserves_sector_context() -> 
 
     regime = merged["market_regime_context"]
     assert regime["market_breadth"]["up_ratio"] == "0.12"
-    assert regime["sector_context"]["relative_state"] == "weak"
+    assert "sector_context" not in regime
     assert merged["market_breadth"]["up_ratio"] == "0.12"
 
 
@@ -414,11 +418,11 @@ def test_live_market_context_cache_isolated_by_endpoint_and_auth(monkeypatch) ->
             "legs": {"index": {"status": "ready"}},
             "as_of": "2026-07-20T05:00:00+00:00",
             "markets": {
-                "kospi": {
-                    "label": "KOSPI",
-                    "advancers": len(calls),
-                    "decliners": 10,
-                }
+                "kospi": _ready_market(
+                    "KOSPI",
+                    "2026-07-20T05:00:00+00:00",
+                    advancers=500 + len(calls),
+                )
             },
         }
 
@@ -814,3 +818,265 @@ def test_snapshot_rejects_duplicate_canonical_key_even_when_one_row_is_invalid()
     )
 
     assert context["market_regime_context"]["markets"] == {}
+
+
+def _live_sector_projection(
+    *,
+    status: str = "ready",
+    symbol: str = "005930",
+    observed_at: str | None = "2026-11-05T10:00:00+09:00",
+    reason: str | None = None,
+) -> dict[str, object]:
+    identity = {
+        "status": "available",
+        "sector_name": "반도체",
+        "market": "KOSPI",
+        "mapping_date": "2026-11-04",
+        "mapping_source": "pykrx",
+        "captured_at": "2026-11-04T16:10:00+09:00",
+        "universe_market_complete": True,
+        "universe_reference_count": 900,
+        "universe_reference_sha256": "a" * 64,
+        "universe_reference_source": "pykrx_market_ticker_list",
+    }
+    projection_status = status
+    ready = status == "ready"
+    return {
+        "schema_version": "live_sector_projection_v1",
+        "status": status,
+        "reason": reason,
+        "symbol": symbol,
+        "market": "KOSPI",
+        "market_date": "2026-11-05",
+        "source_market_date": "2026-11-04",
+        "observed_at": observed_at if ready else None,
+        "source": "core_verified_pykrx_sector_plus_kis_current_session",
+        "sector_identity": identity,
+        "cohort": {
+            "membership_sha256": "b" * 64,
+            "live_market_cap_coverage_ratio": 0.8 if ready else None,
+        },
+        "benchmark": None,
+        "projection": {
+            "status": projection_status,
+            "sector_return_pct": 1.2 if ready else None,
+            "benchmark_return_pct": 0.5 if ready else None,
+            "relative_return_pct": 0.7 if ready else None,
+            "live_market_cap_coverage_ratio": 0.8 if ready else None,
+        },
+        "missing_fields": [] if ready else ["current_session_quotes"],
+        "served_from_cache": False,
+    }
+
+
+def _clear_sector_cache() -> None:
+    with live_market_context._SECTOR_CACHE_LOCK:
+        live_market_context._SECTOR_CACHE.clear()
+
+
+def test_live_sector_projection_ready_is_cached_and_final_boundary_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, date]] = []
+
+    def fake_fetch(*, settings: Settings, symbol: str, source_market_date: date):
+        del settings
+        calls.append((symbol, source_market_date))
+        return _live_sector_projection(symbol=symbol)
+
+    monkeypatch.setattr(live_market_context, "_fetch_live_sector_projection", fake_fetch)
+    _clear_sector_cache()
+    settings = Settings(
+        market_context_enabled=True,
+        market_context_base_url="http://core.test",
+        market_context_cache_ttl_seconds=60,
+    )
+    checked_at = datetime(2026, 11, 5, 1, 0, 10, tzinfo=UTC)
+
+    loaded = load_live_sector_regime_context(
+        settings=settings,
+        symbol="5930",
+        source_market_date=date(2026, 11, 4),
+        now=checked_at,
+    )
+    cached = load_cached_live_sector_regime_context(
+        settings=settings,
+        symbol="005930",
+        source_market_date="2026-11-04",
+        now=checked_at,
+    )
+
+    assert calls == [("005930", date(2026, 11, 4))]
+    assert loaded["sector_context_status"] == "ready"
+    assert loaded["sector_identity"]["sector_name"] == "반도체"
+    assert loaded["sector_context"]["relative_return_pct"] == 0.7
+    assert cached["sector_context"] == loaded["sector_context"]
+
+
+def test_pending_sector_projection_keeps_verified_identity_but_never_performance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        live_market_context,
+        "_fetch_live_sector_projection",
+        lambda **_kwargs: _live_sector_projection(
+            status="pending_current_session",
+            observed_at=None,
+            reason="current_session_sector_performance_pending_market_open",
+        ),
+    )
+    _clear_sector_cache()
+    settings = Settings(
+        market_context_enabled=True,
+        market_context_base_url="http://core.test",
+    )
+    pending = load_live_sector_regime_context(
+        settings=settings,
+        symbol="005930",
+        source_market_date="2026-11-04",
+        now=datetime(2026, 11, 5, 0, 30, tzinfo=UTC),
+    )
+    merged = merge_live_sector_regime_context(
+        {
+            "market_breadth": {"market": "KOSPI", "up_ratio": "0.55"},
+            "sector_context": {"sector_name": "old", "relative_return_pct": -9},
+            "market_regime_context": {
+                "market_breadth": {"market": "KOSPI", "up_ratio": "0.55"},
+                "sector_context": {"sector_name": "old", "relative_return_pct": -9},
+            },
+        },
+        pending,
+    )
+
+    assert pending["sector_context_status"] == "pending_current_session"
+    assert pending["sector_identity"]["sector_name"] == "반도체"
+    assert "sector_context" not in pending
+    assert "sector_context" not in merged
+    assert "sector_context" not in merged["market_regime_context"]
+    assert merged["market_breadth"]["up_ratio"] == "0.55"
+
+
+def test_stale_ready_sector_projection_is_not_cached_as_execution_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        live_market_context,
+        "_fetch_live_sector_projection",
+        lambda **_kwargs: _live_sector_projection(
+            observed_at="2026-11-05T09:50:00+09:00"
+        ),
+    )
+    _clear_sector_cache()
+    settings = Settings(
+        market_context_enabled=True,
+        market_context_base_url="http://core.test",
+        market_context_cache_ttl_seconds=60,
+    )
+    checked_at = datetime(2026, 11, 5, 1, 0, 10, tzinfo=UTC)
+    loaded = load_live_sector_regime_context(
+        settings=settings,
+        symbol="005930",
+        source_market_date="2026-11-04",
+        now=checked_at,
+    )
+    cached = load_cached_live_sector_regime_context(
+        settings=settings,
+        symbol="005930",
+        source_market_date="2026-11-04",
+        now=checked_at,
+    )
+
+    assert loaded["sector_context_status"] == "unavailable"
+    assert loaded["sector_context_reason"] == "live_sector_projection_observation_stale"
+    assert "sector_context" not in loaded
+    assert cached["sector_context_status"] == "unavailable"
+    assert "sector_context" not in cached
+
+
+def test_account_sector_enrichment_uses_pending_verified_identity_and_marks_gaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_fetch(*, settings: Settings, symbol: str, source_market_date: date):
+        del settings, source_market_date
+        if symbol == "000660":
+            payload = _live_sector_projection(
+                status="pending_current_session",
+                symbol=symbol,
+                observed_at=None,
+                reason="current_session_sector_performance_pending_market_open",
+            )
+            payload["sector_identity"] = {
+                **payload["sector_identity"],
+                "sector_name": "반도체",
+            }
+            return payload
+        return {
+            **_live_sector_projection(
+                status="unavailable",
+                symbol=symbol,
+                observed_at=None,
+                reason="verified_pykrx_sector_identity_missing",
+            ),
+            "sector_identity": None,
+        }
+
+    monkeypatch.setattr(live_market_context, "_fetch_live_sector_projection", fake_fetch)
+    _clear_sector_cache()
+    settings = Settings(
+        market_context_enabled=True,
+        market_context_base_url="http://core.test",
+    )
+    original = {
+        "holdings_complete": True,
+        "open_orders_complete": True,
+        "holdings": [{"symbol": "000660", "quantity": 2}],
+        "open_orders": [
+            {"symbol": "005930", "side": "buy", "remaining_quantity": 1},
+            {"symbol": "035420", "side": "sell", "remaining_quantity": 1},
+        ],
+    }
+
+    enriched = enrich_account_context_with_live_sector_identity(
+        settings=settings,
+        account_context=original,
+        source_market_date="2026-11-04",
+        now=datetime(2026, 11, 5, 0, 30, tzinfo=UTC),
+    )
+
+    assert enriched["holdings"][0]["sector_name"] == "반도체"
+    assert enriched["sector_mapping_complete"] is False
+    assert enriched["sector_mapping_missing_symbols"] == ["005930"]
+    assert enriched["sector_mapping_required_symbol_count"] == 2
+    assert "sector_name" not in original["holdings"][0]
+
+
+def test_account_sector_enrichment_requires_complete_account_truth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        live_market_context,
+        "_fetch_live_sector_projection",
+        lambda **kwargs: _live_sector_projection(
+            status="pending_current_session",
+            symbol=kwargs["symbol"],
+            observed_at=None,
+        ),
+    )
+    _clear_sector_cache()
+    enriched = enrich_account_context_with_live_sector_identity(
+        settings=Settings(
+            market_context_enabled=True,
+            market_context_base_url="http://core.test",
+        ),
+        account_context={
+            "holdings": [{"symbol": "005930", "quantity": 1}],
+            "open_orders": [],
+        },
+        source_market_date="2026-11-04",
+        now=datetime(2026, 11, 5, 0, 30, tzinfo=UTC),
+    )
+
+    assert enriched["sector_mapping_complete"] is False
+    assert enriched["sector_mapping_missing_symbols"] == []
+    assert enriched["holdings_complete"] is False
+    assert enriched["open_orders_complete"] is False

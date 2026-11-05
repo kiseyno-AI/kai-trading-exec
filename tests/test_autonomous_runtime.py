@@ -2394,6 +2394,101 @@ def test_sqlite_monitoring_snapshot_excludes_terminal_watch_items(tmp_path) -> N
         engine.dispose()
 
 
+def test_autonomous_snapshots_restore_only_retired_buy_agent_rejections(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'retired-agent-watch-items.db'}",
+        runtime_mode="paper",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=session_factory,
+        broker_adapter_factory=lambda settings: None,  # type: ignore[arg-type,return-value]
+    )
+    retired_context = {
+        "exchange": "KRX",
+        "trigger_direction": "at_or_above",
+        "last_trigger_time_exec_agent_interaction": {
+            "decision": {"decision": "execute_now", "quantity": 2}
+        },
+    }
+
+    try:
+        with session_factory() as session:
+            session.add(
+                ExecutionPlan(
+                    external_plan_id="retired-agent-watch-items",
+                    source="kai-trading-core",
+                    market_date=date(2026, 8, 18),
+                    mode="paper",
+                    status="accepted",
+                    items=[
+                        ExecutionPlanItem(
+                            id="retired-agent-rejected-item",
+                            plan_item_index=0,
+                            symbol="111111",
+                            side="buy",
+                            intent="intraday_watch_buy",
+                            status="agent_rejected",
+                            trigger_price=Decimal("1000"),
+                            risk_context=retired_context,
+                            quantity_policy={"kind": "shares", "quantity": 2},
+                        ),
+                        ExecutionPlanItem(
+                            id="unrelated-agent-rejected-item",
+                            plan_item_index=1,
+                            symbol="222222",
+                            side="buy",
+                            intent="intraday_watch_buy",
+                            status="agent_rejected",
+                            trigger_price=Decimal("1000"),
+                            risk_context={
+                                "exchange": "KRX",
+                                "trigger_direction": "at_or_above",
+                            },
+                            quantity_policy={"kind": "shares", "quantity": 2},
+                        ),
+                    ],
+                )
+            )
+            session.commit()
+
+            assert coordinator._load_local_desired_monitoring_symbols_from_sqlite() == [
+                "111111"
+            ]
+            raw_snapshot = (
+                coordinator._load_monitoring_runtime_snapshot_for_symbols_from_sqlite(
+                    loaded_at=datetime(2026, 8, 18, 1, 0, tzinfo=UTC),
+                    symbols=["111111", "222222"],
+                )
+            )
+            orm_snapshot = coordinator._load_monitoring_runtime_snapshot_for_symbols_with_session(
+                db=session,
+                loaded_at=datetime(2026, 8, 18, 1, 0, tzinfo=UTC),
+                symbols=["111111", "222222"],
+            )
+
+        assert raw_snapshot is not None
+        assert [item.id for item in raw_snapshot.items] == [
+            "retired-agent-rejected-item"
+        ]
+        assert [item.id for item in orm_snapshot.items] == [
+            "retired-agent-rejected-item"
+        ]
+        cached_result = coordinator._evaluate_cached_monitoring_cycle(
+            runtime_snapshot=raw_snapshot,
+            prices=[MonitoringPriceRequest(symbol="111111", price=Decimal("1001"))],
+            started_at=datetime(2026, 8, 18, 1, 0, tzinfo=UTC),
+        )
+        assert cached_result["triggered_buy_symbols"] == ["111111"]
+    finally:
+        engine.dispose()
+
+
 def test_monitoring_snapshots_include_only_price_watch_sizing_pending_items(
     tmp_path,
 ) -> None:

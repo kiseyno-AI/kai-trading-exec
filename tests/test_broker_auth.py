@@ -534,6 +534,18 @@ def _freeze_autonomous_runtime_at_krx_open(
     return KRX_OPEN_TEST_AT
 
 
+def _use_historical_broker_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep explicitly historical execution fixtures on their simulated clock."""
+
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        lambda *, requested_at, **_kwargs: requested_at,
+    )
+
+
 def build_test_app(
     *,
     settings: Settings,
@@ -3063,8 +3075,14 @@ def test_retryable_auth_failure_keeps_protective_stop_rearmable() -> None:
 @pytest.mark.parametrize("intent", ["stop_sell", "target_sell"])
 def test_runtime_safety_fenced_monitoring_sell_rebinds_fresh_command_authority(
     intent: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     triggered_at = datetime(2026, 9, 10, 1, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        lambda **_kwargs: triggered_at,
+    )
     # The fenced attempt was routed during KRX single-price trading. Reusing
     # its route_now on the next regular-session trigger would incorrectly keep
     # the retry on order division 07.
@@ -4819,6 +4837,18 @@ def test_automated_buy_rechecks_hourly_risk_off_after_account_snapshot(
             unrealized_pnl=Decimal("0.00"),
         ),
     )
+    original_market_block = (
+        broker_orders_service.market_scoped_automated_buy_submission_block_reason
+    )
+    monkeypatch.setattr(
+        broker_orders_service,
+        "market_scoped_automated_buy_submission_block_reason",
+        lambda state, **kwargs: (
+            "hourly_plan_risk_off"
+            if state.hourly_risk_off_active
+            else original_market_block(state, **kwargs)
+        ),
+    )
     app, engine = build_test_app(settings=settings, broker_adapter=broker_adapter)
     client = TestClient(app)
     assert client.post(
@@ -5757,6 +5787,25 @@ def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
     release_boundary = Event()
     real_ensure_session = broker_orders_service.ensure_authenticated_broker_session
     block_once = {"armed": True}
+    real_market_guard = (
+        broker_orders_service.market_scoped_automated_buy_submission_block_reason
+    )
+
+    def paper_fixture_hourly_guard(control_state, **kwargs: object):
+        reason = real_market_guard(control_state, **kwargs)
+        if reason is not None:
+            return reason
+        return (
+            "hourly_plan_risk_off"
+            if control_state.hourly_risk_off_active
+            else None
+        )
+
+    monkeypatch.setattr(
+        broker_orders_service,
+        "market_scoped_automated_buy_submission_block_reason",
+        paper_fixture_hourly_guard,
+    )
 
     class FrozenHourlyDateTime(datetime):
         current = datetime(2024, 1, 3, 0, 0, 1, tzinfo=UTC)
@@ -7874,7 +7923,10 @@ def test_place_order_endpoint_defers_non_nxt_protective_sell_at_0800() -> None:
     engine.dispose()
 
 
-def test_dispatch_due_next_open_buy_job_places_broker_order() -> None:
+def test_dispatch_due_next_open_buy_job_places_broker_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     dispatch_at = datetime(2026, 9, 10, 0, 0, 1, tzinfo=UTC)
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -7982,7 +8034,10 @@ def test_dispatch_due_next_open_buy_job_places_broker_order() -> None:
     engine.dispose()
 
 
-def test_dispatch_due_next_open_buy_job_keeps_retrying_duplicate_retryable_order() -> None:
+def test_dispatch_due_next_open_buy_job_keeps_retrying_duplicate_retryable_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     dispatch_at = datetime(2026, 9, 10, 0, 0, 1, tzinfo=UTC)
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -8106,7 +8161,10 @@ def test_dispatch_due_next_open_buy_job_keeps_retrying_duplicate_retryable_order
     engine.dispose()
 
 
-def test_next_open_drawdown_recovery_uses_new_generation_after_confirmed_health() -> None:
+def test_next_open_drawdown_recovery_uses_new_generation_after_confirmed_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     blocked_at = datetime(2026, 9, 10, 0, 0, 1, tzinfo=UTC)
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -8306,6 +8364,7 @@ def test_next_open_drawdown_recovery_uses_new_generation_after_confirmed_health(
 def test_next_open_recovery_runtime_fence_reuses_same_child_on_original_key_retry(
     monkeypatch,
 ) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     app, engine, broker_adapter, item_id, job_id, blocked_at = (
         _build_blocked_next_open_recovery_scenario(
             required_healthy_observations=2,
@@ -10549,6 +10608,7 @@ def test_autonomous_monitoring_rearms_blocked_sell_only_from_trusted_fresh_quote
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     started_at = _freeze_autonomous_runtime_at_krx_open(monkeypatch)
+    _use_historical_broker_boundary(monkeypatch)
 
     class MutableSellPriceSource:
         trusted = False
@@ -11874,7 +11934,10 @@ def test_account_drawdown_latch_is_not_hidden_by_newer_other_currency_losses() -
     engine.dispose()
 
 
-def test_watch_buy_drawdown_recovery_revalidates_trigger_and_controls_before_new_generation() -> None:
+def test_watch_buy_drawdown_recovery_revalidates_trigger_and_controls_before_new_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     app, engine, client, broker_adapter = _build_watch_buy_test_app(
         order_id="kis-watch-buy-drawdown-recovery-1",
         max_quote_age_seconds=30,
@@ -13698,7 +13761,7 @@ def test_paused_watch_buy_skips_trigger_time_agent_and_broker_io(monkeypatch) ->
     engine.dispose()
 
 
-def test_hourly_risk_off_blocks_known_quantity_watch_buy_before_broker_io() -> None:
+def test_paper_watch_buy_does_not_inherit_live_hourly_risk_off_latch() -> None:
     app, engine, client, broker_adapter = _build_watch_buy_test_app()
     _create_watch_buy_candidate(
         client,
@@ -13722,7 +13785,7 @@ def test_hourly_risk_off_blocks_known_quantity_watch_buy_before_broker_io() -> N
         json={
             "actor": "ops",
             "source": "test",
-            "reason": "hourly risk-off must gate before broker I/O",
+            "reason": "paper mode must not inherit a live hourly latch",
             "prices": [{"symbol": "005930", "price": "71050.00"}],
         },
     )
@@ -13730,15 +13793,11 @@ def test_hourly_risk_off_blocks_known_quantity_watch_buy_before_broker_io() -> N
     assert response.status_code == 200
     payload = response.json()
     assert payload["triggered_item_count"] == 1
-    assert payload["submitted_order_count"] == 0
-    assert payload["blocked_item_count"] == 1
-    assert payload["items"][0]["outcome"] == "blocked"
-    assert payload["items"][0]["block_reason"] == "hourly_plan_risk_off"
-    assert payload["items"][0]["status"] == "watch_buy_triggered_blocked"
-    assert broker_adapter.authenticate_calls == 0
-    assert broker_adapter.account_snapshot_calls == 0
-    assert broker_adapter.order_calls == []
-    assert client.get("/orders").json() == []
+    assert payload["submitted_order_count"] == 1
+    assert payload["blocked_item_count"] == 0
+    assert payload["items"][0]["outcome"] == "submitted"
+    assert len(broker_adapter.order_calls) == 1
+    assert len(client.get("/orders").json()) == 1
     engine.dispose()
 
 
@@ -22360,6 +22419,7 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     started_at = _freeze_autonomous_runtime_at_krx_open(monkeypatch)
+    _use_historical_broker_boundary(monkeypatch)
     database_url = f"sqlite:///{tmp_path / 'autonomous-monitoring-restart.db'}"
     first_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -22370,6 +22430,19 @@ def test_autonomous_monitoring_loop_retries_pending_dispatch_after_restart_with_
         ),
         token_grant=build_token_grant(),
         order_placement=build_order_placement(broker_order_id="kis-monitor-initial-1"),
+        account_snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("0"),
+            observed_at=started_at,
+            source="stub:monitoring-restart-initial",
+            holdings=[
+                BrokerAccountHolding(
+                    symbol="005930",
+                    quantity=2,
+                    sellable_quantity=2,
+                    average_price=Decimal("120000"),
+                )
+            ],
+        ),
     )
     first_app, first_engine = build_test_app(
         settings=Settings(
@@ -24072,9 +24145,16 @@ def test_live_monitoring_sell_rechecks_executable_bid_after_position_reservation
     engine.dispose()
 
 
-def test_live_krx_single_price_protective_sell_binds_final_bid() -> None:
+def test_live_krx_single_price_protective_sell_binds_final_bid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     triggered_at = datetime(2026, 9, 10, 7, 0, tzinfo=UTC)
     executable_bid = Decimal("99")
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        lambda **_kwargs: triggered_at,
+    )
 
     class SinglePriceBidAdapter(StubBrokerAdapter):
         def get_live_market_context(self, access_token: str, **kwargs: object):
@@ -25604,7 +25684,10 @@ def test_scope_recovery_observer_cancelled_during_snapshot_cannot_release_or_sub
     engine.dispose()
 
 
-def test_dispatch_expires_stale_first_attempt_next_open_job_without_authentication() -> None:
+def test_dispatch_keeps_same_day_krx_next_open_job_orderable_after_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
             provider="kis",
@@ -25614,6 +25697,7 @@ def test_dispatch_expires_stale_first_attempt_next_open_job_without_authenticati
         ),
         token_grant=build_token_grant(),
         order_placement=build_order_placement(),
+        krx_market_open=True,
     )
     app, engine = build_test_app(
         settings=Settings(
@@ -25650,6 +25734,18 @@ def test_dispatch_expires_stale_first_attempt_next_open_job_without_authenticati
     )
     item_id = created.json()["persisted_execution_item_ids"][0]
 
+    def complete_claimed_job(*, db, job_id, claim_locked_at, **_kwargs):
+        return execution_jobs_service._finish_job(
+            db=db,
+            job_id=job_id,
+            expected_locked_at=claim_locked_at,
+            status="completed",
+            last_error=None,
+            plan_item_status="broker_order_submitted",
+        )
+
+    monkeypatch.setattr(execution_jobs_service, "_dispatch_job", complete_claimed_job)
+
     stale_dispatch_at = datetime(2024, 1, 3, 0, 5, 1, tzinfo=UTC)
     with app.state.db_session_factory() as session:
         result = dispatch_due_execution_jobs(
@@ -25660,14 +25756,15 @@ def test_dispatch_expires_stale_first_attempt_next_open_job_without_authenticati
         )
 
     assert result.status_code == 200
-    assert result.payload["failed_job_count"] == 1
-    assert result.payload["jobs"][0]["status"] == "expired"
-    assert broker_adapter.authenticate_calls == 0
+    assert result.payload["completed_job_count"] == 1
+    assert result.payload["failed_job_count"] == 0
+    assert result.payload["jobs"][0]["status"] == "completed"
+    assert broker_adapter.authenticate_calls >= 1
     assert broker_adapter.order_calls == []
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        assert item.status == "next_open_buy_expired"
+        assert item.status == "broker_order_submitted"
         assert session.scalars(select(BrokerOrder)).all() == []
     engine.dispose()
 
@@ -25882,7 +25979,10 @@ def test_unrelated_order_does_not_waive_stale_next_open_expiry() -> None:
     engine.dispose()
 
 
-def test_transient_krx_calendar_failure_retries_then_submits_within_grace() -> None:
+def test_transient_krx_calendar_failure_retries_then_submits_within_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     first_attempt_at = datetime(2026, 9, 10, 0, 0, 1, tzinfo=UTC)
     retry_at = first_attempt_at + timedelta(seconds=15)
     broker_adapter = StubBrokerAdapter(
@@ -25970,7 +26070,10 @@ def test_transient_krx_calendar_failure_retries_then_submits_within_grace() -> N
     engine.dispose()
 
 
-def test_same_cycle_next_open_jobs_share_one_authoritative_calendar_lookup() -> None:
+def test_same_cycle_next_open_jobs_share_one_authoritative_calendar_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     dispatch_at = datetime(2026, 9, 10, 0, 0, 1, tzinfo=UTC)
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -26044,7 +26147,7 @@ def test_same_cycle_next_open_jobs_share_one_authoritative_calendar_lookup() -> 
     engine.dispose()
 
 
-def test_same_cycle_elapsed_time_expires_later_next_open_jobs_before_claim(
+def test_same_cycle_elapsed_time_keeps_same_day_krx_next_open_jobs_claimable(
     monkeypatch,
 ) -> None:
     dispatch_at = datetime(2026, 9, 10, 0, 0, 1, tzinfo=UTC)
@@ -26120,10 +26223,13 @@ def test_same_cycle_elapsed_time_expires_later_next_open_jobs_before_claim(
             now=dispatch_at,
         )
 
-    assert result.payload["completed_job_count"] == 1
-    assert result.payload["failed_job_count"] == 1
-    assert len(dispatched_job_ids) == 1
-    assert sorted(job["status"] for job in result.payload["jobs"]) == ["completed", "expired"]
+    assert result.payload["completed_job_count"] == 2
+    assert result.payload["failed_job_count"] == 0
+    assert len(dispatched_job_ids) == 2
+    assert [job["status"] for job in result.payload["jobs"]] == [
+        "completed",
+        "completed",
+    ]
     assert broker_adapter.order_calls == []
     engine.dispose()
 
@@ -26227,9 +26333,8 @@ def test_next_open_calendar_guard_does_not_revive_a_concurrently_cancelled_item(
     engine.dispose()
 
 
-def test_krx_calendar_unavailable_through_grace_expires_without_order() -> None:
+def test_krx_calendar_unavailable_after_grace_remains_retryable() -> None:
     near_deadline = datetime(2026, 9, 10, 0, 4, 50, tzinfo=UTC)
-    deadline = datetime(2026, 9, 10, 0, 5, 0, tzinfo=UTC)
     broker_adapter = StubBrokerAdapter(
         config=BrokerConfig(
             provider="kis",
@@ -26283,18 +26388,19 @@ def test_krx_calendar_unavailable_through_grace_expires_without_order() -> None:
             now=near_deadline,
         )
     assert first.payload["jobs"][0]["status"] == "retrying"
-    assert first.payload["jobs"][0]["scheduled_for"] == deadline.isoformat()
+    first_retry_at = datetime.fromisoformat(first.payload["jobs"][0]["scheduled_for"])
+    assert first_retry_at > near_deadline
 
     with app.state.db_session_factory() as session:
         final = dispatch_due_execution_jobs(
             settings=app.state.settings,
             db=session,
             adapter=broker_adapter,
-            now=deadline,
+            now=first_retry_at,
         )
-    assert final.payload["failed_job_count"] == 1, final.payload
-    assert final.payload["jobs"][0]["status"] == "expired"
-    assert final.payload["jobs"][0]["last_error"] == "krx_calendar_unavailable_at_deadline"
+    assert final.payload["failed_job_count"] == 0, final.payload
+    assert final.payload["jobs"][0]["status"] == "retrying"
+    assert final.payload["jobs"][0]["last_error"] == "krx_calendar_unavailable"
     assert broker_adapter.order_calls == []
     engine.dispose()
 
@@ -26896,7 +27002,9 @@ def test_live_automated_krx_buy_requires_bid_for_final_cost_evidence() -> None:
 def test_terminal_next_open_loss_latch_is_released_without_resurrecting_source(
     source_terminal_status: str,
     source_job_status: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     app, engine, broker_adapter, source_item_id, job_id, blocked_at = (
         _build_blocked_next_open_recovery_scenario(
             required_healthy_observations=2,
@@ -26907,25 +27015,15 @@ def test_terminal_next_open_loss_latch_is_released_without_resurrecting_source(
     client = TestClient(app)
 
     expired_at = blocked_at + timedelta(seconds=301)
-    if source_terminal_status == "next_open_buy_expired":
-        with app.state.db_session_factory() as session:
-            expired = dispatch_due_execution_jobs(
-                settings=app.state.settings,
-                db=session,
-                adapter=broker_adapter,
-                now=expired_at,
-            )
-        assert expired.payload["failed_job_count"] == 1
-    else:
-        with app.state.db_session_factory() as session:
-            source_item = session.get(ExecutionPlanItem, source_item_id)
-            source_job = session.get(ExecutionJob, job_id)
-            assert source_item is not None
-            assert source_job is not None
-            source_item.status = source_terminal_status
-            source_job.status = source_job_status
-            source_job.locked_at = None
-            session.commit()
+    with app.state.db_session_factory() as session:
+        source_item = session.get(ExecutionPlanItem, source_item_id)
+        source_job = session.get(ExecutionJob, job_id)
+        assert source_item is not None
+        assert source_job is not None
+        source_item.status = source_terminal_status
+        source_job.status = source_job_status
+        source_job.locked_at = None
+        session.commit()
     assert broker_adapter.order_calls == []
 
     observer_item_id = _create_watch_buy_candidate(
@@ -30590,4 +30688,732 @@ def test_non_kis_protective_sell_requires_exact_current_account_authority(
         assert submitted.json()["block_reason"] == expected_block_reason
         assert submitted.json()["order"]["status"] == "manual_review_required"
         assert adapter.order_calls == []
+    engine.dispose()
+
+
+def test_final_daily_new_buy_cap_counts_krx_market_date_cohort_once() -> None:
+    adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        ),
+        token_grant=build_token_grant(),
+        order_placement=build_order_placement(),
+    )
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="paper",
+        kis_app_key="paper-key",
+        kis_app_secret="paper-secret",
+        kis_account_number="12345678",
+        kis_account_product_code="01",
+        exec_agent_max_daily_new_buy_notional=Decimal("1200"),
+    )
+    app, engine = build_test_app(settings=settings, broker_adapter=adapter)
+    settings = app.state.settings
+    market_date = date(2026, 11, 5)
+
+    def item(
+        *,
+        item_id: str,
+        status: str,
+        quantity: int,
+        limit_price: Decimal,
+    ) -> ExecutionPlanItem:
+        risk_context, quantity_policy = _bound_kis_item_payloads(
+            settings=settings,
+            risk_context={"exchange": "KRX"},
+            quantity_policy={"kind": "shares", "quantity": quantity},
+        )
+        return ExecutionPlanItem(
+            id=item_id,
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="intraday_watch_buy",
+            status=status,
+            provider="kis",
+            venue="KRX",
+            asset_class="stock",
+            quantity_policy=quantity_policy,
+            limit_price=limit_price,
+            risk_context=risk_context,
+        )
+
+    with app.state.db_session_factory() as session:
+        uncertain_item = item(
+            item_id="daily-cap-uncertain-item",
+            status="broker_order_submission_pending",
+            quantity=5,
+            limit_price=Decimal("100"),
+        )
+        filled_item = item(
+            item_id="daily-cap-filled-item",
+            status="filled",
+            quantity=2,
+            limit_price=Decimal("100"),
+        )
+        us_risk_context, us_quantity_policy = _bound_kis_item_payloads(
+            settings=settings,
+            risk_context={"exchange": "NASD"},
+            quantity_policy={"kind": "shares", "quantity": 20},
+        )
+        same_account_us_item = ExecutionPlanItem(
+            id="daily-cap-same-account-us-item",
+            plan_item_index=2,
+            symbol="AAPL",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="filled",
+            provider="kis",
+            venue="kis",
+            asset_class="us_equity",
+            quantity_policy=us_quantity_policy,
+            limit_price=Decimal("100"),
+            risk_context=us_risk_context,
+        )
+        current_item = item(
+            item_id="daily-cap-current-item",
+            status="broker_order_submission_pending",
+            quantity=6,
+            limit_price=Decimal("100"),
+        )
+        session.add(
+            ExecutionPlan(
+                external_plan_id="daily-cap-current-market-cohort",
+                source="test",
+                market_date=market_date,
+                mode="paper",
+                status="accepted",
+                items=[
+                    uncertain_item,
+                    filled_item,
+                    same_account_us_item,
+                    current_item,
+                ],
+            )
+        )
+        session.flush()
+        uncertain_order = BrokerOrder(
+            execution_plan_item_id=uncertain_item.id,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="daily-cap-uncertain-order",
+            symbol="005930",
+            side="buy",
+            status="submission_pending",
+            quantity=5,
+            limit_price=Decimal("100"),
+        )
+        current_order = BrokerOrder(
+            execution_plan_item_id=current_item.id,
+            broker_name="kis",
+            mode="paper",
+            idempotency_key="daily-cap-current-order",
+            symbol="005930",
+            side="buy",
+            status="submission_pending",
+            quantity=6,
+            limit_price=Decimal("100"),
+        )
+        session.add_all([uncertain_order, current_order])
+        session.flush()
+
+        failure = (
+            broker_orders_service._evaluate_final_daily_new_buy_notional_boundary(
+                settings=settings,
+                db=session,
+                adapter=adapter,
+                command=PlaceOrderRequest(
+                    idempotency_key="daily-cap-current-order",
+                    execution_plan_item_id=current_item.id,
+                    provider="kis",
+                    asset_class="stock",
+                    symbol="005930",
+                    side="buy",
+                    quantity=6,
+                    order_type="limit",
+                    limit_price=Decimal("100"),
+                    time_in_force="day",
+                    exchange="KRX",
+                ),
+                plan_item=current_item,
+                request_source="monitoring:intraday_target_stop_monitor",
+                exclude_order_id=current_order.id,
+            )
+        )
+
+    assert failure is not None
+    assert failure.block_reason == "daily_new_buy_cap_reached"
+    assert failure.metrics["daily_new_buy_notional_used"] == "700"
+    assert failure.metrics["candidate_notional"] == "600"
+    assert failure.metrics["projected_daily_new_buy_notional"] == "1300"
+    assert failure.metrics["daily_new_buy_notional_cap"] == "1200"
+    assert adapter.order_calls == []
+    engine.dispose()
+
+
+def test_final_vol_corr_cap_uses_current_holdings_without_double_capping() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        vol_corr_sizing_enabled=True,
+        vol_corr_missing_data_behavior="conservative",
+        vol_corr_missing_data_multiplier=Decimal("0.50"),
+    )
+    adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        )
+    )
+    item = ExecutionPlanItem(
+        id="final-vol-corr-item",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="watch_buy_triggered",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 24,
+            "sizing_adjustment": {
+                "vol_corr_cap": {"baseline_quantity": 40},
+            },
+        },
+        risk_context={"realized_volatility_pct": "8.0"},
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="final-vol-corr-order",
+        execution_plan_item_id=item.id,
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=24,
+        order_type="limit",
+        limit_price=Decimal("70000"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+    snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("5000000"),
+        observed_at=datetime(2026, 11, 5, 1, 0, tzinfo=UTC),
+        source="stub:final-vol-corr",
+        holdings=[BrokerAccountHolding(symbol="000660", quantity=3)],
+    )
+
+    failure = broker_orders_service._evaluate_final_vol_corr_quantity_boundary(
+        settings=settings,
+        adapter=adapter,
+        command=command,
+        plan_item=item,
+        request_source="monitoring:intraday_target_stop_monitor",
+        snapshot=snapshot,
+        snapshot_error=None,
+    )
+
+    assert failure is not None
+    assert failure.block_reason == "vol_corr_quantity_cap_changed"
+    assert failure.metrics["baseline_quantity"] == 40
+    assert failure.metrics["submitted_quantity"] == 24
+    assert failure.metrics["capped_quantity"] == 10
+    assert failure.metrics["vol_corr_cap_reason"] == (
+        "very_high_volatility+missing_data_conservative"
+    )
+    assert adapter.order_calls == []
+
+
+def test_final_vol_corr_cap_reuses_exec_agent_sizing_baseline() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        vol_corr_sizing_enabled=True,
+        vol_corr_missing_data_behavior="conservative",
+        vol_corr_missing_data_multiplier=Decimal("0.50"),
+    )
+    adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        )
+    )
+    item = ExecutionPlanItem(
+        id="final-vol-corr-exec-agent-item",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="watch_buy_triggered",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        quantity_policy={"kind": "shares", "quantity": 24},
+        risk_context={
+            "realized_volatility_pct": "8.0",
+            "exec_agent_decision": {
+                "sizing_caps": {"baseline_quantity": 40},
+            },
+        },
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="final-vol-corr-exec-agent-order",
+        execution_plan_item_id=item.id,
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=24,
+        order_type="limit",
+        limit_price=Decimal("70000"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+
+    failure = broker_orders_service._evaluate_final_vol_corr_quantity_boundary(
+        settings=settings,
+        adapter=adapter,
+        command=command,
+        plan_item=item,
+        request_source="monitoring:intraday_target_stop_monitor",
+        snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("5000000"),
+            observed_at=datetime(2026, 11, 5, 1, 0, tzinfo=UTC),
+            source="stub:final-vol-corr-exec-agent",
+            holdings=[BrokerAccountHolding(symbol="000660", quantity=3)],
+        ),
+        snapshot_error=None,
+    )
+
+    assert failure is not None
+    assert failure.metrics["baseline_quantity"] == 40
+    assert failure.metrics["submitted_quantity"] == 24
+    assert failure.metrics["capped_quantity"] == 10
+    assert adapter.order_calls == []
+
+
+def test_final_vol_corr_cap_raises_stale_plan_volatility_to_live_intraday_range() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        vol_corr_sizing_enabled=True,
+    )
+    adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        )
+    )
+    item = ExecutionPlanItem(
+        id="final-vol-corr-live-range-item",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="watch_buy_triggered",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        quantity_policy={
+            "kind": "shares",
+            "quantity": 8,
+            "sizing_adjustment": {"vol_corr_cap": {"baseline_quantity": 10}},
+        },
+        risk_context={"realized_volatility_pct": "1.0"},
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="final-vol-corr-live-range-order",
+        execution_plan_item_id=item.id,
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=8,
+        order_type="limit",
+        limit_price=Decimal("105"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+    observed_at = datetime(2026, 11, 5, 1, 0, tzinfo=UTC)
+    evidence = broker_orders_service.AutomatedKisBuyMarketEvidence(
+        context=BrokerLiveMarketContext(
+            symbol="005930",
+            exchange="KRX",
+            observed_at=observed_at,
+            bid=Decimal("104"),
+            ask=Decimal("105"),
+            freshness_source="kis_exchange_orderbook_time",
+        ),
+        is_domestic=True,
+        liquidity_snapshot=BrokerIntradayLiquiditySnapshot(
+            symbol="005930",
+            exchange="KRX",
+            observed_at=observed_at,
+            volume=Decimal("100000"),
+            turnover=Decimal("10000000000"),
+            day_high=Decimal("110"),
+            day_low=Decimal("100"),
+            freshness_source="kis_exchange_orderbook_time",
+        ),
+    )
+
+    failure = broker_orders_service._evaluate_final_vol_corr_quantity_boundary(
+        settings=settings,
+        adapter=adapter,
+        command=command,
+        plan_item=item,
+        request_source="monitoring:intraday_target_stop_monitor",
+        snapshot=BrokerAccountSnapshot(
+            available_cash=Decimal("5000000"),
+            observed_at=observed_at,
+            source="stub:final-vol-corr-live-range",
+        ),
+        snapshot_error=None,
+        observed_at=observed_at,
+        market_evidence=evidence,
+    )
+
+    assert failure is not None
+    assert failure.block_reason == "vol_corr_quantity_cap_changed"
+    assert failure.metrics["volatility_source"] == "realized_volatility_pct"
+    assert failure.metrics["volatility_pct"] == "10.0000"
+    assert failure.metrics["capped_quantity"] == 5
+    assert failure.metrics["live_intraday_range_observed_at"] == observed_at.isoformat()
+
+
+def test_final_vol_corr_context_drops_evidence_for_no_longer_held_symbol() -> None:
+    item = ExecutionPlanItem(
+        id="final-vol-corr-current-holdings-item",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="watch_buy_triggered",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        quantity_policy={"kind": "shares", "quantity": 24},
+        risk_context={
+            "max_holding_correlation": "0.10",
+            "correlation_symbol": "035420",
+            "holding_return_pcts_by_symbol": {
+                "035420": ["1", "2", "3"],
+                "000660": ["3", "2", "1"],
+            },
+        },
+    )
+
+    context = broker_orders_service._final_vol_corr_context(
+        plan_item=item,
+        snapshot=BrokerAccountSnapshot(
+            observed_at=datetime(2026, 11, 5, 1, 0, tzinfo=UTC),
+            holdings=[BrokerAccountHolding(symbol="000660", quantity=3)],
+        ),
+    )
+
+    assert context["holding_symbols"] == ["000660"]
+    assert "max_holding_correlation" not in context
+    assert "correlation_symbol" not in context
+    assert context["holding_return_pcts_by_symbol"] == {
+        "000660": ["3", "2", "1"]
+    }
+
+
+def test_final_account_drawdown_boundary_uses_fresh_severe_loss_snapshot() -> None:
+    observed_at = datetime(2026, 11, 5, 1, 0, tzinfo=UTC)
+    settings = Settings(
+        runtime_mode="paper",
+        account_drawdown_gate_enabled=True,
+        account_daily_total_asset_drawdown_pct=Decimal("0"),
+        account_daily_total_asset_drawdown_krw=Decimal("0"),
+        account_weekly_total_asset_drawdown_pct=Decimal("0"),
+        account_unrealized_loss_abs_krw=Decimal("0"),
+        account_unrealized_loss_pct=Decimal("0"),
+        account_severe_holding_loss_pct=Decimal("5"),
+    )
+    adapter = StubBrokerAdapter(
+        config=BrokerConfig(
+            provider="kis",
+            mode="paper",
+            configured=True,
+            api_base_url=KIS_PAPER_API_BASE_URL,
+        )
+    )
+    item = ExecutionPlanItem(
+        id="final-drawdown-item",
+        plan_item_index=0,
+        symbol="005930",
+        side="buy",
+        intent="intraday_watch_buy",
+        status="watch_buy_triggered",
+        provider="kis",
+        venue="KRX",
+        asset_class="stock",
+        quantity_policy={"kind": "shares", "quantity": 1},
+        risk_context={},
+    )
+    command = PlaceOrderRequest(
+        idempotency_key="final-drawdown-order",
+        execution_plan_item_id=item.id,
+        provider="kis",
+        asset_class="stock",
+        symbol="005930",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=Decimal("70000"),
+        time_in_force="day",
+        exchange="KRX",
+    )
+    snapshot = BrokerAccountSnapshot(
+        available_cash=Decimal("5000000"),
+        buying_power=Decimal("5000000"),
+        observed_at=observed_at,
+        source="stub:final-drawdown",
+        total_asset_value=Decimal("10000000"),
+        previous_total_asset_value=Decimal("10000000"),
+        asset_change_amount=Decimal("0"),
+        unrealized_pnl=Decimal("-80000"),
+        holdings=[
+            BrokerAccountHolding(
+                symbol="000660",
+                quantity=3,
+                unrealized_pnl=Decimal("-80000"),
+                unrealized_pnl_pct=Decimal("-8"),
+            )
+        ],
+    )
+
+    decision = broker_orders_service._evaluate_final_account_drawdown_boundary(
+        settings=settings,
+        adapter=adapter,
+        command=command,
+        plan_item=item,
+        request_source="monitoring:intraday_target_stop_monitor",
+        snapshot=snapshot,
+        snapshot_error=None,
+        observed_at=observed_at,
+    )
+
+    assert decision is not None
+    assert decision.allowed is False
+    assert decision.gate_name == "severe_holding_unrealized_loss_pct"
+    assert adapter.order_calls == []
+
+
+@pytest.mark.parametrize(
+    ("boundary", "block_reason"),
+    (
+        ("daily", "daily_new_buy_cap_reached"),
+        ("vol_corr", "vol_corr_quantity_cap_changed"),
+        ("drawdown", "severe_holding_unrealized_loss_pct"),
+    ),
+)
+def test_final_dynamic_buy_boundaries_fence_before_broker_call(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    block_reason: str,
+) -> None:
+    app, engine, client, adapter = _build_watch_buy_test_app(
+        order_id=f"must-not-submit-final-{boundary}",
+    )
+    market_date = datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id=f"final-{boundary}-boundary-plan",
+        market_date=market_date,
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "76000",
+            "stop_price": "70000",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    generic_failure = broker_orders_service.AutomatedKisBuySymbolExposureFailure(
+        block_reason=block_reason,
+        message=f"test final {boundary} boundary",
+        metrics={"boundary": boundary},
+    )
+    if boundary == "daily":
+        monkeypatch.setattr(
+            broker_orders_service,
+            "_evaluate_final_daily_new_buy_notional_boundary",
+            lambda **_kwargs: generic_failure,
+        )
+    elif boundary == "vol_corr":
+        monkeypatch.setattr(
+            broker_orders_service,
+            "_evaluate_final_vol_corr_quantity_boundary",
+            lambda **_kwargs: generic_failure,
+        )
+    else:
+        monkeypatch.setattr(
+            broker_orders_service,
+            "_evaluate_final_account_drawdown_boundary",
+            lambda **kwargs: broker_orders_service.evaluate_account_drawdown_gate(
+                settings=kwargs["settings"].model_copy(
+                    update={
+                        "account_daily_total_asset_drawdown_pct": Decimal("0"),
+                        "account_daily_total_asset_drawdown_krw": Decimal("0"),
+                        "account_weekly_total_asset_drawdown_pct": Decimal("0"),
+                        "account_unrealized_loss_abs_krw": Decimal("0"),
+                        "account_unrealized_loss_pct": Decimal("0"),
+                        "account_severe_holding_loss_pct": Decimal("5"),
+                    }
+                ),
+                snapshot=BrokerAccountSnapshot(
+                    observed_at=kwargs["observed_at"],
+                    holdings=[
+                        BrokerAccountHolding(
+                            symbol="000660",
+                            quantity=1,
+                            unrealized_pnl_pct=Decimal("-8"),
+                        )
+                    ],
+                ),
+                order_idempotency_key=kwargs["command"].idempotency_key,
+                execution_plan_item_id=kwargs["plan_item"].id,
+                now=kwargs["observed_at"],
+            ),
+        )
+
+    with app.state.db_session_factory() as session:
+        result = broker_orders_service.place_broker_order(
+            settings=app.state.settings,
+            db=session,
+            adapter=adapter,
+            command=PlaceOrderRequest(
+                idempotency_key=f"final-{boundary}-boundary-order",
+                execution_plan_item_id=item_id,
+                provider="kis",
+                asset_class="stock",
+                symbol="005930",
+                side="buy",
+                quantity=2,
+                order_type="limit",
+                limit_price=Decimal("71000"),
+                time_in_force="day",
+                exchange="KRX",
+            ),
+            request_source="monitoring:intraday_target_stop_monitor",
+        )
+
+    assert result.status_code == 409, result.payload
+    assert result.payload["block_reason"] == block_reason
+    if boundary in {"daily", "vol_corr"}:
+        assert result.payload["preserve_plan_item_status"] is True
+    assert adapter.order_calls == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("authority", "block_reason"),
+    (
+        ("runtime", "hourly_market_observation_stale"),
+        ("core", "core_buy_authority_stale"),
+    ),
+)
+def test_time_derived_buy_authority_is_rechecked_immediately_before_broker_call(
+    monkeypatch: pytest.MonkeyPatch,
+    authority: str,
+    block_reason: str,
+) -> None:
+    app, engine, client, adapter = _build_watch_buy_test_app(
+        order_id=f"must-not-submit-expired-{authority}-authority",
+    )
+    market_date = datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
+    item_id = _create_watch_buy_candidate(
+        client,
+        plan_id=f"expired-{authority}-authority-plan",
+        market_date=market_date,
+        risk_context={
+            "exchange": "KRX",
+            "target_price": "76000",
+            "stop_price": "70000",
+            "trigger_direction": "at_or_above",
+        },
+    )
+    initial_boundary_time = datetime.now(UTC)
+    expired_boundary_time = initial_boundary_time + timedelta(seconds=61)
+    boundary_clock_calls = 0
+    calls = 0
+
+    def advancing_boundary_clock(**_kwargs: object) -> datetime:
+        nonlocal boundary_clock_calls
+        boundary_clock_calls += 1
+        # The first final reference and the pre-Core-lock check are fresh.
+        # Authority becomes stale only while the Core row lock is acquired.
+        if boundary_clock_calls < 5:
+            return initial_boundary_time
+        return expired_boundary_time
+
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        advancing_boundary_clock,
+    )
+
+    if authority == "runtime":
+
+        def runtime_reason(*_args: object, **_kwargs: object) -> str | None:
+            nonlocal calls
+            calls += 1
+            return (
+                block_reason
+                if _kwargs.get("now") == expired_boundary_time
+                else None
+            )
+
+        monkeypatch.setattr(
+            broker_orders_service,
+            "market_scoped_automated_buy_submission_block_reason",
+            runtime_reason,
+        )
+    else:
+
+        def core_reason(**kwargs: object) -> str | None:
+            nonlocal calls
+            calls += 1
+            return block_reason if kwargs.get("now") == expired_boundary_time else None
+
+        monkeypatch.setattr(
+            broker_orders_service,
+            "core_buy_authority_block_reason",
+            core_reason,
+        )
+
+    with app.state.db_session_factory() as session:
+        result = broker_orders_service.place_broker_order(
+            settings=app.state.settings,
+            db=session,
+            adapter=adapter,
+            command=PlaceOrderRequest(
+                idempotency_key=f"expired-{authority}-authority-order",
+                execution_plan_item_id=item_id,
+                provider="kis",
+                asset_class="stock",
+                symbol="005930",
+                side="buy",
+                quantity=2,
+                order_type="limit",
+                limit_price=Decimal("71000"),
+                time_in_force="day",
+                exchange="KRX",
+            ),
+            request_source="monitoring:intraday_target_stop_monitor",
+        )
+
+    assert boundary_clock_calls == 5
+    assert calls >= 4
+    assert result.status_code == 409, result.payload
+    assert result.payload["block_reason"] == block_reason
+    assert adapter.order_calls == []
     engine.dispose()

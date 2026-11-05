@@ -56,6 +56,7 @@ from test_broker_auth import (
     StubBrokerAdapter,
     _seed_exact_strategy_family_for_sell_items,
     _seed_exact_strategy_family_in_session,
+    _use_historical_broker_boundary,
     build_order_placement,
     build_test_app,
     build_token_grant,
@@ -1201,6 +1202,333 @@ def test_trigger_time_buy_agent_is_bypassed_for_persisted_price_line_buy(
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    "legacy_status",
+    (
+        "triggered_pending_agent",
+        "agent_delay",
+        "agent_approved_pending_submit",
+        "agent_rejected",
+    ),
+)
+def test_retired_buy_agent_state_rearms_with_deterministic_sizing(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_status: str,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id=f"plan-retired-buy-agent-{legacy_status}",
+        quantity_policy={"kind": "shares", "quantity": 2},
+    )
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        item.status = legacy_status
+        item.quantity_policy = {
+            "type": "trigger_time_exec_agent_sized",
+            "kind": "trigger_time_exec_agent_sized",
+            "max_budget_krw": "200000",
+            "max_quantity": 2,
+            "quantity": 9,
+        }
+        item.risk_context = {
+            **item.risk_context,
+            "last_trigger_time_exec_agent_interaction": {
+                "decision": {
+                    "decision": "execute_now",
+                    "approved_quantity": 9,
+                }
+            },
+        }
+        session.commit()
+
+    result = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "retired BUY agent state must rearm deterministically",
+            "prices": [_live_price_payload(price="71100.00")],
+        },
+    )
+
+    assert result.status_code == 200
+    payload = result.json()
+    assert payload["submitted_order_count"] == 1, json.dumps(payload)
+    assert captured == []
+    assert len(broker_adapter.order_calls) == 1
+    assert 0 < broker_adapter.order_calls[0].quantity < 9
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.quantity_policy["kind"] == "risk_based"
+        assert item.quantity_policy["max_quantity"] == 2
+        assert "quantity" not in item.quantity_policy
+        assert "last_trigger_time_exec_agent_interaction" not in item.risk_context
+
+    engine.dispose()
+
+
+def test_unrelated_agent_rejection_is_not_rearmed_as_a_buy_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-unrelated-agent-rejection",
+        quantity_policy={"kind": "shares", "quantity": 2},
+    )
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        item.status = "agent_rejected"
+        risk_context = dict(item.risk_context)
+        risk_context.pop("last_trigger_time_exec_agent_interaction", None)
+        risk_context.pop("trigger_time_exec_agent_interactions", None)
+        item.risk_context = risk_context
+        session.commit()
+
+    result = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "unrelated rejected authority must remain terminal",
+            "prices": [_live_price_payload(price="71100.00")],
+        },
+    )
+
+    assert result.status_code == 200
+    assert result.json()["submitted_order_count"] == 0
+    assert captured == []
+    assert broker_adapter.order_calls == []
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.status == "agent_rejected"
+
+    engine.dispose()
+
+
+def test_retired_rejected_buy_is_restored_to_autonomous_symbol_membership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-retired-rejected-autonomous-membership",
+        quantity_policy={"kind": "shares", "quantity": 2},
+    )
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        item.status = "agent_rejected"
+        item.risk_context = {
+            **item.risk_context,
+            "last_trigger_time_exec_agent_interaction": {
+                "decision": {"decision": "execute_now", "quantity": 2}
+            },
+        }
+        session.commit()
+
+        symbols = monitoring.list_autonomous_monitoring_symbols(
+            settings=app.state.settings,
+            db=session,
+            current_market_date=date(2026, 6, 5),
+        )
+
+    assert symbols == ["005930"]
+    assert captured == []
+    assert broker_adapter.order_calls == []
+    engine.dispose()
+
+
+def test_duplicate_retired_rejected_buys_rearm_only_newest_route_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    older_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-retired-rejected-duplicate-older",
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    newer_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-retired-rejected-duplicate-newer",
+        quantity_policy={"kind": "shares", "quantity": 2},
+    )
+    with app.state.db_session_factory() as session:
+        for item_id in (older_id, newer_id):
+            item = session.get(ExecutionPlanItem, item_id)
+            assert item is not None
+            item.status = "agent_rejected"
+            item.risk_context = {
+                **item.risk_context,
+                "last_trigger_time_exec_agent_interaction": {
+                    "decision": {"decision": "execute_now", "quantity": 9}
+                },
+            }
+        session.commit()
+
+    result = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "retired duplicate authority must canonicalize before rearm",
+            "prices": [_live_price_payload(price="71100.00")],
+        },
+    )
+
+    assert result.status_code == 200
+    assert result.json()["submitted_order_count"] == 1
+    assert captured == []
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == newer_id
+    second_result = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "superseded retired duplicate must not reappear next cycle",
+            "prices": [_live_price_payload(price="71100.00")],
+        },
+    )
+    assert second_result.status_code == 200
+    assert second_result.json()["submitted_order_count"] == 0
+    assert len(broker_adapter.order_calls) == 1
+    with app.state.db_session_factory() as session:
+        older = session.get(ExecutionPlanItem, older_id)
+        assert older is not None
+        assert older.status == "superseded"
+    engine.dispose()
+
+
+def test_newer_retired_rejected_buy_supersedes_older_active_route_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    older_active_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-active-duplicate-older",
+        quantity_policy={"kind": "shares", "quantity": 1},
+    )
+    newer_rejected_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-retired-rejected-duplicate-newer-than-active",
+        quantity_policy={"kind": "shares", "quantity": 2},
+    )
+    with app.state.db_session_factory() as session:
+        newer = session.get(ExecutionPlanItem, newer_rejected_id)
+        assert newer is not None
+        newer.status = "agent_rejected"
+        newer.risk_context = {
+            **newer.risk_context,
+            "last_trigger_time_exec_agent_interaction": {
+                "decision": {"decision": "execute_now", "quantity": 9}
+            },
+        }
+        session.commit()
+
+    first_result = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "newest route authority must supersede older active watch",
+            "prices": [_live_price_payload(price="71100.00")],
+        },
+    )
+    assert first_result.status_code == 200
+    assert first_result.json()["submitted_order_count"] == 1
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].execution_plan_item_id == newer_rejected_id
+
+    second_result = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "older active duplicate must stay superseded",
+            "prices": [_live_price_payload(price="71100.00")],
+        },
+    )
+    assert second_result.status_code == 200
+    assert second_result.json()["submitted_order_count"] == 0
+    assert len(broker_adapter.order_calls) == 1
+    assert captured == []
+    with app.state.db_session_factory() as session:
+        older = session.get(ExecutionPlanItem, older_active_id)
+        assert older is not None
+        assert older.status == "superseded"
+    engine.dispose()
+
+
+def test_retired_buy_agent_state_preserves_fixed_share_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
+        monkeypatch=monkeypatch,
+        agent_responses=[],
+    )
+    item_id = _create_intraday_watch_buy(
+        client,
+        plan_id="plan-retired-buy-agent-fixed-shares",
+        quantity_policy={"kind": "shares", "quantity": 2, "max_quantity": 2},
+    )
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        item.status = "agent_approved_pending_submit"
+        original_policy = dict(item.quantity_policy)
+        item.risk_context = {
+            **item.risk_context,
+            "last_trigger_time_exec_agent_interaction": {
+                "decision": {"decision": "execute_now", "quantity": 9}
+            },
+        }
+        session.commit()
+
+    result = client.post(
+        "/monitoring/evaluate",
+        json={
+            "actor": "ops",
+            "source": "test",
+            "reason": "fixed share authority must survive retired BUY-agent cleanup",
+            "prices": [_live_price_payload(price="71100.00")],
+        },
+    )
+
+    assert result.status_code == 200
+    assert result.json()["submitted_order_count"] == 1
+    assert captured == []
+    assert len(broker_adapter.order_calls) == 1
+    assert broker_adapter.order_calls[0].quantity == 2
+    with app.state.db_session_factory() as session:
+        item = session.get(ExecutionPlanItem, item_id)
+        assert item is not None
+        assert item.quantity_policy == original_policy
+        assert "last_trigger_time_exec_agent_interaction" not in item.risk_context
+
+    engine.dispose()
+
+
 def test_trigger_time_buy_agent_is_bypassed_for_intraday_pullback_below_trigger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1643,6 +1971,7 @@ def test_expired_agent_active_target_sell_is_recovered_and_reapproved(
     stale_agent_context: dict[str, object],
     expected_recovery_reason: str,
 ) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
         monkeypatch=monkeypatch,
         agent_responses=[

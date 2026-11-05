@@ -45,6 +45,7 @@ from app.models.runtime import (
     ExecutionPlanItem,
     ExecutionPlanItemAudit,
     ExecutionPosition,
+    RuntimeControlState,
 )
 from app.services import core_handoff_v4
 from app.services import watch_exec_agent_sizing as watch_sizing
@@ -645,7 +646,7 @@ def test_reopens_legacy_price_watch_only_when_cap_matches_direction(
             deferred = eligible.risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
             assert deferred["price_watch_only"] is True
             assert deferred["retry_after"] == "2026-10-14T01:01:00+00:00"
-            assert deferred["expires_at"] == "2026-10-14T06:30:00+00:00"
+            assert "expires_at" not in deferred
             assert eligible.risk_context["reward_risk_max_entry_price"] == "6657.2237"
         assert structural.status == "exec_agent_rejected"
         audit = session.scalar(
@@ -656,6 +657,205 @@ def test_reopens_legacy_price_watch_only_when_cap_matches_direction(
             )
         )
         assert (audit is not None) is expected_reopened
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "reason_family", "expected_reopened"),
+    [
+        ("allowed_action_envelope_blocked", "action_envelope", True),
+        ("minimum_notional_unreachable", "agent_rejection", True),
+        ("missing_target_price", "agent_rejection", False),
+    ],
+)
+def test_reopens_only_legacy_live_dynamic_terminal_rejections_once(
+    reason_code: str,
+    reason_family: str,
+    expected_reopened: bool,
+) -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        item = _watch_item(
+            item_id=f"legacy-dynamic-{reason_code}",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "76000",
+                "stop_loss_price": "69000",
+            },
+        )
+        item.provider = "kis"
+        item.venue = "KRX"
+        item.asset_class = "stock"
+        original_policy = dict(item.quantity_policy)
+        item.status = "exec_agent_rejected"
+        item.quantity_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": "legacy terminal decision",
+            "reason_code": reason_code,
+            "reason_family": reason_family,
+            "rejection_disposition": "terminal",
+            "previous_policy": original_policy,
+        }
+        session.add(
+            ExecutionPlan(
+                external_plan_id=f"plan-{reason_code}",
+                source="core-short-term-decider",
+                market_date=date(2026, 10, 14),
+                mode="live",
+                status="accepted",
+                items=[item],
+            )
+        )
+        session.commit()
+
+        reopened = watch_sizing._reopen_live_dynamic_terminal_rejections(
+            db=session,
+            settings=settings,
+            market_date=date(2026, 10, 15),
+            now=datetime(2026, 10, 15, 0, 0, tzinfo=UTC),
+        )
+        session.commit()
+
+        assert reopened == ([item.id] if expected_reopened else [])
+        if expected_reopened:
+            assert item.status == "watch_sizing_pending"
+            assert item.quantity_policy == original_policy
+            assert (
+                watch_sizing.LIVE_DYNAMIC_WATCH_REOPEN_MARKER_KEY
+                in item.risk_context
+            )
+            assert item.risk_context[
+                watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY
+            ]["persistent_live_dynamic_filter"] is True
+            assert watch_sizing._reopen_live_dynamic_terminal_rejections(
+                db=session,
+                settings=settings,
+                market_date=date(2026, 10, 15),
+                now=datetime(2026, 10, 15, 0, 1, tzinfo=UTC),
+            ) == []
+        else:
+            assert item.status == "exec_agent_rejected"
+
+    engine.dispose()
+
+
+def test_candidate_plan_scope_keeps_old_live_waits_but_only_current_next_open() -> None:
+    settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    today = date(2026, 10, 15)
+    now = datetime(2026, 10, 15, 1, 0, tzinfo=UTC)
+
+    old_intraday = _watch_item(
+        item_id="old-live-intraday",
+        risk_context={"target_price": "76000", "stop_loss_price": "69000"},
+    )
+    old_next_open = _next_open_watch_item(item_id="old-live-next-open")
+    old_next_open.plan_item_index = 1
+    current_next_open = _next_open_watch_item(item_id="current-live-next-open")
+    future_intraday = _watch_item(
+        item_id="future-live-intraday",
+        risk_context={"target_price": "76000", "stop_loss_price": "69000"},
+    )
+    completed_intraday = _watch_item(
+        item_id="completed-live-intraday",
+        risk_context={"target_price": "76000", "stop_loss_price": "69000"},
+    )
+    paper_old = _watch_item(
+        item_id="old-paper-intraday",
+        risk_context={"target_price": "76000", "stop_loss_price": "69000"},
+    )
+    paper_current = _watch_item(
+        item_id="current-paper-intraday",
+        risk_context={"target_price": "76000", "stop_loss_price": "69000"},
+    )
+
+    with session_factory() as session:
+        session.add_all(
+            [
+                ExecutionPlan(
+                    external_plan_id="old-live-mixed",
+                    source="test",
+                    market_date=today - timedelta(days=1),
+                    mode="live",
+                    status="accepted",
+                    items=[old_intraday, old_next_open],
+                ),
+                ExecutionPlan(
+                    external_plan_id="current-live-next-open",
+                    source="test",
+                    market_date=today,
+                    mode="live",
+                    status="accepted",
+                    items=[current_next_open],
+                ),
+                ExecutionPlan(
+                    external_plan_id="future-live-intraday",
+                    source="test",
+                    market_date=today + timedelta(days=1),
+                    mode="live",
+                    status="accepted",
+                    items=[future_intraday],
+                ),
+                ExecutionPlan(
+                    external_plan_id="completed-live-intraday",
+                    source="test",
+                    market_date=today - timedelta(days=1),
+                    mode="live",
+                    status="completed",
+                    items=[completed_intraday],
+                ),
+                ExecutionPlan(
+                    external_plan_id="old-paper-intraday",
+                    source="test",
+                    market_date=today - timedelta(days=1),
+                    mode="paper",
+                    status="accepted",
+                    items=[paper_old],
+                ),
+                ExecutionPlan(
+                    external_plan_id="current-paper-intraday",
+                    source="test",
+                    market_date=today,
+                    mode="paper",
+                    status="accepted",
+                    items=[paper_current],
+                ),
+            ]
+        )
+        session.commit()
+
+        live_plans = watch_sizing._load_candidate_plans(
+            settings=settings,
+            db=session,
+            market_date=today,
+        )
+        assert {plan.external_plan_id for plan in live_plans} == {
+            "old-live-mixed",
+            "current-live-next-open",
+        }
+        mixed = next(
+            plan for plan in live_plans if plan.external_plan_id == "old-live-mixed"
+        )
+        assert [
+            item.id for item in watch_sizing._unsized_watch_items(mixed, now=now)
+        ] == ["old-live-intraday"]
+
+        paper_plans = watch_sizing._load_candidate_plans(
+            settings=settings.model_copy(update={"runtime_mode": "paper"}),
+            db=session,
+            market_date=today,
+        )
+        assert [plan.external_plan_id for plan in paper_plans] == [
+            "current-paper-intraday"
+        ]
 
     engine.dispose()
 
@@ -2480,7 +2680,7 @@ def test_live_watch_buy_vetoes_risk_off_breadth_before_submission() -> None:
     assert approval.quantity is None
     assert approval.reason == "market_breadth_risk_off"
     assert summary is not None
-    assert summary["status"] == "watch_buy_rejected"
+    assert summary["status"] == "watch_buy_triggered_blocked"
     assert payload is not None
     assert payload["skipped_quantity"] == 10
     assert payload["skipped_notional_krw"] == "710000.0000"
@@ -2748,13 +2948,25 @@ def test_monitoring_cycle_persists_live_veto_status_and_operator_summaries() -> 
                 ),
             )
             assert resume_result.outcome == "applied"
+            observation_at = datetime(2026, 8, 18, 1, 5, tzinfo=UTC)
+            control = session.get(RuntimeControlState, "global")
+            assert control is not None
+            control.hourly_risk_off_context = {
+                **(control.hourly_risk_off_context or {}),
+                "last_market_observation_id": "live-veto-cycle",
+                "last_market_observation_market_date": "2026-08-18",
+                "last_market_observation_received_at": observation_at.isoformat(),
+                "last_market_observation_source_observed_at": observation_at.isoformat(),
+                "last_market_observation_risk_flags": 0,
+            }
+            session.commit()
 
             result = evaluate_monitoring(
                 settings=settings,
                 db=session,
                 adapter=WatchSizingBrokerStub(reconcile_payloads=[]),
                 command=MonitoringEvaluationRequest(prices=[_price()]),
-                now=datetime(2026, 8, 18, 1, 5, tzinfo=UTC),
+                now=observation_at,
             )
             session.commit()
 
@@ -3109,8 +3321,110 @@ def test_typed_snapshot_completeness_blocks_live_watch_sizing(
 
     assert account_context["available"] is True
     assert account_context["buy_sizing_available"] is False
+    assert account_context["holdings_complete"] is snapshot_kwargs.get(
+        "holdings_complete", True
+    )
+    assert account_context["open_orders_complete"] is snapshot_kwargs.get(
+        "open_orders_complete", True
+    )
     assert account_context["buy_sizing_block_reason"] == expected_reason
     assert watch_sizing._live_buy_sizing_block_reason(account_context) == expected_reason
+
+
+def test_watch_sizing_guardrail_uses_live_sector_and_enriched_account_mapping(
+    monkeypatch,
+) -> None:
+    candidate = _candidate_payload(
+        _watch_item(
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "76000",
+                "stop_price": "69000",
+            }
+        )
+    )
+    candidate["market_date"] = "2026-11-05"
+    candidate["source_market_date"] = "2026-11-04"
+    account_context = _fresh_account_context(
+        holdings_complete=True,
+        open_orders_complete=True,
+        holdings=[{"symbol": "000660", "quantity": 2}],
+        open_orders=[
+            {
+                "symbol": "005930",
+                "side": "buy",
+                "quantity": 1,
+                "remaining_quantity": 1,
+            }
+        ],
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "load_live_market_regime_context",
+        lambda **_: {"market_context_status": "ready", "market_regime_context": {}},
+    )
+
+    def load_sector(**kwargs):
+        assert kwargs["symbol"] == "005930"
+        assert kwargs["source_market_date"] == "2026-11-04"
+        return {
+            "sector_context_status": "ready",
+            "sector_identity": {"sector_name": "Semiconductors"},
+            "sector_context": {
+                "source": "kai-trading-core:/market/live-sector-projection",
+                "symbol": "005930",
+                "market": "KOSPI",
+                "market_date": "2026-11-05",
+                "observed_at": "2026-11-05T00:05:00+00:00",
+                "sector_name": "Semiconductors",
+                "relative_return_pct": "-0.4",
+            },
+        }
+
+    monkeypatch.setattr(watch_sizing, "load_live_sector_regime_context", load_sector)
+
+    def enrich_account(**kwargs):
+        assert kwargs["source_market_date"] == "2026-11-04"
+        enriched = deepcopy(kwargs["account_context"])
+        enriched["sector_mapping_complete"] = True
+        enriched["holdings"][0]["sector_name"] = "Semiconductors"
+        enriched["open_orders"][0]["sector_name"] = "Semiconductors"
+        return enriched
+
+    monkeypatch.setattr(
+        watch_sizing,
+        "enrich_account_context_with_live_sector_identity",
+        enrich_account,
+    )
+
+    def guardrail(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            rejected=False,
+            action="allow",
+            reason_code="market_breadth_normal",
+            audit={"action": "allow"},
+        )
+
+    monkeypatch.setattr(watch_sizing, "evaluate_market_regime_guardrail", guardrail)
+
+    watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="live", automation_enabled=True),
+        candidate=candidate,
+        account_context=account_context,
+    )
+
+    context = captured["context"]
+    assert context["sector_context"]["sector_name"] == "Semiconductors"
+    regime_account = captured["account_context"]
+    assert regime_account["sector_mapping_complete"] is True
+    assert regime_account["holdings"][0]["sector_name"] == "Semiconductors"
+    assert regime_account["open_orders"][0]["sector_name"] == "Semiconductors"
+    assert captured["market_date"] == datetime.now(UTC).astimezone(
+        ZoneInfo("Asia/Seoul")
+    ).date()
 
 
 def test_stale_open_order_unknown_broker_status_blocks_watch_sizing_before_agent(tmp_path, monkeypatch) -> None:
@@ -4731,7 +5045,7 @@ def test_apply_decisions_clamps_agent_approval_that_exceeds_cap() -> None:
     assert policy["allowed_action_envelope"]["max_quantity"] == 11
 
 
-def test_apply_decisions_rejects_when_allowed_action_envelope_has_no_quantity() -> None:
+def test_apply_decisions_defers_live_watch_when_allowed_action_envelope_has_no_quantity() -> None:
     settings = Settings(runtime_mode="live")
     plan = ExecutionPlan(
         id="plan-1",
@@ -4780,15 +5094,16 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_has_no_quantity() 
     )
 
     assert summary["approved"] == 0
-    assert summary["rejected"] == 1
-    assert plan.items[0].status == "exec_agent_rejected"
-    _assert_canonical_terminal_rejection_policy(
-        plan.items[0].quantity_policy,
-        reason_code="allowed_action_envelope_blocked",
-    )
+    assert summary["rejected"] == 0
+    assert summary["deferred"] == 1
+    assert plan.items[0].status == "watch_sizing_pending"
+    deferred = plan.items[0].risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
+    assert deferred["reason_code"] == "allowed_action_envelope_blocked"
+    assert deferred["reason_family"] == "action_envelope"
+    assert deferred["persistent_live_dynamic_filter"] is True
 
 
-def test_apply_decisions_rejects_when_allowed_action_envelope_has_hard_reject_reason() -> None:
+def test_apply_decisions_defers_live_watch_when_account_state_has_existing_holding() -> None:
     settings = Settings(runtime_mode="live")
     plan = ExecutionPlan(
         id="plan-1",
@@ -4835,19 +5150,17 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_has_hard_reject_re
         },
     )
 
-    policy = plan.items[0].quantity_policy
     assert summary["approved"] == 0
-    assert summary["rejected"] == 1
-    assert plan.items[0].status == "exec_agent_rejected"
-    assert policy["reason_code"] == "allowed_action_envelope_blocked"
-    _assert_canonical_terminal_rejection_policy(
-        policy,
-        reason_code="allowed_action_envelope_blocked",
-    )
-    assert "existing_holding" in policy["reason"]
+    assert summary["rejected"] == 0
+    assert summary["deferred"] == 1
+    assert plan.items[0].status == "watch_sizing_pending"
+    deferred = plan.items[0].risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
+    assert deferred["reason_code"] == "allowed_action_envelope_blocked"
+    assert deferred["reason_family"] == "account_state"
+    assert "existing_holding" in deferred["reason"]
 
 
-def test_apply_decisions_rejects_when_allowed_action_envelope_disallows_buy_downsize(monkeypatch) -> None:
+def test_apply_decisions_defers_live_watch_when_action_envelope_temporarily_disallows_buy(monkeypatch) -> None:
     settings = Settings(runtime_mode="live")
     plan = ExecutionPlan(
         id="plan-1",
@@ -4904,23 +5217,21 @@ def test_apply_decisions_rejects_when_allowed_action_envelope_disallows_buy_down
         },
     )
 
-    policy = plan.items[0].quantity_policy
     assert summary["approved"] == 0
-    assert summary["rejected"] == 1
-    assert plan.items[0].status == "exec_agent_rejected"
-    assert policy["reason_code"] == "allowed_action_envelope_blocked"
-    _assert_canonical_terminal_rejection_policy(
-        policy,
-        reason_code="allowed_action_envelope_blocked",
-    )
-    assert policy["reason"] == "allowed action envelope disallows buy/downsize approval"
+    assert summary["rejected"] == 0
+    assert summary["deferred"] == 1
+    assert plan.items[0].status == "watch_sizing_pending"
+    deferred = plan.items[0].risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
+    assert deferred["reason_code"] == "allowed_action_envelope_blocked"
+    assert deferred["reason_family"] == "action_envelope"
+    assert deferred["reason"] == "allowed action envelope disallows buy/downsize approval"
 
 
 @pytest.mark.parametrize(
     "terminal_path",
     ["sizing_skip", "zero_quantity", "agent_terminal"],
 )
-def test_apply_decisions_canonicalizes_every_terminal_rejection_path(
+def test_apply_decisions_preserves_live_watch_for_mutable_sizing_paths(
     terminal_path: str,
     monkeypatch,
 ) -> None:
@@ -4998,13 +5309,22 @@ def test_apply_decisions_canonicalizes_every_terminal_rejection_path(
     )
 
     assert summary["approved"] == 0
-    assert summary["rejected"] == 1
-    assert item.status == "exec_agent_rejected"
     expected_reason_code = (
         "allowed_action_envelope_blocked"
         if terminal_path == "zero_quantity"
         else "minimum_notional_unreachable"
     )
+    if terminal_path in {"sizing_skip", "zero_quantity"}:
+        assert summary["rejected"] == 0
+        assert summary["deferred"] == 1
+        assert item.status == "watch_sizing_pending"
+        deferred = item.risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
+        assert deferred["reason_code"] == expected_reason_code
+        assert deferred["persistent_live_dynamic_filter"] is True
+        return
+
+    assert summary["rejected"] == 1
+    assert item.status == "exec_agent_rejected"
     _assert_canonical_terminal_rejection_policy(
         item.quantity_policy,
         reason_code=expected_reason_code,
@@ -8130,7 +8450,7 @@ def test_apply_decisions_rejects_unknown_item_mixed_with_expected_item() -> None
 
 
 @pytest.mark.parametrize(
-    ("available_cash", "expected_approved", "expected_rejected"),
+    ("available_cash", "expected_approved", "expected_deferred"),
     [
         pytest.param("100000", 1, 1, id="one-share-then-reserved-cash-exhausted"),
         pytest.param("60000", 0, 2, id="cash-below-executable-reference"),
@@ -8139,7 +8459,7 @@ def test_apply_decisions_rejects_unknown_item_mixed_with_expected_item() -> None
 def test_apply_decisions_reserves_cash_between_approvals_in_the_same_response(
     available_cash: str,
     expected_approved: int,
-    expected_rejected: int,
+    expected_deferred: int,
 ) -> None:
     settings = Settings(
         runtime_mode="live",
@@ -8210,22 +8530,23 @@ def test_apply_decisions_reserves_cash_between_approvals_in_the_same_response(
     )
 
     assert summary["approved"] == expected_approved
-    assert summary["rejected"] == expected_rejected
+    assert summary["rejected"] == 0
+    assert summary["deferred"] == expected_deferred
     assert summary["approved_notional_krw"] == (
         "71500.0000" if expected_approved else "0.0000"
     )
     assert sum(item.status == "watch_monitoring_active" for item in plan.items) == (
         expected_approved
     )
-    rejected_items = [
-        item for item in plan.items if item.status == "exec_agent_rejected"
+    deferred_items = [
+        item for item in plan.items if item.status == "watch_sizing_pending"
     ]
-    assert len(rejected_items) == expected_rejected
-    for item in rejected_items:
-        _assert_canonical_terminal_rejection_policy(
-            item.quantity_policy,
-            reason_code="allowed_action_envelope_blocked",
-        )
+    assert len(deferred_items) == expected_deferred
+    assert all(
+        item.risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]["reason_code"]
+        == "allowed_action_envelope_blocked"
+        for item in deferred_items
+    )
     approved_items = [
         item for item in plan.items if item.status == "watch_monitoring_active"
     ]
@@ -8996,7 +9317,7 @@ def test_next_open_sizing_quarantines_a_candidate_bound_to_another_account(
     engine.dispose()
 
 
-def test_next_open_approval_at_market_open_is_terminal_without_a_job() -> None:
+def test_next_open_approval_at_market_open_is_not_rejected_for_krx_timing() -> None:
     plan = ExecutionPlan(
         id="plan-next-open-late",
         external_plan_id="plan-next-open-late",
@@ -9040,15 +9361,15 @@ def test_next_open_approval_at_market_open_is_terminal_without_a_job() -> None:
 
     assert summary["approved"] == 0
     assert summary["rejected"] == 1
-    assert plan.items[0].status == "next_open_buy_expired"
+    assert plan.items[0].status == "exec_agent_rejected"
     _assert_canonical_terminal_rejection_policy(
         plan.items[0].quantity_policy,
-        reason_code="missed_next_open_window",
+        reason_code="unverified_exec_agent_runtime",
     )
     assert plan.items[0].jobs == []
 
 
-def test_due_next_open_expiry_uses_canonical_terminal_rejection() -> None:
+def test_due_next_open_expires_only_after_krx_target_date() -> None:
     item = _next_open_watch_item(item_id="next-open-expiry")
     plan = ExecutionPlan(
         id="plan-next-open-expiry",
@@ -9062,7 +9383,7 @@ def test_due_next_open_expiry_uses_canonical_terminal_rejection() -> None:
     summary = watch_sizing._expire_missed_next_open_items(
         db=None,
         plan=plan,
-        now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
+        now=datetime(2026, 6, 5, 0, 0, tzinfo=UTC),
     )
 
     assert summary["rejected"] == 1

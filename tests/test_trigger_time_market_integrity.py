@@ -732,7 +732,7 @@ def test_intraday_buy_final_gate_rejects_future_plan_market_date() -> None:
     )
 
 
-def test_intraday_buy_final_gate_rejects_expired_plan_market_date() -> None:
+def test_intraday_buy_final_gate_preserves_prior_plan_and_requires_current_turnover() -> None:
     local_market_date = EVALUATED_AT.astimezone(ZoneInfo("Asia/Seoul")).date()
     plan = ExecutionPlan(
         id="expired-intraday-plan",
@@ -792,8 +792,8 @@ def test_intraday_buy_final_gate_rejects_expired_plan_market_date() -> None:
     )
 
     assert failure == (
-        "live_buy_plan_market_date_mismatch",
-        "automated KIS buy plan is not authorized for the current market date",
+        "live_buy_short_term_turnover_unavailable",
+        "short-term automated buy requires timestamped turnover evidence",
     )
 
 

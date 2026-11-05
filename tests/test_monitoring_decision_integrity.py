@@ -5561,7 +5561,7 @@ def test_watch_expiry_only_mutates_current_account_route() -> None:
         engine.dispose()
 
 
-def test_watch_candidate_ttl_spans_two_trading_sessions_then_expires() -> None:
+def test_live_krx_watch_candidate_survives_trading_session_ttl() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         runtime_mode="live",
@@ -5627,12 +5627,9 @@ def test_watch_candidate_ttl_spans_two_trading_sessions_then_expires() -> None:
                 settings=settings,
                 db=db,
                 current_market_date=date(2026, 9, 8),
-            ) == []
-            assert item.status == "watch_expired"
-            event = item.risk_context["last_monitoring_event"]
-            assert event["event"] == "watch_buy_trading_session_ttl_elapsed"
-            assert event["age_trading_sessions"] == 2
-            assert event["max_age_trading_sessions"] == 2
+            ) == ["005930"]
+            assert item.status == "watch_monitoring_active"
+            assert "last_monitoring_event" not in (item.risk_context or {})
     finally:
         engine.dispose()
 
@@ -5641,7 +5638,7 @@ def test_watch_candidate_ttl_spans_two_trading_sessions_then_expires() -> None:
     "decision_agent_name",
     ("short-term-decider", "signal-decider"),
 )
-def test_short_term_watch_expires_when_holiday_normalized_target_session_ends(
+def test_live_krx_short_term_watch_survives_target_session_end(
     decision_agent_name: str,
 ) -> None:
     settings = Settings(
@@ -5706,12 +5703,9 @@ def test_short_term_watch_expires_when_holiday_normalized_target_session_ends(
                 settings=settings,
                 db=db,
                 effective_at=datetime(2026, 9, 28, 6, 30, tzinfo=UTC),
-            ) == []
-            assert item.status == "watch_expired"
-            event = item.risk_context["last_monitoring_event"]
-            assert event["event"] == "watch_buy_target_session_elapsed"
-            assert event["target_market_date"] == "2026-09-28"
-            assert event["source_market_date"] == "2026-09-28"
+            ) == ["005930"]
+            assert item.status == "watch_monitoring_active"
+            assert "last_monitoring_event" not in (item.risk_context or {})
     finally:
         engine.dispose()
 
@@ -6443,7 +6437,7 @@ def test_monitoring_cycle_preserves_cached_core_priority_before_round_robin(
     assert payload["monitored_symbols"] == ["999999"]
 
 
-def test_live_watch_uses_calendar_safety_ttl_when_session_evidence_is_missing() -> None:
+def test_live_watch_missing_market_date_is_excluded_without_terminal_expiry() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         runtime_mode="live",
@@ -6482,16 +6476,13 @@ def test_live_watch_uses_calendar_safety_ttl_when_session_evidence_is_missing() 
                 db=db,
                 current_market_date=date(2026, 9, 8),
             ) == []
-            assert item.status == "watch_expired"
-            event = item.risk_context["last_monitoring_event"]
-            assert event["event"] == "watch_buy_calendar_safety_ttl_elapsed"
-            assert event["reason"] == "calendar_safety_ttl_elapsed"
-            assert event["source_market_date"] == "2026-08-31"
+            assert item.status == "watch_monitoring_active"
+            assert "last_monitoring_event" not in (item.risk_context or {})
     finally:
         engine.dispose()
 
 
-def test_watch_ttl_counts_observed_market_sessions_not_weekends_or_closures() -> None:
+def test_live_krx_watch_survives_observed_sessions_and_closures() -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         runtime_mode="live",
@@ -6558,8 +6549,8 @@ def test_watch_ttl_counts_observed_market_sessions_not_weekends_or_closures() ->
                 settings=settings,
                 db=db,
                 current_market_date=date(2026, 9, 9),
-            ) == []
-            assert item.status == "watch_expired"
+            ) == ["005930"]
+            assert item.status == "watch_monitoring_active"
     finally:
         engine.dispose()
 

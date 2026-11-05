@@ -93,6 +93,7 @@ from app.services.execution_account_route import (
     AccountRouteMismatch,
     ExecutionAccountScopeMismatch,
     build_execution_account_scope_binding,
+    classify_kis_account_route,
     execution_account_scope_binding_from_payloads,
     redact_account_references,
     validate_execution_account_scope,
@@ -103,6 +104,7 @@ from app.services.execution_semantics import (
     canonical_execution_asset_class,
     is_short_term_watch_buy_intent,
     is_watch_buy_intent,
+    resolve_execution_market_scope,
     watch_buy_direction_from_payloads,
 )
 from app.services.execution_api import serialize_broker_order
@@ -130,6 +132,23 @@ from app.services.fifo_inventory import (
     load_fifo_isolation_cursor,
 )
 from app.services.json_compaction import PLAN_ITEM_SUBMISSION_RISK_KEYS, json_payload_hash
+from app.services.live_market_context import (
+    enrich_account_context_with_live_sector_identity,
+    live_market_breadth_is_current,
+    live_sector_context_is_current,
+    load_cached_live_market_regime_context,
+    load_cached_live_sector_regime_context,
+    load_live_market_regime_context,
+    load_live_sector_regime_context,
+    market_regime_account_context_from_snapshot,
+    market_regime_target_market,
+    merge_live_market_regime_context,
+    merge_live_sector_regime_context,
+)
+from app.services.market_regime_guardrails import (
+    evaluate_market_regime_guardrail,
+    market_regime_context_from_item_payloads,
+)
 from app.services.monitoring_price_source import is_us_regular_session, next_us_regular_open
 from app.services.order_intent_serialization import (
     alpaca_pre_auth_order_intent_account_scope,
@@ -156,7 +175,7 @@ from app.services.position_identity import (
     position_identity_from_payload,
     stable_account_scope_hmac_key,
 )
-from app.services.risk_sizing import effective_stop_price
+from app.services.risk_sizing import apply_vol_corr_quantity_cap, effective_stop_price
 from app.services.runtime_controls import (
     RUNTIME_CONTROL_ID,
     automated_order_submission_allowed,
@@ -181,6 +200,7 @@ TRANSIENT_MARKET_FENCE_STATUS_FALLBACKS = {
     "watch_buy_dispatching": "watch_buy_triggered_blocked",
     "next_open_buy_dispatching": "next_open_buy_retry_pending",
     "new_buy_dispatching": "new_buy_retry_pending",
+    "broker_order_retry_dispatching": "broker_order_retry_pending",
 }
 TRANSIENT_MARKET_FENCE_RESTORABLE_STATUSES = (
     ACTIVE_WATCH_MONITORING_STATUSES
@@ -193,6 +213,28 @@ TRANSIENT_MARKET_FENCE_RESTORABLE_STATUSES = (
             "new_buy_retry_pending",
         }
     )
+)
+DAILY_NEW_BUY_NOTIONAL_ITEM_STATUSES = frozenset(
+    {
+        "next_open_buy_scheduled",
+        "next_open_buy_dispatching",
+        "next_open_buy_retry_pending",
+        "watch_buy_submitted",
+        "broker_order_submission_pending",
+        "broker_order_submitted",
+        "broker_order_retry_pending",
+        "submitted",
+        "open",
+        "partially_filled",
+        "filled",
+        "retry_pending",
+    }
+)
+DAILY_NEW_BUY_NOTIONAL_ORDER_STATUSES = frozenset(
+    {
+        *CAPITAL_RESERVING_ORDER_STATUSES,
+        NormalizedBrokerOrderStatus.FILLED.value,
+    }
 )
 ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES = frozenset(
     {
@@ -2744,6 +2786,17 @@ def _place_broker_order_serialized(
             plan_item=plan_item,
             request_source=request_source,
         )
+        _warm_final_market_regime_sector_context(
+            settings=settings,
+            command=routed_command,
+            plan_item=plan_item,
+            snapshot=symbol_exposure_snapshot,
+            snapshot_error=symbol_exposure_snapshot_error,
+            evaluated_at=(
+                snapshot_freshness_reference_at
+                + timedelta(seconds=max(0.0, monotonic() - submission_started))
+            ),
+        )
         if _requires_automated_kis_symbol_exposure_boundary(
             adapter=adapter,
             command=routed_command,
@@ -3004,6 +3057,7 @@ def _place_broker_order_serialized(
         )
         if next_open_window_failure is not None:
             block_reason, message = next_open_window_failure
+            terminal_window_failure = block_reason == "missed_next_open_submission_window"
             return _persist_runtime_safety_fence(
                 settings=settings,
                 db=db,
@@ -3013,9 +3067,13 @@ def _place_broker_order_serialized(
                 control_state=control_state,
                 block_reason_override=block_reason,
                 message_override=message,
-                plan_item_status_override="next_open_buy_expired",
-                retryable_override=False,
-                permanent_rejection=True,
+                plan_item_status_override=(
+                    "next_open_buy_expired"
+                    if terminal_window_failure
+                    else "next_open_buy_retry_pending"
+                ),
+                retryable_override=not terminal_window_failure,
+                permanent_rejection=terminal_window_failure,
             )
         provider_buy_capability_failure = _automated_provider_buy_capability_failure(
             settings=settings,
@@ -3314,6 +3372,17 @@ def _place_broker_order_serialized(
                 command=routed_command,
                 plan_item=plan_item,
                 request_source=request_source,
+            )
+            _warm_final_market_regime_sector_context(
+                settings=settings,
+                command=routed_command,
+                plan_item=plan_item,
+                snapshot=symbol_exposure_snapshot,
+                snapshot_error=symbol_exposure_snapshot_error,
+                evaluated_at=(
+                    snapshot_freshness_reference_at
+                    + timedelta(seconds=max(0.0, monotonic() - submission_started))
+                ),
             )
             if _requires_automated_kis_symbol_exposure_boundary(
                 adapter=adapter,
@@ -3614,6 +3683,9 @@ def _place_broker_order_serialized(
             )
             if next_open_window_failure is not None:
                 block_reason, message = next_open_window_failure
+                terminal_window_failure = (
+                    block_reason == "missed_next_open_submission_window"
+                )
                 return _persist_runtime_safety_fence(
                     settings=settings,
                     db=db,
@@ -3623,9 +3695,13 @@ def _place_broker_order_serialized(
                     control_state=control_state,
                     block_reason_override=block_reason,
                     message_override=message,
-                    plan_item_status_override="next_open_buy_expired",
-                    retryable_override=False,
-                    permanent_rejection=True,
+                    plan_item_status_override=(
+                        "next_open_buy_expired"
+                        if terminal_window_failure
+                        else "next_open_buy_retry_pending"
+                    ),
+                    retryable_override=not terminal_window_failure,
+                    permanent_rejection=terminal_window_failure,
                 )
             market_evidence_failure = _automated_kis_buy_market_evidence_failure(
                 settings=settings,
@@ -3657,6 +3733,45 @@ def _place_broker_order_serialized(
                         else "watch_buy_triggered_blocked"
                     ),
                 )
+            final_market_regime_failure = _evaluate_final_market_regime_boundary(
+                settings=settings,
+                command=routed_command,
+                plan_item=plan_item,
+                market_evidence=market_evidence,
+                snapshot=symbol_exposure_snapshot,
+                snapshot_error=symbol_exposure_snapshot_error,
+                evaluated_at=final_market_reference_at,
+            )
+            if final_market_regime_failure is not None:
+                block_reason, message, metrics = final_market_regime_failure
+                fenced = _persist_runtime_safety_fence(
+                    settings=settings,
+                    db=db,
+                    order=order,
+                    plan_item=plan_item,
+                    command=routed_command,
+                    control_state=control_state,
+                    block_reason_override=block_reason,
+                    message_override=message,
+                    retry_after_at_override=(
+                        datetime.now(UTC)
+                        + timedelta(
+                            seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                        )
+                    ),
+                    plan_item_status_override=(
+                        "next_open_buy_retry_pending"
+                        if plan_item is not None and plan_item.intent == "next_open_buy"
+                        else "watch_buy_triggered_blocked"
+                    ),
+                )
+                return PlaceBrokerOrderResult(
+                    status_code=fenced.status_code,
+                    payload={
+                        **fenced.payload,
+                        "market_regime_final_boundary": metrics,
+                    },
+                )
             sell_market_evidence_failure = _automated_kis_sell_market_evidence_failure(
                 settings=settings,
                 command=routed_command,
@@ -3687,6 +3802,13 @@ def _place_broker_order_serialized(
                         else None
                     ),
                 )
+        opposite_order_reference_at = _final_buy_boundary_checked_at(
+            settings=settings,
+            requested_at=(
+                snapshot_freshness_reference_at
+                + timedelta(seconds=max(0.0, monotonic() - submission_started))
+            ),
+        )
         opposite_order_failure = _automated_kis_opposite_order_boundary_failure(
             settings=settings,
             db=db,
@@ -3699,11 +3821,8 @@ def _place_broker_order_serialized(
             snapshot=opposite_order_snapshot,
             snapshot_error=opposite_order_snapshot_error,
             exclude_order_id=order.id,
-            observed_at=datetime.now(UTC),
-            operation_reference_at=(
-                snapshot_freshness_reference_at
-                + timedelta(seconds=max(0.0, monotonic() - submission_started))
-            ),
+            observed_at=opposite_order_reference_at,
+            operation_reference_at=opposite_order_reference_at,
         )
         if opposite_order_failure is not None:
             fenced = _persist_runtime_safety_fence(
@@ -3806,6 +3925,110 @@ def _place_broker_order_serialized(
                     ),
                 },
             )
+        final_daily_notional_failure = (
+            _evaluate_final_daily_new_buy_notional_boundary(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                command=routed_command,
+                plan_item=plan_item,
+                request_source=request_source,
+                exclude_order_id=order.id,
+                observed_at=boundary_checked_at,
+            )
+        )
+        if final_daily_notional_failure is not None:
+            fenced = _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=final_daily_notional_failure.block_reason,
+                message_override=final_daily_notional_failure.message,
+                retry_after_at_override=(
+                    datetime.now(UTC)
+                    + timedelta(
+                        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                    )
+                ),
+            )
+            return PlaceBrokerOrderResult(
+                status_code=fenced.status_code,
+                payload={
+                    **fenced.payload,
+                    "daily_new_buy_notional": final_daily_notional_failure.metrics,
+                },
+            )
+
+        final_vol_corr_failure = _evaluate_final_vol_corr_quantity_boundary(
+            settings=settings,
+            adapter=adapter,
+            command=routed_command,
+            plan_item=plan_item,
+            request_source=request_source,
+            snapshot=symbol_exposure_snapshot,
+            snapshot_error=symbol_exposure_snapshot_error,
+            observed_at=boundary_checked_at,
+            market_evidence=market_evidence,
+        )
+        if final_vol_corr_failure is not None:
+            fenced = _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=final_vol_corr_failure.block_reason,
+                message_override=final_vol_corr_failure.message,
+                retry_after_at_override=(
+                    datetime.now(UTC)
+                    + timedelta(
+                        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                    )
+                ),
+            )
+            return PlaceBrokerOrderResult(
+                status_code=fenced.status_code,
+                payload={
+                    **fenced.payload,
+                    "vol_corr_quantity_cap": final_vol_corr_failure.metrics,
+                },
+            )
+
+        final_account_drawdown_decision = (
+            _evaluate_final_account_drawdown_boundary(
+                settings=settings,
+                adapter=adapter,
+                command=routed_command,
+                plan_item=plan_item,
+                request_source=request_source,
+                snapshot=symbol_exposure_snapshot,
+                snapshot_error=symbol_exposure_snapshot_error,
+                observed_at=boundary_checked_at,
+            )
+        )
+        if (
+            final_account_drawdown_decision is not None
+            and not final_account_drawdown_decision.allowed
+        ):
+            return _persist_account_gate_block(
+                settings=settings,
+                db=db,
+                adapter=adapter,
+                command=routed_command,
+                original_command=logical_command,
+                request_source=request_source,
+                plan_item=plan_item,
+                route_decision=route_decision,
+                decision=final_account_drawdown_decision,
+                existing_order=order,
+                observed_at=boundary_checked_at,
+                final_boundary_recheck=True,
+            )
+
         final_cash_decision = _evaluate_final_automated_buy_cash_boundary(
             settings=settings,
             db=db,
@@ -3903,6 +4126,13 @@ def _place_broker_order_serialized(
                 },
             )
 
+        symbol_exposure_reference_at = _final_buy_boundary_checked_at(
+            settings=settings,
+            requested_at=(
+                snapshot_freshness_reference_at
+                + timedelta(seconds=max(0.0, monotonic() - submission_started))
+            ),
+        )
         symbol_exposure_failure = _evaluate_automated_kis_buy_symbol_exposure_boundary(
             settings=settings,
             db=db,
@@ -3914,15 +4144,8 @@ def _place_broker_order_serialized(
             snapshot=symbol_exposure_snapshot,
             snapshot_error=symbol_exposure_snapshot_error,
             exclude_order_id=order.id,
-            # This snapshot is fetched synchronously at the final broker
-            # boundary, so its freshness must be judged against wall-clock
-            # receipt time as well as the operation's monotonic-adjusted
-            # reference (paper/replay dispatches can intentionally be dated).
-            observed_at=datetime.now(UTC),
-            operation_reference_at=(
-                snapshot_freshness_reference_at
-                + timedelta(seconds=max(0.0, monotonic() - submission_started))
-            ),
+            observed_at=symbol_exposure_reference_at,
+            operation_reference_at=symbol_exposure_reference_at,
         )
         if symbol_exposure_failure is not None:
             fenced = _persist_runtime_safety_fence(
@@ -3980,6 +4203,309 @@ def _place_broker_order_serialized(
                     "quarantined_position_count": quarantine_block[
                         "quarantined_position_count"
                     ],
+                },
+            )
+
+        # No external I/O or additional cohort work is allowed between this
+        # wall-clock authority check and the broker call. Runtime observations,
+        # scoped Core authority, and cached quote/session evidence can all age
+        # out while the preceding locked DB boundaries are evaluated.
+        immediate_boundary_checked_at = _final_buy_boundary_checked_at(
+            settings=settings,
+            requested_at=final_market_reference_at,
+        )
+        is_new_buy = bool(
+            routed_command.side == "buy"
+            and _is_new_buy_order(command=routed_command, plan_item=plan_item)
+        )
+        immediate_boundary_block_reason = (
+            market_scoped_automated_buy_submission_block_reason(
+                control_state,
+                settings=settings,
+                provider=routed_command.provider,
+                asset_class=routed_command.asset_class,
+                exchange=routed_command.exchange,
+                symbol=routed_command.symbol,
+                venue=routed_command.venue,
+                risk_context=(
+                    plan_item.risk_context if plan_item is not None else None
+                ),
+                now=immediate_boundary_checked_at,
+            )
+            if is_new_buy
+            else automated_order_submission_block_reason(control_state)
+        )
+        if immediate_boundary_block_reason is not None:
+            return _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=immediate_boundary_block_reason,
+                risk_off_fence=(
+                    immediate_boundary_block_reason == "hourly_plan_risk_off"
+                ),
+            )
+        immediate_scoped_authority_reason = (
+            core_buy_authority_block_reason(
+                settings=settings,
+                db=db,
+                plan_item=plan_item,
+                now=immediate_boundary_checked_at,
+                lock=True,
+            )
+            if is_new_buy
+            else None
+        )
+        if immediate_scoped_authority_reason is not None:
+            if plan_item is not None:
+                project_plan_item_for_core_buy_authority(
+                    settings=settings,
+                    db=db,
+                    plan_item=plan_item,
+                    now=immediate_boundary_checked_at,
+                )
+            return _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=immediate_scoped_authority_reason,
+                message_override=(
+                    "broker submission was fenced because the scoped Core KRX "
+                    "buy authority expired immediately before the broker call"
+                ),
+                preserve_plan_item_status=True,
+            )
+        # The Core authority read may wait on a database lock.  Refresh the
+        # live wall clock after that wait so quote, breadth, and account proof
+        # cannot pass merely because they were fresh before lock acquisition.
+        immediate_boundary_checked_at = _final_buy_boundary_checked_at(
+            settings=settings,
+            requested_at=immediate_boundary_checked_at,
+        )
+        post_lock_boundary_block_reason = (
+            market_scoped_automated_buy_submission_block_reason(
+                control_state,
+                settings=settings,
+                provider=routed_command.provider,
+                asset_class=routed_command.asset_class,
+                exchange=routed_command.exchange,
+                symbol=routed_command.symbol,
+                venue=routed_command.venue,
+                risk_context=(
+                    plan_item.risk_context if plan_item is not None else None
+                ),
+                now=immediate_boundary_checked_at,
+            )
+            if is_new_buy
+            else automated_order_submission_block_reason(control_state)
+        )
+        if post_lock_boundary_block_reason is not None:
+            return _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=post_lock_boundary_block_reason,
+                risk_off_fence=(
+                    post_lock_boundary_block_reason == "hourly_plan_risk_off"
+                ),
+            )
+        post_lock_scoped_authority_reason = (
+            core_buy_authority_block_reason(
+                settings=settings,
+                db=db,
+                plan_item=plan_item,
+                now=immediate_boundary_checked_at,
+                lock=False,
+            )
+            if is_new_buy
+            else None
+        )
+        if post_lock_scoped_authority_reason is not None:
+            if plan_item is not None:
+                project_plan_item_for_core_buy_authority(
+                    settings=settings,
+                    db=db,
+                    plan_item=plan_item,
+                    now=immediate_boundary_checked_at,
+                )
+            return _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=post_lock_scoped_authority_reason,
+                message_override=(
+                    "broker submission was fenced because scoped Core KRX buy "
+                    "authority aged out while acquiring the final database lock"
+                ),
+                preserve_plan_item_status=True,
+            )
+        immediate_next_open_window_failure = (
+            _automated_next_open_submission_window_failure(
+                settings=settings,
+                command=routed_command,
+                plan_item=plan_item,
+                request_source=request_source,
+                reference_at=immediate_boundary_checked_at,
+            )
+        )
+        if immediate_next_open_window_failure is not None:
+            block_reason, message = immediate_next_open_window_failure
+            terminal_window_failure = block_reason == "missed_next_open_submission_window"
+            return _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=block_reason,
+                message_override=message,
+                plan_item_status_override=(
+                    "next_open_buy_expired"
+                    if terminal_window_failure
+                    else "next_open_buy_retry_pending"
+                ),
+                retryable_override=not terminal_window_failure,
+                permanent_rejection=terminal_window_failure,
+            )
+        immediate_market_evidence_failure = (
+            _automated_kis_buy_market_evidence_failure(
+                settings=settings,
+                command=routed_command,
+                plan_item=plan_item,
+                evidence=market_evidence,
+                reference_at=immediate_boundary_checked_at,
+            )
+        )
+        if immediate_market_evidence_failure is not None:
+            block_reason, message = immediate_market_evidence_failure
+            return _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=block_reason,
+                message_override=message,
+                retry_after_at_override=(
+                    datetime.now(UTC)
+                    + timedelta(
+                        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                    )
+                ),
+                plan_item_status_override=(
+                    "next_open_buy_retry_pending"
+                    if plan_item is not None and plan_item.intent == "next_open_buy"
+                    else "watch_buy_triggered_blocked"
+                ),
+            )
+        immediate_market_regime_failure = _evaluate_final_market_regime_boundary(
+            settings=settings,
+            command=routed_command,
+            plan_item=plan_item,
+            market_evidence=market_evidence,
+            snapshot=symbol_exposure_snapshot,
+            snapshot_error=symbol_exposure_snapshot_error,
+            evaluated_at=immediate_boundary_checked_at,
+        )
+        if immediate_market_regime_failure is not None:
+            block_reason, message, metrics = immediate_market_regime_failure
+            fenced = _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override=block_reason,
+                message_override=message,
+                retry_after_at_override=(
+                    datetime.now(UTC)
+                    + timedelta(
+                        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                    )
+                ),
+                plan_item_status_override=(
+                    "next_open_buy_retry_pending"
+                    if plan_item is not None and plan_item.intent == "next_open_buy"
+                    else "watch_buy_triggered_blocked"
+                ),
+            )
+            return PlaceBrokerOrderResult(
+                status_code=fenced.status_code,
+                payload={
+                    **fenced.payload,
+                    "market_regime_final_boundary": metrics,
+                },
+            )
+        immediate_snapshot_failure = _final_automated_kis_snapshot_failure(
+            settings=settings,
+            adapter=adapter,
+            command=routed_command,
+            plan_item=plan_item,
+            request_source=request_source,
+            snapshot=(
+                symbol_exposure_snapshot
+                if routed_command.side == "buy"
+                else opposite_order_snapshot
+            ),
+            snapshot_error=(
+                symbol_exposure_snapshot_error
+                if routed_command.side == "buy"
+                else opposite_order_snapshot_error
+            ),
+            evaluated_at=immediate_boundary_checked_at,
+        )
+        if immediate_snapshot_failure is not None:
+            message, metrics = immediate_snapshot_failure
+            fenced = _persist_runtime_safety_fence(
+                settings=settings,
+                db=db,
+                order=order,
+                plan_item=plan_item,
+                command=routed_command,
+                control_state=control_state,
+                block_reason_override="final_broker_snapshot_unavailable",
+                message_override=message,
+                retry_after_at_override=(
+                    datetime.now(UTC)
+                    + timedelta(
+                        seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                    )
+                ),
+                plan_item_status_override=(
+                    (
+                        "next_open_buy_retry_pending"
+                        if plan_item is not None
+                        and plan_item.intent == "next_open_buy"
+                        else "watch_buy_triggered_blocked"
+                    )
+                    if routed_command.side == "buy"
+                    else (
+                        f"{plan_item.intent}_monitoring"
+                        if plan_item is not None
+                        else None
+                    )
+                ),
+            )
+            return PlaceBrokerOrderResult(
+                status_code=fenced.status_code,
+                payload={
+                    **fenced.payload,
+                    "final_broker_snapshot": metrics,
                 },
             )
         broker_call_started = True
@@ -4761,7 +5287,21 @@ def _persist_runtime_safety_fence(
         or automated_order_submission_block_reason(control_state)
         or "runtime_control"
     )
-    transient_market_fence = is_transient_market_buy_filter_reason(block_reason)
+    transient_market_fence = bool(
+        is_transient_market_buy_filter_reason(block_reason)
+        or block_reason
+        in {
+            "daily_new_buy_cap_reached",
+            "daily_new_buy_cap_unverifiable",
+            "vol_corr_quantity_cap_changed",
+            "vol_corr_snapshot_stale",
+            "vol_corr_snapshot_unavailable",
+            "vol_corr_current_evidence_unavailable",
+            "market_regime_final_boundary_changed",
+            "market_regime_final_evidence_unavailable",
+            "final_broker_snapshot_unavailable",
+        }
+    )
     message = message_override or (
         "broker submission was fenced before the broker call because runtime safety controls "
         f"changed to {block_reason}"
@@ -4892,7 +5432,7 @@ def _automated_next_open_submission_window_failure(
     market_date = plan_item.plan.market_date if plan_item.plan is not None else None
     if market_date is None:
         return (
-            "missed_next_open_submission_window",
+            "live_buy_plan_market_date_mismatch",
             "automated next-open buy requires an explicit current market date",
         )
     asset_class = str(command.asset_class or plan_item.asset_class or "stock").strip().lower()
@@ -4905,11 +5445,17 @@ def _automated_next_open_submission_window_failure(
         ).astimezone(UTC)
     elif asset_class == "stock":
         market_timezone = ZoneInfo(settings.market_timezone)
-        local_open = datetime.combine(
-            market_date,
-            datetime.min.time().replace(hour=9),
-            tzinfo=market_timezone,
-        ).astimezone(UTC)
+        evaluated_at = _normalize_utc_datetime(reference_at)
+        if evaluated_at.astimezone(market_timezone).date() != market_date:
+            return (
+                "live_buy_plan_market_date_mismatch",
+                "automated KRX buy plan is not authorized for the current market date",
+            )
+        # KRX plans may arrive after the opening auction because the upstream
+        # daily process completed late.  Current-session quote, route, market
+        # filters, and broker boundaries still govern the order; elapsed wall
+        # time must not permanently expire the candidate.
+        return None
     else:
         return (
             "missed_next_open_submission_window",
@@ -6868,44 +7414,21 @@ def _automated_kis_buy_market_evidence_failure(
         if (
             plan_market_date is None
             or plan_market_date > current_market_date
-            or (
-                is_domestic
-                and is_short_term_watch_buy_intent(plan_item.intent)
-                and plan_market_date != current_market_date
-            )
         ):
             return (
                 "live_buy_plan_market_date_mismatch",
                 "automated KIS buy plan is not authorized for the current market date",
             )
-    if (
-        is_domestic
-        and plan_item is not None
-        and plan_item.intent == "next_open_buy"
-    ):
+    if is_domestic and plan_item is not None and plan_item.intent == "next_open_buy":
         market_date = plan_item.plan.market_date if plan_item.plan is not None else None
         local_tz = ZoneInfo(settings.market_timezone)
-        if market_date is None:
-            return (
-                "missed_next_open_submission_window",
-                "next-open buy requires a current market date at final submission",
-            )
-        local_open = datetime.combine(
-            market_date,
-            datetime.min.time().replace(hour=9),
-            tzinfo=local_tz,
-        ).astimezone(UTC)
-        deadline = local_open + timedelta(
-            seconds=settings.next_open_buy_initial_submission_grace_seconds
-        )
         if (
-            evaluated_at.astimezone(local_tz).date() != market_date
-            or evaluated_at < local_open
-            or evaluated_at > deadline
+            market_date is None
+            or evaluated_at.astimezone(local_tz).date() != market_date
         ):
             return (
-                "missed_next_open_submission_window",
-                "next-open buy crossed its initial submission grace window",
+                "live_buy_plan_market_date_mismatch",
+                "next-open buy requires a plan for the current KRX session",
             )
     if is_domestic:
         final_route = _final_automated_domestic_buy_route(
@@ -8650,7 +9173,7 @@ def _automated_kis_opposite_order_boundary_failure(
     )
     snapshot_payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
     aggregated_open_order_errors = snapshot_payload.get("open_orders_errors")
-    if not (fresh_at_receipt or fresh_at_operation):
+    if not (fresh_at_receipt and fresh_at_operation):
         return indeterminate(
             "automated KIS opposite-order snapshot is stale or future-dated"
         )
@@ -8900,7 +9423,7 @@ def _evaluate_automated_kis_buy_symbol_exposure_boundary(
         now=operation_reference_at,
         settings=settings,
     )
-    if not (fresh_at_receipt or fresh_at_operation):
+    if not (fresh_at_receipt and fresh_at_operation):
         return indeterminate("automated KIS buy account snapshot is stale or future-dated")
     snapshot_payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
     aggregated_open_order_errors = snapshot_payload.get("open_orders_errors")
@@ -9089,6 +9612,1051 @@ def _evaluate_final_automated_buy_cash_boundary(
         local_open_buy_unknown_count=reservation.local_unknown_count,
         observed_at=observed_at,
         open_buy_reservation=reservation,
+    )
+
+
+def _evaluate_final_daily_new_buy_notional_boundary(
+    *,
+    settings: Settings,
+    db: Session,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    exclude_order_id: str,
+    observed_at: datetime | None = None,
+) -> AutomatedKisBuySymbolExposureFailure | None:
+    """Recheck the actual execution-session buy cohort under the account lock.
+
+    A durable WAIT may legitimately survive its original plan date.  In live
+    mode the cap therefore follows the KRX session in which the broker call is
+    made, counting both today's plan reservations and orders submitted today
+    from older plans.
+    """
+
+    daily_cap = Decimal(settings.exec_agent_max_daily_new_buy_notional)
+    if daily_cap <= 0 or not _requires_automated_kis_symbol_exposure_boundary(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+    ):
+        return None
+    evaluated_at = _normalize_utc_datetime(observed_at or datetime.now(UTC))
+    plan_market_date = (
+        plan_item.plan.market_date
+        if plan_item is not None and plan_item.plan is not None
+        else None
+    )
+    market_date = (
+        evaluated_at.astimezone(ZoneInfo(settings.market_timezone)).date()
+        if settings.runtime_mode == "live"
+        else plan_market_date
+    )
+    candidate_notional = _order_notional(command=command, plan_item=plan_item)
+    if market_date is None or candidate_notional is None:
+        return AutomatedKisBuySymbolExposureFailure(
+            block_reason="daily_new_buy_cap_unverifiable",
+            message=(
+                "final daily new-buy cap cannot prove the candidate market-date "
+                "cohort or notional"
+            ),
+            metrics={
+                "market_date": market_date.isoformat() if market_date is not None else None,
+                "candidate_notional": (
+                    str(candidate_notional) if candidate_notional is not None else None
+                ),
+                "daily_new_buy_notional_cap": str(daily_cap),
+            },
+        )
+
+    market_timezone = ZoneInfo(settings.market_timezone)
+    local_day_start = datetime(
+        market_date.year,
+        market_date.month,
+        market_date.day,
+        tzinfo=market_timezone,
+    )
+    day_start = local_day_start.astimezone(UTC)
+    day_end = (local_day_start + timedelta(days=1)).astimezone(UTC)
+    order_activity_at = func.coalesce(
+        BrokerOrder.submitted_at,
+        BrokerOrder.created_at,
+    )
+    represented_rows = db.execute(
+        select(BrokerOrder, ExecutionPlanItem)
+        .join(
+            ExecutionPlanItem,
+            BrokerOrder.execution_plan_item_id == ExecutionPlanItem.id,
+        )
+        .join(ExecutionPlan, ExecutionPlanItem.execution_plan_id == ExecutionPlan.id)
+        .where(
+            BrokerOrder.mode == settings.runtime_mode,
+            ExecutionPlan.mode == settings.runtime_mode,
+            or_(
+                ExecutionPlan.market_date == market_date,
+                (
+                    (order_activity_at >= day_start)
+                    & (order_activity_at < day_end)
+                ),
+            ),
+            BrokerOrder.id != exclude_order_id,
+            BrokerOrder.broker_name == "kis",
+            BrokerOrder.side == "buy",
+            BrokerOrder.status.in_(
+                tuple(DAILY_NEW_BUY_NOTIONAL_ORDER_STATUSES)
+            ),
+        )
+    ).all()
+    represented_item_ids: set[str] = set()
+    daily_notional_used = Decimal("0")
+    unknown_notional_count = 0
+    for order, item in represented_rows:
+        if not _is_krx_daily_new_buy_notional_item(item):
+            continue
+        if (
+            classify_kis_account_route(
+                settings=settings,
+                provider=item.provider,
+                risk_context=item.risk_context,
+                quantity_policy=item.quantity_policy,
+            )
+            == "foreign"
+        ):
+            continue
+        represented_item_ids.add(item.id)
+        notional = _local_order_notional(order)
+        if notional is None:
+            unknown_notional_count += 1
+            continue
+        daily_notional_used += notional
+
+    cohort_items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlanItem.plan)
+        .where(
+            ExecutionPlan.mode == settings.runtime_mode,
+            ExecutionPlan.market_date == market_date,
+            ExecutionPlanItem.id != plan_item.id,
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.status.in_(
+                tuple(DAILY_NEW_BUY_NOTIONAL_ITEM_STATUSES)
+            ),
+        )
+    ).all()
+    for item in cohort_items:
+        if item.id in represented_item_ids or not _is_krx_daily_new_buy_notional_item(
+            item
+        ):
+            continue
+        if (
+            classify_kis_account_route(
+                settings=settings,
+                provider=item.provider,
+                risk_context=item.risk_context,
+                quantity_policy=item.quantity_policy,
+            )
+            == "foreign"
+        ):
+            continue
+        notional = _persisted_plan_item_buy_notional(item)
+        if notional is None:
+            unknown_notional_count += 1
+            continue
+        daily_notional_used += notional
+
+    projected_notional = daily_notional_used + candidate_notional
+    metrics: dict[str, object] = {
+        "market_date": market_date.isoformat(),
+        "plan_market_date": (
+            plan_market_date.isoformat() if plan_market_date is not None else None
+        ),
+        "cohort_basis": (
+            "execution_market_date"
+            if settings.runtime_mode == "live"
+            else "plan_market_date"
+        ),
+        "daily_new_buy_notional_used": str(daily_notional_used),
+        "candidate_notional": str(candidate_notional),
+        "projected_daily_new_buy_notional": str(projected_notional),
+        "daily_new_buy_notional_cap": str(daily_cap),
+        "unknown_notional_count": unknown_notional_count,
+        "current_order_excluded": True,
+        "current_plan_item_excluded": True,
+    }
+    if unknown_notional_count:
+        return AutomatedKisBuySymbolExposureFailure(
+            block_reason="daily_new_buy_cap_unverifiable",
+            message=(
+                "final daily new-buy cap found cohort rows without deterministic "
+                "notional"
+            ),
+            metrics=metrics,
+        )
+    if projected_notional <= daily_cap:
+        return None
+    return AutomatedKisBuySymbolExposureFailure(
+        block_reason="daily_new_buy_cap_reached",
+        message="final candidate would exceed the configured daily new-buy cap",
+        metrics=metrics,
+    )
+
+
+def _is_krx_daily_new_buy_notional_item(item: ExecutionPlanItem) -> bool:
+    provider, asset_class, exchange = resolve_execution_market_scope(
+        provider=item.provider,
+        asset_class=item.asset_class,
+        symbol=item.symbol,
+        venue=item.venue,
+        risk_context=item.risk_context,
+    )
+    return bool(
+        provider == "kis"
+        and asset_class == "stock"
+        and exchange in KRX_EXCHANGES
+    )
+
+
+def _persisted_plan_item_buy_notional(
+    item: ExecutionPlanItem,
+) -> Decimal | None:
+    policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    decision = policy.get("exec_agent_decision")
+    if isinstance(decision, dict):
+        approved = _positive_decimal(decision.get("approved_notional"))
+        if approved is not None:
+            return approved
+    for key in ("approved_notional", "notional", "max_notional"):
+        value = _positive_decimal(policy.get(key))
+        if value is not None:
+            return value
+    quantity = policy.get("quantity") if policy.get("kind") == "shares" else None
+    if isinstance(quantity, bool):
+        quantity = None
+    try:
+        parsed_quantity = int(quantity) if quantity is not None else None
+    except (TypeError, ValueError):
+        parsed_quantity = None
+    price = item.limit_price or item.trigger_price
+    if parsed_quantity is None or parsed_quantity <= 0 or price is None or price <= 0:
+        return None
+    return Decimal(parsed_quantity) * Decimal(price)
+
+
+def _evaluate_final_vol_corr_quantity_boundary(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    snapshot: BrokerAccountSnapshot | None,
+    snapshot_error: str | None,
+    observed_at: datetime | None = None,
+    market_evidence: AutomatedKisBuyMarketEvidence | None = None,
+) -> AutomatedKisBuySymbolExposureFailure | None:
+    if not settings.vol_corr_sizing_enabled or not (
+        command.quantity is not None
+        and command.quantity > 0
+        and _requires_automated_kis_symbol_exposure_boundary(
+            adapter=adapter,
+            command=command,
+            plan_item=plan_item,
+            request_source=request_source,
+        )
+    ):
+        return None
+    if snapshot_error is not None or snapshot is None:
+        if settings.runtime_mode != "live":
+            snapshot = None
+        else:
+            return AutomatedKisBuySymbolExposureFailure(
+                block_reason="vol_corr_snapshot_unavailable",
+                message=(
+                    "final volatility/correlation cap requires a current broker "
+                    "account snapshot"
+                ),
+                metrics={"snapshot_error": snapshot_error or "snapshot unavailable"},
+            )
+    evaluated_at = observed_at or datetime.now(UTC)
+    if (
+        settings.runtime_mode == "live"
+        and snapshot is not None
+        and not snapshot_is_fresh_for_recovery(
+            observed_at=snapshot.observed_at,
+            now=evaluated_at,
+            settings=settings,
+        )
+    ):
+        return AutomatedKisBuySymbolExposureFailure(
+            block_reason="vol_corr_snapshot_stale",
+            message=(
+                "final volatility/correlation cap requires fresh broker account "
+                "evidence"
+            ),
+            metrics={
+                "snapshot_observed_at": snapshot.observed_at.isoformat(),
+                "evaluated_at": evaluated_at.isoformat(),
+            },
+        )
+
+    baseline_quantity = _final_vol_corr_baseline_quantity(
+        command=command,
+        plan_item=plan_item,
+    )
+    persisted_evidence_current = (
+        settings.runtime_mode != "live"
+        or _live_vol_corr_historical_evidence_is_current(
+            settings=settings,
+            plan_item=plan_item,
+            evaluated_at=evaluated_at,
+        )
+    )
+    context = _final_vol_corr_context(
+        plan_item=plan_item,
+        snapshot=snapshot,
+        market_evidence=market_evidence,
+        evaluated_at=evaluated_at,
+        include_persisted_inputs=persisted_evidence_current,
+        max_live_age_seconds=settings.monitoring_max_quote_age_seconds,
+    )
+    cap_settings = settings
+    if (
+        settings.runtime_mode == "live"
+        and not persisted_evidence_current
+        and str(settings.vol_corr_missing_data_behavior).lower() != "conservative"
+    ):
+        # Never let an old plan's return/correlation series authorize a later
+        # session.  Current intraday range still participates, while missing
+        # correlation is converted into a deterministic conservative cap
+        # instead of either failing open or permanently deadlocking the WAIT.
+        cap_settings = settings.model_copy(
+            update={"vol_corr_missing_data_behavior": "conservative"}
+        )
+    cap = apply_vol_corr_quantity_cap(
+        settings=cap_settings,
+        baseline_quantity=baseline_quantity,
+        context=context,
+    )
+    if cap is None or command.quantity <= int(cap["capped_quantity"]):
+        return None
+    return AutomatedKisBuySymbolExposureFailure(
+        block_reason="vol_corr_quantity_cap_changed",
+        message=(
+            "current volatility/correlation evidence reduced the maximum safe "
+            "quantity before broker submission"
+        ),
+        metrics={
+            **cap,
+            "submitted_quantity": command.quantity,
+            "historical_evidence_current": persisted_evidence_current,
+            **_final_vol_corr_live_context_metrics(context),
+        },
+    )
+
+
+def _live_vol_corr_historical_evidence_is_current(
+    *,
+    settings: Settings,
+    plan_item: ExecutionPlanItem | None,
+    evaluated_at: datetime,
+) -> bool:
+    """Accept stable lookback series only from today's activated plan.
+
+    Return/correlation series are previous-close lookbacks rather than an
+    intraday control state.  They remain valid for the target session, while
+    live range volatility is overlaid below.  Binding them to today's plan and
+    an earlier source session prevents a prior target-day plan from silently
+    authorizing a new session.
+    """
+
+    if plan_item is None or plan_item.plan is None:
+        return False
+    target_market_date = plan_item.plan.market_date
+    source_market_date = plan_item.source_market_date
+    current_market_date = _normalize_utc_datetime(evaluated_at).astimezone(
+        ZoneInfo(settings.market_timezone)
+    ).date()
+    return bool(
+        target_market_date == current_market_date
+        and source_market_date is not None
+        and source_market_date < current_market_date
+    )
+
+
+def _final_automated_kis_snapshot_failure(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    snapshot: BrokerAccountSnapshot | None,
+    snapshot_error: str | None,
+    evaluated_at: datetime,
+) -> tuple[str, dict[str, object]] | None:
+    requires_buy_snapshot = _requires_automated_kis_symbol_exposure_boundary(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+    )
+    requires_opposite_snapshot = _requires_automated_kis_opposite_order_boundary(
+        adapter=adapter,
+        command=command,
+        plan_item=plan_item,
+        request_source=request_source,
+        retry_lineage_proof=None,
+    )
+    if not (requires_buy_snapshot or requires_opposite_snapshot):
+        return None
+    if snapshot_error is not None or snapshot is None:
+        return (
+            "final broker account snapshot is unavailable immediately before submission",
+            {"snapshot_error": snapshot_error or "snapshot unavailable"},
+        )
+    if not snapshot_is_fresh_for_recovery(
+        observed_at=snapshot.observed_at,
+        now=evaluated_at,
+        settings=settings,
+    ):
+        return (
+            "final broker account snapshot became stale before submission",
+            {
+                "snapshot_observed_at": snapshot.observed_at.isoformat(),
+                "evaluated_at": evaluated_at.isoformat(),
+            },
+        )
+    payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
+    open_order_errors = payload.get("open_orders_errors")
+    open_orders_degraded = bool(
+        (
+            isinstance(payload.get("open_orders_error"), dict)
+            and payload["open_orders_error"].get("degraded") is True
+        )
+        or (
+            isinstance(open_order_errors, list)
+            and any(
+                isinstance(error, dict) and error.get("degraded") is True
+                for error in open_order_errors
+            )
+        )
+    )
+    if (
+        not snapshot.open_orders_complete
+        or open_orders_degraded
+        or (requires_buy_snapshot and not snapshot.holdings_complete)
+    ):
+        return (
+            "final broker account snapshot is incomplete immediately before submission",
+            {
+                "holdings_complete": snapshot.holdings_complete,
+                "open_orders_complete": snapshot.open_orders_complete,
+                "open_orders_degraded": open_orders_degraded,
+                "evaluated_at": evaluated_at.isoformat(),
+            },
+        )
+    return None
+
+
+def _final_market_regime_boundary_applies(
+    *,
+    settings: Settings,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+) -> bool:
+    exchange = str(command.exchange or "KRX").strip().upper()
+    return bool(
+        settings.runtime_mode == "live"
+        and settings.market_context_enabled
+        and settings.market_regime_guard_enabled
+        and command.provider == "kis"
+        and command.side == "buy"
+        and command.asset_class == "stock"
+        and exchange in KRX_EXCHANGES
+        and plan_item is not None
+        and _is_new_buy_order(command=command, plan_item=plan_item)
+    )
+
+
+def _warm_final_market_regime_sector_context(
+    *,
+    settings: Settings,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    snapshot: BrokerAccountSnapshot | None,
+    snapshot_error: str | None,
+    evaluated_at: datetime,
+) -> None:
+    """Warm candidate/account sector evidence before any final database lock."""
+
+    if not _final_market_regime_boundary_applies(
+        settings=settings,
+        command=command,
+        plan_item=plan_item,
+    ):
+        return
+    assert plan_item is not None
+    # Final locked checks are deliberately cache-only.  Prime both breadth and
+    # sector authority here so direct next-open jobs do not depend on a prior
+    # monitoring cycle having populated the process-local cache.
+    load_live_market_regime_context(
+        settings=settings,
+        now=evaluated_at,
+    )
+    load_live_sector_regime_context(
+        settings=settings,
+        symbol=command.symbol,
+        source_market_date=plan_item.source_market_date,
+        now=evaluated_at,
+    )
+    if snapshot is None or snapshot_error is not None:
+        return
+    enrich_account_context_with_live_sector_identity(
+        settings=settings,
+        account_context=market_regime_account_context_from_snapshot(snapshot),
+        source_market_date=plan_item.source_market_date,
+        now=evaluated_at,
+        cached_only=False,
+    )
+
+
+def _evaluate_final_market_regime_boundary(
+    *,
+    settings: Settings,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    market_evidence: AutomatedKisBuyMarketEvidence | None,
+    snapshot: BrokerAccountSnapshot | None,
+    snapshot_error: str | None,
+    evaluated_at: datetime,
+) -> tuple[str, str, dict[str, object]] | None:
+    """Recheck changing breadth/sector authority at the last no-I/O boundary."""
+
+    exchange = str(command.exchange or "KRX").strip().upper()
+    if not _final_market_regime_boundary_applies(
+        settings=settings,
+        command=command,
+        plan_item=plan_item,
+    ):
+        return None
+    assert plan_item is not None
+
+    cached_live = load_cached_live_market_regime_context(
+        settings=settings,
+        now=evaluated_at,
+    )
+    live_status = str(cached_live.get("market_context_status") or "").strip().lower()
+    if live_status not in {"ready", "partial"}:
+        return (
+            "market_regime_final_evidence_unavailable",
+            "final broker boundary requires current-session cached market breadth evidence",
+            {
+                "market_context_status": live_status or "unavailable",
+                "market_context_stale_reason": cached_live.get(
+                    "market_context_stale_reason"
+                ),
+                "evaluated_at": evaluated_at.isoformat(),
+            },
+        )
+
+    base_context = market_regime_context_from_item_payloads(
+        plan_item.risk_context,
+        plan_item.quantity_policy,
+    )
+    context = merge_live_market_regime_context(base_context, cached_live)
+    cached_sector = load_cached_live_sector_regime_context(
+        settings=settings,
+        symbol=command.symbol,
+        source_market_date=plan_item.source_market_date,
+        now=evaluated_at,
+    )
+    context = merge_live_sector_regime_context(context, cached_sector)
+    sector_status = str(
+        cached_sector.get("sector_context_status") or "unavailable"
+    ).strip().lower()
+    selected_sector = context.get("sector_context")
+    if (
+        sector_status != "ready"
+        or not isinstance(selected_sector, dict)
+        or str(selected_sector.get("symbol") or "").strip().upper()
+        != str(command.symbol or "").strip().upper()
+        or not live_sector_context_is_current(
+            selected_sector,
+            checked_at=evaluated_at,
+        )
+    ):
+        return (
+            "market_regime_final_evidence_unavailable",
+            "final broker boundary cannot prove current sector evidence for the symbol",
+            {
+                "symbol": command.symbol,
+                "sector_context_status": sector_status,
+                "sector_context_reason": cached_sector.get("sector_context_reason"),
+                "evaluated_at": evaluated_at.isoformat(),
+            },
+        )
+
+    account_context: dict[str, object] | None = None
+    if snapshot is not None and snapshot_error is None:
+        account_context = enrich_account_context_with_live_sector_identity(
+            settings=settings,
+            account_context=market_regime_account_context_from_snapshot(snapshot),
+            source_market_date=plan_item.source_market_date,
+            now=evaluated_at,
+            cached_only=True,
+        )
+    if (
+        not isinstance(account_context, dict)
+        or account_context.get("sector_mapping_complete") is not True
+    ):
+        return (
+            "market_regime_final_evidence_unavailable",
+            "final broker boundary requires complete current sector identity coverage for account exposure",
+            {
+                "symbol": command.symbol,
+                "sector_mapping_status": (
+                    account_context.get("sector_mapping_status")
+                    if isinstance(account_context, dict)
+                    else "unavailable"
+                ),
+                "sector_mapping_missing_symbols": (
+                    account_context.get("sector_mapping_missing_symbols")
+                    if isinstance(account_context, dict)
+                    else None
+                ),
+                "evaluated_at": evaluated_at.isoformat(),
+            },
+        )
+    selected_breadth = context.get("market_breadth")
+    breadth_market = (
+        str(selected_breadth.get("market") or "").strip().upper()
+        if isinstance(selected_breadth, dict)
+        else ""
+    )
+    expected_market = (
+        exchange
+        if exchange in {"KOSPI", "KOSDAQ"}
+        else market_regime_target_market(base_context)
+    )
+    if (
+        expected_market not in {"KOSPI", "KOSDAQ"}
+        or
+        not isinstance(selected_breadth, dict)
+        or breadth_market not in {"KOSPI", "KOSDAQ"}
+        or breadth_market != expected_market
+        or not live_market_breadth_is_current(
+            selected_breadth,
+            checked_at=evaluated_at,
+        )
+    ):
+        return (
+            "market_regime_final_evidence_unavailable",
+            "final broker boundary cannot prove current breadth for the target KRX market",
+            {
+                "expected_market": expected_market,
+                "observed_market": breadth_market or None,
+                "breadth_present": isinstance(selected_breadth, dict),
+                "evaluated_at": evaluated_at.isoformat(),
+            },
+        )
+    submitted_quantity = command.quantity
+    if submitted_quantity is None or submitted_quantity <= 0:
+        return None
+    baseline_quantity = _latest_market_regime_baseline_quantity(
+        plan_item=plan_item,
+        submitted_quantity=submitted_quantity,
+    )
+    live_context = market_evidence.context if market_evidence is not None else None
+    reference_price = command.limit_price
+    if reference_price is None and live_context is not None:
+        reference_price = live_context.ask or live_context.bid
+    current_market_date = _normalize_utc_datetime(evaluated_at).astimezone(
+        ZoneInfo(settings.market_timezone)
+    ).date()
+    decision = evaluate_market_regime_guardrail(
+        settings=settings,
+        context=context,
+        market_date=current_market_date,
+        original_quantity=baseline_quantity,
+        original_notional=(
+            reference_price * Decimal(baseline_quantity)
+            if reference_price is not None and reference_price > 0
+            else None
+        ),
+        reference_price=reference_price,
+        account_context=account_context,
+        now=evaluated_at,
+    )
+    adjusted_quantity = _positive_integer(decision.audit.get("adjusted_quantity"))
+    if (
+        not decision.rejected
+        and adjusted_quantity is not None
+        and adjusted_quantity >= submitted_quantity
+    ):
+        return None
+    return (
+        "market_regime_final_boundary_changed",
+        "current market breadth or sector evidence no longer authorizes the submitted quantity",
+        {
+            "submitted_quantity": submitted_quantity,
+            "baseline_quantity": baseline_quantity,
+            "adjusted_quantity": adjusted_quantity,
+            "reason_code": decision.reason_code,
+            "action": decision.action,
+            "posture": decision.posture,
+            "audit": decision.audit,
+            "sector_context_status": sector_status,
+            "sector_context_reason": cached_sector.get("sector_context_reason"),
+            "sector_mapping_status": (
+                account_context.get("sector_mapping_status")
+                if isinstance(account_context, dict)
+                else "unavailable"
+            ),
+            "evaluated_at": evaluated_at.isoformat(),
+        },
+    )
+
+
+def _latest_market_regime_baseline_quantity(
+    *,
+    plan_item: ExecutionPlanItem,
+    submitted_quantity: int,
+) -> int:
+    risk_context = (
+        plan_item.risk_context if isinstance(plan_item.risk_context, dict) else {}
+    )
+    events = risk_context.get("monitoring_events")
+    if isinstance(events, list):
+        for event in reversed(events):
+            candidate = _market_regime_original_quantity(event)
+            if candidate is not None:
+                return max(submitted_quantity, candidate)
+    for source in (
+        risk_context.get("last_monitoring_event"),
+        plan_item.quantity_policy,
+        risk_context,
+    ):
+        candidate = _market_regime_original_quantity(source)
+        if candidate is not None:
+            return max(submitted_quantity, candidate)
+    return submitted_quantity
+
+
+def _market_regime_original_quantity(source: object) -> int | None:
+    if not isinstance(source, dict):
+        return None
+    candidates: list[object] = [source.get("market_regime_guardrail")]
+    for key in ("sizing_adjustment", "cap_details"):
+        nested = source.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested.get("market_regime_guardrail"))
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            quantity = _positive_integer(candidate.get("original_quantity"))
+            if quantity is not None:
+                return quantity
+    return None
+
+
+def _positive_integer(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _final_vol_corr_baseline_quantity(
+    *,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+) -> int:
+    assert command.quantity is not None and command.quantity > 0
+    policy = (
+        plan_item.quantity_policy
+        if plan_item is not None and isinstance(plan_item.quantity_policy, dict)
+        else {}
+    )
+    risk_context = (
+        plan_item.risk_context
+        if plan_item is not None and isinstance(plan_item.risk_context, dict)
+        else {}
+    )
+    adjustment = policy.get("sizing_adjustment")
+    vol_corr = (
+        adjustment.get("vol_corr_cap")
+        if isinstance(adjustment, dict)
+        else None
+    )
+    candidates: list[object] = [
+        vol_corr.get("baseline_quantity") if isinstance(vol_corr, dict) else None
+    ]
+    for source in (policy, risk_context):
+        for decision_key in (
+            "exec_agent_decision",
+            "short_term_exec_agent_decision",
+        ):
+            decision = source.get(decision_key)
+            sizing_caps = (
+                decision.get("sizing_caps")
+                if isinstance(decision, dict)
+                else None
+            )
+            candidates.append(
+                sizing_caps.get("baseline_quantity")
+                if isinstance(sizing_caps, dict)
+                else None
+            )
+    for candidate in candidates:
+        if (
+            isinstance(candidate, int)
+            and not isinstance(candidate, bool)
+            and candidate > 0
+        ):
+            return max(command.quantity, candidate)
+    return command.quantity
+
+
+def _final_vol_corr_context(
+    *,
+    plan_item: ExecutionPlanItem | None,
+    snapshot: BrokerAccountSnapshot | None,
+    market_evidence: AutomatedKisBuyMarketEvidence | None = None,
+    evaluated_at: datetime | None = None,
+    include_persisted_inputs: bool = True,
+    max_live_age_seconds: int = 30,
+) -> dict[str, object]:
+    context: dict[str, object] = {}
+    if plan_item is not None and include_persisted_inputs:
+        sources: list[object] = [plan_item.risk_context, plan_item.quantity_policy]
+        for source in (plan_item.risk_context, plan_item.quantity_policy):
+            if not isinstance(source, dict):
+                continue
+            sources.extend(
+                source.get(key)
+                for key in ("decider_output", "market_data", "quote", "orderbook")
+                if isinstance(source.get(key), dict)
+            )
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for key in (
+                "realized_volatility_pct",
+                "volatility_pct",
+                "atr_pct",
+                "recent_realized_volatility_pct",
+                "daily_return_pcts",
+                "return_pcts",
+                "candidate_return_pcts",
+                "daily_returns",
+                "returns",
+                "candidate_returns",
+                "max_holding_correlation",
+                "holding_correlation",
+                "correlation",
+                "correlation_symbol",
+                "holding_return_pcts_by_symbol",
+                "holding_returns_by_symbol",
+            ):
+                if key in source:
+                    context[key] = source[key]
+    if snapshot is not None:
+        current_holding_symbols = {
+            str(holding.symbol).strip().upper()
+            for holding in snapshot.holdings
+            if str(holding.symbol).strip() and holding.quantity > 0
+        }
+        correlation_symbol = str(context.get("correlation_symbol") or "").strip().upper()
+        if (
+            any(
+                key in context
+                for key in (
+                    "max_holding_correlation",
+                    "holding_correlation",
+                    "correlation",
+                )
+            )
+            and (
+                not correlation_symbol
+                or correlation_symbol not in current_holding_symbols
+            )
+        ):
+            for key in (
+                "max_holding_correlation",
+                "holding_correlation",
+                "correlation",
+                "correlation_symbol",
+            ):
+                context.pop(key, None)
+        for key in (
+            "holding_return_pcts_by_symbol",
+            "holding_returns_by_symbol",
+        ):
+            returns_by_symbol = context.get(key)
+            if not isinstance(returns_by_symbol, dict):
+                continue
+            filtered_returns = {
+                str(symbol).strip().upper(): values
+                for symbol, values in returns_by_symbol.items()
+                if str(symbol).strip().upper() in current_holding_symbols
+            }
+            if filtered_returns:
+                context[key] = filtered_returns
+            else:
+                context.pop(key, None)
+        holding_symbols = sorted(current_holding_symbols)
+        if holding_symbols:
+            context["holding_symbols"] = holding_symbols
+    live_range = _final_intraday_range_volatility_context(
+        market_evidence=market_evidence,
+        evaluated_at=evaluated_at,
+        max_age_seconds=max_live_age_seconds,
+    )
+    if live_range:
+        current_volatility = max(
+            (
+                value
+                for value in (
+                    _positive_decimal(context.get(key))
+                    for key in (
+                        "realized_volatility_pct",
+                        "volatility_pct",
+                        "atr_pct",
+                        "recent_realized_volatility_pct",
+                    )
+                )
+                if value is not None
+            ),
+            default=Decimal("0"),
+        )
+        intraday_range_pct = Decimal(str(live_range["intraday_range_pct"]))
+        context["realized_volatility_pct"] = str(
+            max(current_volatility, intraday_range_pct)
+        )
+        context.update(live_range)
+    return context
+
+
+def _final_intraday_range_volatility_context(
+    *,
+    market_evidence: AutomatedKisBuyMarketEvidence | None,
+    evaluated_at: datetime | None,
+    max_age_seconds: int,
+) -> dict[str, object]:
+    liquidity = (
+        market_evidence.liquidity_snapshot
+        if market_evidence is not None
+        else None
+    )
+    if liquidity is None or liquidity.day_low <= 0 or liquidity.day_high < liquidity.day_low:
+        return {}
+    observed_at = _normalize_utc_datetime(liquidity.observed_at)
+    reference_at = _normalize_utc_datetime(evaluated_at or datetime.now(UTC))
+    age_seconds = (reference_at - observed_at).total_seconds()
+    if age_seconds < 0 or age_seconds > max(int(max_age_seconds), 1):
+        return {}
+    intraday_range_pct = (
+        (liquidity.day_high - liquidity.day_low)
+        / liquidity.day_low
+        * Decimal("100")
+    ).quantize(Decimal("0.0001"))
+    return {
+        "intraday_range_pct": str(intraday_range_pct),
+        "live_intraday_range_observed_at": observed_at.isoformat(),
+        "live_intraday_range_freshness_source": liquidity.freshness_source,
+    }
+
+
+def _final_vol_corr_live_context_metrics(
+    context: dict[str, object],
+) -> dict[str, object]:
+    return {
+        key: context[key]
+        for key in (
+            "intraday_range_pct",
+            "live_intraday_range_observed_at",
+            "live_intraday_range_freshness_source",
+        )
+        if key in context
+    }
+
+
+def _evaluate_final_account_drawdown_boundary(
+    *,
+    settings: Settings,
+    adapter: BrokerAdapter,
+    command: PlaceOrderRequest,
+    plan_item: ExecutionPlanItem | None,
+    request_source: str,
+    snapshot: BrokerAccountSnapshot | None,
+    snapshot_error: str | None,
+    observed_at: datetime,
+) -> AccountDrawdownDecision | None:
+    if not settings.account_drawdown_gate_enabled or not (
+        _requires_automated_kis_symbol_exposure_boundary(
+            adapter=adapter,
+            command=command,
+            plan_item=plan_item,
+            request_source=request_source,
+        )
+        and _is_new_buy_order(command=command, plan_item=plan_item)
+    ):
+        return None
+    if snapshot_error is not None or snapshot is None:
+        return account_drawdown_uncertain_decision(
+            order_idempotency_key=command.idempotency_key,
+            execution_plan_item_id=(
+                plan_item.id if plan_item is not None else command.execution_plan_item_id
+            ),
+            reason=(
+                "final account-loss boundary cannot verify the broker snapshot: "
+                f"{snapshot_error or 'snapshot unavailable'}"
+            ),
+            now=observed_at,
+        )
+    if settings.runtime_mode == "live" and not snapshot_is_fresh_for_recovery(
+        observed_at=snapshot.observed_at,
+        now=observed_at,
+        settings=settings,
+    ):
+        return account_drawdown_uncertain_decision(
+            order_idempotency_key=command.idempotency_key,
+            execution_plan_item_id=(
+                plan_item.id if plan_item is not None else command.execution_plan_item_id
+            ),
+            reason="final account-loss boundary received stale or future-dated evidence",
+            now=observed_at,
+        )
+    incomplete_reason = _account_drawdown_recovery_snapshot_incomplete(
+        settings=settings,
+        snapshot=snapshot,
+        command=command,
+        require_reliable_open_orders=False,
+    )
+    if incomplete_reason is not None:
+        return account_drawdown_uncertain_decision(
+            order_idempotency_key=command.idempotency_key,
+            execution_plan_item_id=(
+                plan_item.id if plan_item is not None else command.execution_plan_item_id
+            ),
+            reason=incomplete_reason,
+            now=observed_at,
+        )
+    return evaluate_account_drawdown_gate(
+        settings=settings,
+        snapshot=snapshot_with_raw_balance_holdings(
+            snapshot,
+            as_of=observed_at,
+            max_age_seconds=settings.exec_agent_max_account_snapshot_age_seconds,
+        ),
+        order_idempotency_key=command.idempotency_key,
+        execution_plan_item_id=(
+            plan_item.id if plan_item is not None else command.execution_plan_item_id
+        ),
+        now=observed_at,
     )
 
 
@@ -12052,6 +13620,7 @@ def _persist_account_gate_block(
     decision: AccountDrawdownDecision,
     existing_order: BrokerOrder | None = None,
     observed_at: datetime | None = None,
+    final_boundary_recheck: bool = False,
 ) -> PlaceBrokerOrderResult:
     observed_at = _normalize_utc_datetime(observed_at or datetime.now(UTC))
     sanitized_decision_summary = _redacted_payload(decision.summary) or {}
@@ -12065,8 +13634,18 @@ def _persist_account_gate_block(
         )
         preserve_current_plan_status = bool(
             current_plan_state is None
-            or current_plan_state[0]
-            in ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES
+            or (
+                current_plan_state[0]
+                in ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES
+                and not (
+                    final_boundary_recheck
+                    and current_plan_state[0]
+                    == "broker_order_submission_pending"
+                    and existing_order is not None
+                    and existing_order.status
+                    == NormalizedBrokerOrderStatus.SUBMISSION_PENDING.value
+                )
+            )
         )
         if current_plan_state is not None:
             # Keep the caller's identity-mapped object aligned with the row we
@@ -12921,7 +14500,9 @@ def _final_buy_boundary_checked_at(
     settings: Settings,
     requested_at: datetime,
 ) -> datetime:
-    if settings.runtime_mode == "live":
+    # Both live and paper modes talk to a real-time broker surface.  Only the
+    # fully local mock mode may retain a caller-supplied historical clock.
+    if settings.runtime_mode in {"live", "paper"}:
         return datetime.now(UTC)
     return _normalize_utc_datetime(requested_at)
 

@@ -1412,8 +1412,14 @@ def test_matched_market_buy_uses_one_durable_valuation_for_symbol_and_cash(
 
 def test_final_ioc_price_rechecks_aggregate_cash_under_account_lock(
     tmp_path,
+    monkeypatch,
 ) -> None:
     observed_at = datetime(2026, 9, 9, 1, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        lambda *, requested_at, **_kwargs: requested_at,
+    )
 
     class FinalAskAdapter(StubBrokerAdapter):
         def get_live_market_context(

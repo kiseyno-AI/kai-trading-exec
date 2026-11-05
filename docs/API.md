@@ -340,6 +340,10 @@ Current response includes:
   - `active`
   - `epoch`
   - `context`
+- `krx_market_observation`
+  - `available`
+  - `fresh`
+  - `block_reason`
 - `readiness_reason`
 - `last_change`
   - `action`
@@ -352,8 +356,11 @@ Current response includes:
 `automation_enabled` remains a compatibility field and is derived as
 `not paused and not kill_switch_enabled`; it is not stored independently.
 `automated_order_submission_allowed` represents the all-side kill-switch gate.
-`automated_buy_submission_allowed` additionally reflects the entry pause and
-hourly buy risk-off gate.
+`automated_buy_submission_allowed` is a conservative compatibility summary that
+additionally reflects the entry pause and hourly risk-off state. Actual order
+admission is route-scoped: the hourly fence and current-session observation
+gate apply to live KRX new/increasing buys, not US equity, Alpaca, crypto,
+paper-mode simulation, or risk-reducing sells.
 
 If the runtime-control schema cannot be read, both automated submission flags
 fail closed. In that fallback payload `hourly_risk_off.available` is `false`
@@ -362,8 +369,9 @@ for an inactive fence.
 
 ### `POST /runtime/plan-judgment/action`
 
-Apply one hourly risk judgment to the durable global buy fence and its persisted
-`intraday_watch_buy` and `next_open_buy` projections. The body requires an
+Apply one hourly risk judgment to the durable live-KRX buy fence. The fence
+blocks submission without expiring or deleting persisted `intraday_watch_buy`
+and `next_open_buy` candidates. The body requires an
 explicit non-negative integer `risk_flags` and explicit string array
 `risk_reasons[]`; booleans, numeric strings, fractional flags, scalar reasons,
 unknown fields, and omitted fields return `422` instead of being coerced into a
@@ -386,26 +394,20 @@ schema migration. Risky observations (`risk_flags >= 1`) retain the legacy
 explicit two-field body so a safety observation is never dependent on recovery
 metadata.
 
-- `risk_flags >= 3` first activates the global buy-only fence, then expires all
-  mutable buy watches/jobs and records each prior safe status plus recovery
-  state. Projection is durably marked pending before item mutation. A late buy
-  candidate is still fenced at broker submission and is picked up by the next
-  active-fence reconciliation scan.
-- `risk_flags >= 1` keeps the fence and risk-off-expired items blocked, clears
+- `risk_flags >= 3` activates the live-KRX buy-only fence. Existing and later
+  candidates keep their monitoring or retryable job state; every broker
+  boundary independently observes the fence.
+- `risk_flags >= 1` keeps the fence active, clears
   healthy progress, and restarts the recovery cooldown.
 - `risk_flags == 0` records a later healthy observation. The fence clears only
-  after the configured observation count and cooldown are both satisfied and
-  every hourly-expired projection has been reconciled. The pending marker and
-  global fence remain active if any projection fails or another mutable buy is
-  discovered during reconciliation.
+  after the configured observation count and cooldown are both satisfied.
 
-Only items tagged as expired by this hourly action are eligible. Manual expiry,
-rejection, and unrelated status changes are not reversed. A restored item is
-only eligible for later monitoring or job dispatch. Transient in-flight states
-resume as a safe retry state rather than being replayed as in-flight. Trigger/job
-validity, quote freshness, broker session, runtime controls, account gates,
-sizing, and buying power are checked again before submission. Sells and explicit
-risk-reduction/protective-hedge orders are not stopped by this buy fence.
+Recovery changes only fence eligibility and never resurrects a manually expired,
+rejected, cancelled, or unrelated item. Trigger/job validity, current-session
+market evidence, quote freshness, broker session, runtime controls, account
+gates, sizing, and buying power are checked again before submission. Sells and
+explicit risk-reduction/protective-hedge orders are not stopped by this buy
+fence; neither are US-equity, Alpaca, crypto, or paper-mode candidates.
 
 An applied response includes `status`, `action`, `message`, `changed_count`,
 `recovery_observed_count`, `recovery_reset_count`, and
@@ -416,6 +418,13 @@ An applied response includes `status`, `action`, `message`, `changed_count`,
 Counted observations must also be separated by
 `KAI_EXEC_HOURLY_PLAN_JUDGMENT_RECOVERY_MIN_OBSERVATION_INTERVAL_SECONDS`
 (default `300`) so duplicate scheduler/API calls cannot satisfy recovery immediately.
+
+The production market observer evaluates every 60 seconds in its KRX operating
+window. Exec records only a fresh observation whose `market_date` and source
+timestamp belong to the current KST session; missing or prior-session evidence
+keeps live KRX BUY submission fail-closed before the open. The one-minute
+observer cadence does not weaken the recovery interval: only distinct healthy
+observations at least the configured 300 seconds apart count toward release.
 
 ## Persistence boundary
 

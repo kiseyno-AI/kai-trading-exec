@@ -80,6 +80,16 @@ from app.services.watch_exec_agent_sizing import _reconcile_stale_sizing_orders
 OBSERVED_AT = datetime(2026, 5, 13, 9, 5, tzinfo=UTC)
 
 
+def _use_historical_broker_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep explicitly historical execution fixtures on their simulated clock."""
+
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        lambda *, requested_at, **_kwargs: requested_at,
+    )
+
+
 def test_execution_fill_serialization_recursively_redacts_account_references() -> None:
     order = _order(broker_order_id="redacted-fill-order")
     fill = ExecutionFill(
@@ -3038,7 +3048,10 @@ def test_scoped_position_sync_cannot_ignore_parallel_nonflat_legacy_row() -> Non
     engine.dispose()
 
 
-def test_monitoring_reconciles_stale_missing_position_from_broker_holdings_before_sell() -> None:
+def test_monitoring_reconciles_stale_missing_position_from_broker_holdings_before_sell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _use_historical_broker_boundary(monkeypatch)
     settings = Settings(
         database_url="sqlite:///:memory:",
         runtime_mode="paper",

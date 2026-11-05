@@ -2,6 +2,10 @@ from datetime import UTC, datetime, timedelta
 
 from app.core.config import Settings
 from app.models.runtime import RuntimeControlState
+from app.services.monitoring import (
+    _placement_preserves_current_plan_status,
+    _watch_buy_approval_reason_is_transient,
+)
 from app.services.execution_semantics import resolve_execution_market_scope
 from app.services.runtime_controls import (
     automated_buy_submission_block_reason,
@@ -196,3 +200,24 @@ def test_dynamic_market_and_core_authority_reasons_are_transient_buy_fences() ->
     ):
         assert is_transient_market_buy_filter_reason(reason)
     assert not is_transient_market_buy_filter_reason("execution_plan_item_state_changed")
+
+
+def test_live_regime_downsize_reasons_remain_retryable_watch_blocks() -> None:
+    for reason in (
+        "market_breadth_incomplete_caution",
+        "market_breadth_caution",
+        "market_breadth_below_normal",
+        "market_breadth_missing_caution",
+        "market_breadth_missing_risk_off",
+        "sector_weakness_or_crowding_downsize",
+    ):
+        assert _watch_buy_approval_reason_is_transient(reason)
+
+
+def test_permanent_broker_rejection_status_is_not_overwritten_by_monitoring() -> None:
+    assert _placement_preserves_current_plan_status(
+        {
+            "block_reason": "permanent_contract_rejection",
+            "permanent_rejection": True,
+        }
+    )

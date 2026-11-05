@@ -16,7 +16,7 @@ from time import monotonic
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, selectinload, sessionmaker, undefer
 from sqlalchemy.orm.attributes import set_committed_value
 
@@ -47,10 +47,12 @@ from app.services.execution_account_route import (
     validate_kis_account_route,
 )
 from app.services.execution_semantics import (
+    INTRADAY_WATCH_BUY_INTENTS,
     KRX_ASSET_CLASS_ALIASES,
     WATCH_BUY_INTENTS,
     is_exec_agent_sizing_policy,
     is_short_term_watch_buy_intent,
+    resolve_execution_market_scope,
     watch_buy_direction_from_payloads,
 )
 from app.services.execution_exposure import (
@@ -66,7 +68,13 @@ from app.services.exec_agent_approval import (
     maximum_entry_price_for_buy_economics,
 )
 from app.services.json_compaction import compact_json_object, json_payload_hash
-from app.services.live_market_context import load_live_market_regime_context, merge_live_market_regime_context
+from app.services.live_market_context import (
+    enrich_account_context_with_live_sector_identity,
+    load_live_market_regime_context,
+    load_live_sector_regime_context,
+    merge_live_market_regime_context,
+    merge_live_sector_regime_context,
+)
 from app.services.market_regime_guardrails import evaluate_market_regime_guardrail
 from app.services.openclaw_runtime_contract import (
     bind_signed_runtime_agent_identity,
@@ -111,13 +119,18 @@ SIZING_ELIGIBLE_WATCH_STATUSES = frozenset({
     "watch_buy_triggered_blocked",
     "unsupported_semantics",
 })
-UNSIZED_NEXT_OPEN_STATUSES = frozenset({"pending", "next_open_buy_pending_configuration"})
+UNSIZED_NEXT_OPEN_STATUSES = frozenset({
+    WATCH_SIZING_PENDING_STATUS,
+    "pending",
+    "next_open_buy_pending_configuration",
+})
 WATCH_EXEC_AGENT_BATCH_SIZE = 10
 WATCH_EXEC_AGENT_RESPONSE_VERSION = "manual-exec-agent-watch-sizing-v1"
 WATCH_EXEC_AGENT_BINDING_VERSION = "watch-exec-agent-binding-v2"
 SERVER_EFFECTIVE_STOP_POLICY_VERSION = "server_effective_stop_v1"
 QUANTITY_ONLY_WATCH_SIZING_POLICY_VERSION = "quantity_only_watch_sizing_v1"
 SUBJECTIVE_WATCH_REOPEN_MARKER_KEY = "quantity_only_watch_reopen_v1"
+LIVE_DYNAMIC_WATCH_REOPEN_MARKER_KEY = "live_dynamic_watch_reopen_v1"
 WATCH_EXEC_AGENT_DEFER_KEY = "watch_exec_agent_deferred"
 WATCH_EXEC_AGENT_DEFER_SECONDS = 300
 WATCH_EXEC_AGENT_PRICE_WATCH_DEFER_SECONDS = 60
@@ -140,16 +153,22 @@ _TRANSIENT_DETERMINISTIC_REASONS = frozenset({
     "account_cash_unavailable",
     "account_snapshot_unavailable",
     "broker_open_orders_truth_unavailable",
-})
-_STRUCTURAL_DETERMINISTIC_REASONS = frozenset({
     "existing_holding",
     "duplicate_open_buy_order",
+    "open_order_quantity_indeterminate",
+})
+_STRUCTURAL_DETERMINISTIC_REASONS = frozenset({
     "missing_reference_price",
     "missing_target_price",
     "invalid_target_distance",
     "missing_stop_price",
     "invalid_stop_distance",
     "invalid_target_stop_geometry",
+})
+_LEGACY_LIVE_DYNAMIC_TERMINAL_REASON_CODES = frozenset({
+    "allowed_action_envelope_blocked",
+    "minimum_notional_unreachable",
+    "no_buyable_quantity",
 })
 _NO_TRADE_TERMINAL_ENTRY_STATUSES = frozenset({
     "contract_quarantined",
@@ -249,18 +268,22 @@ def run_due_watch_exec_agent_sizing(
             price_watch_reopened_item_ids=reopened_price_watch_ids,
         )
 
-    expired_price_watch_summaries = [
-        summary
-        for plan in plans
-        if (
-            summary := _expire_elapsed_price_watch_items(
-                db=db,
-                settings=settings,
-                plan=plan,
-                now=cycle_at,
-            )
-        )["rejected"]
-    ]
+    expired_price_watch_summaries = (
+        []
+        if settings.runtime_mode == "live"
+        else [
+            summary
+            for plan in plans
+            if (
+                summary := _expire_elapsed_price_watch_items(
+                    db=db,
+                    settings=settings,
+                    plan=plan,
+                    now=cycle_at,
+                )
+            )["rejected"]
+        ]
+    )
 
     provider_mismatch_summaries = _quarantine_provider_mismatched_items(
         settings=settings,
@@ -498,18 +521,22 @@ def _run_due_watch_exec_agent_sizing_short_transactions(
             _load_candidate_plans(settings=settings, db=db, market_date=market_date),
             now=cycle_at,
         )
-        expired_price_watch_summaries = [
-            summary
-            for plan in plans
-            if (
-                summary := _expire_elapsed_price_watch_items(
-                    db=db,
-                    settings=settings,
-                    plan=plan,
-                    now=cycle_at,
-                )
-            )["rejected"]
-        ]
+        expired_price_watch_summaries = (
+            []
+            if settings.runtime_mode == "live"
+            else [
+                summary
+                for plan in plans
+                if (
+                    summary := _expire_elapsed_price_watch_items(
+                        db=db,
+                        settings=settings,
+                        plan=plan,
+                        now=cycle_at,
+                    )
+                )["rejected"]
+            ]
+        )
         provider_mismatch_summaries = _quarantine_provider_mismatched_items(
             settings=settings,
             db=db,
@@ -862,10 +889,38 @@ def _next_open_window_missed(
     plan: ExecutionPlan,
     item: ExecutionPlanItem,
     now: datetime,
+    settings: Settings | None = None,
 ) -> bool:
     if plan.market_date is None:
         return True
+    if _is_krx_next_open_item(item):
+        # KRX next-open authority remains usable throughout its target trading
+        # date.  Late pipeline/handoff completion must reach the current quote,
+        # calendar and broker safety boundaries instead of being destroyed at
+        # the 09:00 sizing boundary.  It expires only after the target date.
+        if plan.market_date.weekday() >= 5:
+            return True
+        timezone = ZoneInfo(
+            settings.market_timezone if settings is not None else "Asia/Seoul"
+        )
+        return _utc_datetime(now).astimezone(timezone).date() > plan.market_date
     return _utc_datetime(now) >= _next_open_deadline(plan=plan, item=item)
+
+
+def _is_krx_next_open_item(item: ExecutionPlanItem) -> bool:
+    risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+    provider, asset_class, exchange = resolve_execution_market_scope(
+        provider=item.provider or risk_context.get("provider"),
+        asset_class=item.asset_class or risk_context.get("asset_class"),
+        symbol=item.symbol,
+        venue=item.venue,
+        risk_context=risk_context,
+    )
+    return bool(
+        exchange in {"KRX", "KOSPI", "KOSDAQ"}
+        and provider in {"", "kis", "korea-investment", "korea_investment"}
+        and (not asset_class or asset_class in KRX_ASSET_CLASS_ALIASES)
+    )
 
 
 def _is_untriggered_next_open_sizing_item(item: ExecutionPlanItem) -> bool:
@@ -897,6 +952,7 @@ def _expire_missed_next_open_items(
             plan=plan,
             item=item,
             now=checked_at,
+            settings=settings,
         ):
             continue
         previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
@@ -1211,21 +1267,31 @@ def _applicable_decision_ids(decision_payload: dict[str, object], *, expected_it
 
 
 def _load_candidate_plans(*, settings: Settings, db: Session, market_date) -> list[ExecutionPlan]:
+    intraday_candidate = ExecutionPlan.items.any(
+        (ExecutionPlanItem.intent.in_(tuple(INTRADAY_WATCH_BUY_INTENTS)))
+        & ExecutionPlanItem.status.in_(tuple(SIZING_ELIGIBLE_WATCH_STATUSES))
+    )
+    next_open_candidate = ExecutionPlan.items.any(
+        (ExecutionPlanItem.intent == "next_open_buy")
+        & ExecutionPlanItem.status.in_(tuple(UNSIZED_NEXT_OPEN_STATUSES))
+    )
+    candidate_scope = (
+        or_(
+            and_(ExecutionPlan.market_date <= market_date, intraday_candidate),
+            and_(ExecutionPlan.market_date == market_date, next_open_candidate),
+        )
+        if settings.runtime_mode == "live"
+        else and_(
+            ExecutionPlan.market_date == market_date,
+            or_(intraday_candidate, next_open_candidate),
+        )
+    )
     return db.scalars(
         select(ExecutionPlan)
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlan.market_date == market_date,
-            ExecutionPlan.items.any(
-                (ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)))
-                & (
-                    ExecutionPlanItem.status.in_(tuple(SIZING_ELIGIBLE_WATCH_STATUSES))
-                    | and_(
-                        ExecutionPlanItem.intent == "next_open_buy",
-                        ExecutionPlanItem.status.in_(tuple(UNSIZED_NEXT_OPEN_STATUSES)),
-                    )
-                )
-            ),
+            ExecutionPlan.status == "accepted",
+            candidate_scope,
         )
         .options(
             selectinload(ExecutionPlan.items).options(
@@ -1262,10 +1328,14 @@ def _reopen_stale_effective_stop_terminal_rejections(
         )
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlan.market_date == market_date,
+            (
+                ExecutionPlan.market_date <= market_date
+                if settings.runtime_mode == "live"
+                else ExecutionPlan.market_date == market_date
+            ),
             ExecutionPlan.status == "accepted",
             ExecutionPlanItem.side == "buy",
-            ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+            ExecutionPlanItem.intent.in_(tuple(INTRADAY_WATCH_BUY_INTENTS)),
             ExecutionPlanItem.status == "exec_agent_rejected",
             ~ExecutionPlanItem.jobs.any(),
             ~ExecutionPlanItem.broker_orders.any(),
@@ -1294,14 +1364,19 @@ def _reopen_stale_effective_stop_terminal_rejections(
         ):
             continue
 
-        expires_at = _price_watch_session_expiry(settings=settings, item=item)
+        expires_at = (
+            None
+            if settings.runtime_mode == "live"
+            else _price_watch_session_expiry(settings=settings, item=item)
+        )
         entry_price, _entry_source = _entry_reference_for_item(item)
         upstream_stop = _upstream_stop_price(item)
         risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
         target_price = _decimal_value(risk_context.get("target_price"))
         if (
-            expires_at is None
-            or expires_at <= checked_at
+            (settings.runtime_mode != "live" and (
+                expires_at is None or expires_at <= checked_at
+            ))
             or entry_price is None
             or upstream_stop is None
             or target_price is None
@@ -1329,19 +1404,21 @@ def _reopen_stale_effective_stop_terminal_rejections(
             plan_item=item,
             status=WATCH_SIZING_PENDING_STATUS,
         )
+        summary = {
+            "symbol": item.symbol,
+            "reason_code": "effective_stop_policy_reassessment",
+            "upstream_stop_price": _decimal_text(upstream_stop),
+            "effective_stop_price": _decimal_text(normalized_stop),
+            "reward_risk_max_entry_price": _decimal_text(reward_risk_entry_cap),
+            "effective_stop_policy_version": SERVER_EFFECTIVE_STOP_POLICY_VERSION,
+        }
+        if expires_at is not None:
+            summary["expires_at"] = expires_at.isoformat()
         _add_plan_item_audit(
             db=db,
             item=item,
             event_type="watch_exec_agent_effective_stop_policy_reopened",
-            summary={
-                "symbol": item.symbol,
-                "reason_code": "effective_stop_policy_reassessment",
-                "upstream_stop_price": _decimal_text(upstream_stop),
-                "effective_stop_price": _decimal_text(normalized_stop),
-                "reward_risk_max_entry_price": _decimal_text(reward_risk_entry_cap),
-                "effective_stop_policy_version": SERVER_EFFECTIVE_STOP_POLICY_VERSION,
-                "expires_at": expires_at.isoformat(),
-            },
+            summary=summary,
             payload={
                 "prior_quantity_policy": policy,
                 "restored_quantity_policy": previous_policy,
@@ -1375,15 +1452,28 @@ def _reopen_price_watch_terminal_rejections(
             now=checked_at,
         )
     )
+    reopened_ids.extend(
+        _reopen_live_dynamic_terminal_rejections(
+            db=db,
+            settings=settings,
+            market_date=market_date,
+            now=checked_at,
+        )
+    )
     items = db.scalars(
         select(ExecutionPlanItem)
         .join(ExecutionPlan, ExecutionPlan.id == ExecutionPlanItem.execution_plan_id)
         .options(undefer(ExecutionPlanItem.risk_context))
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlan.market_date == market_date,
+            (
+                ExecutionPlan.market_date <= market_date
+                if settings.runtime_mode == "live"
+                else ExecutionPlan.market_date == market_date
+            ),
+            ExecutionPlan.status == "accepted",
             ExecutionPlanItem.side == "buy",
-            ExecutionPlanItem.intent.in_(tuple(WATCH_BUY_INTENTS)),
+            ExecutionPlanItem.intent.in_(tuple(INTRADAY_WATCH_BUY_INTENTS)),
             ExecutionPlanItem.status == "exec_agent_rejected",
             ~ExecutionPlanItem.jobs.any(),
             ~ExecutionPlanItem.broker_orders.any(),
@@ -1391,6 +1481,13 @@ def _reopen_price_watch_terminal_rejections(
         .order_by(ExecutionPlanItem.created_at.asc(), ExecutionPlanItem.id.asc())
     ).all()
     for item in items:
+        provider = str(item.provider or "").strip().lower()
+        asset_class = str(item.asset_class or "").strip().lower()
+        if (
+            provider not in {"kis", "korea-investment", "korea_investment"}
+            or asset_class not in KRX_ASSET_CLASS_ALIASES
+        ):
+            continue
         policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
         previous_policy = policy.get("previous_policy")
         risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
@@ -1404,9 +1501,13 @@ def _reopen_price_watch_terminal_rejections(
             settings=settings,
             item=item,
         )
-        expires_at = _price_watch_session_expiry(
-            settings=settings,
-            item=item,
+        expires_at = (
+            None
+            if settings.runtime_mode == "live"
+            else _price_watch_session_expiry(
+                settings=settings,
+                item=item,
+            )
         )
         if (
             policy.get("kind") != "exec_agent_rejected"
@@ -1423,16 +1524,18 @@ def _reopen_price_watch_terminal_rejections(
                 and stored_cap < trigger_price
             )
             or current_cap is None
-            or expires_at is None
-            or expires_at <= checked_at
+            or (
+                settings.runtime_mode != "live"
+                and (expires_at is None or expires_at <= checked_at)
+            )
         ):
             continue
 
-        retry_after = min(
-            checked_at
-            + timedelta(seconds=_price_watch_defer_seconds(settings)),
-            expires_at,
+        retry_after = checked_at + timedelta(
+            seconds=_price_watch_defer_seconds(settings)
         )
+        if expires_at is not None:
+            retry_after = min(retry_after, expires_at)
         next_context = dict(risk_context)
         next_context["reward_risk_max_entry_price"] = _decimal_text(current_cap)
         next_context[WATCH_EXEC_AGENT_DEFER_KEY] = {
@@ -1442,11 +1545,14 @@ def _reopen_price_watch_terminal_rejections(
             "reason": "wait for the planned trigger without exhausting price-dependent retries",
             "deferred_at": checked_at.isoformat(),
             "retry_after": retry_after.isoformat(),
-            "expires_at": expires_at.isoformat(),
             "attempt_count": int(settings.exec_agent_watch_sizing_max_attempts),
             "max_attempts": int(settings.exec_agent_watch_sizing_max_attempts),
             "price_watch_only": True,
         }
+        if expires_at is not None:
+            next_context[WATCH_EXEC_AGENT_DEFER_KEY]["expires_at"] = (
+                expires_at.isoformat()
+            )
         item.risk_context = compact_json_object(next_context)
         item.quantity_policy = compact_json_object(previous_policy)
         apply_plan_item_status(
@@ -1461,6 +1567,121 @@ def _reopen_price_watch_terminal_rejections(
                 "symbol": item.symbol,
                 "reason_code": "reward_risk_price_watch",
                 "reward_risk_max_entry_price": _decimal_text(current_cap),
+                "retry_after": retry_after.isoformat(),
+            },
+            payload={
+                "prior_quantity_policy": policy,
+                "restored_quantity_policy": previous_policy,
+            },
+        )
+        reopened_ids.append(item.id)
+    return reopened_ids
+
+
+def _reopen_live_dynamic_terminal_rejections(
+    *,
+    db: Session,
+    settings: Settings,
+    market_date,
+    now: datetime,
+) -> list[str]:
+    """One-time repair for live dynamic gates exhausted by the old retry cap."""
+
+    if settings.runtime_mode != "live":
+        return []
+    checked_at = _utc_datetime(now)
+    dynamic_families = {
+        "action_envelope",
+        "account_state",
+        "broker_truth",
+        "liquidity",
+        "market_regime",
+        "runtime_contract",
+        "transaction_cost",
+    }
+    items = db.scalars(
+        select(ExecutionPlanItem)
+        .join(ExecutionPlan, ExecutionPlan.id == ExecutionPlanItem.execution_plan_id)
+        .options(
+            undefer(ExecutionPlanItem.quantity_policy),
+            undefer(ExecutionPlanItem.risk_context),
+        )
+        .where(
+            ExecutionPlan.mode == "live",
+            ExecutionPlan.market_date <= market_date,
+            ExecutionPlan.status == "accepted",
+            ExecutionPlanItem.side == "buy",
+            ExecutionPlanItem.intent.in_(tuple(INTRADAY_WATCH_BUY_INTENTS)),
+            ExecutionPlanItem.status == "exec_agent_rejected",
+            ~ExecutionPlanItem.jobs.any(),
+            ~ExecutionPlanItem.broker_orders.any(),
+        )
+        .order_by(ExecutionPlanItem.created_at.asc(), ExecutionPlanItem.id.asc())
+    ).all()
+    reopened_ids: list[str] = []
+    for item in items:
+        provider = str(item.provider or "").strip().lower()
+        asset_class = str(item.asset_class or "").strip().lower()
+        policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+        previous_policy = policy.get("previous_policy")
+        risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        exhausted_dynamic_retry = (
+            policy.get("reason_code") == "deterministic_retry_exhausted"
+            and policy.get("reason_family") != "reward_risk"
+        )
+        explicitly_dynamic = policy.get("reason_family") in dynamic_families
+        legacy_dynamic_reason = (
+            policy.get("reason_code")
+            in _LEGACY_LIVE_DYNAMIC_TERMINAL_REASON_CODES
+        )
+        if (
+            provider not in {"kis", "korea-investment", "korea_investment"}
+            or asset_class not in KRX_ASSET_CLASS_ALIASES
+            or policy.get("kind") != "exec_agent_rejected"
+            or policy.get("source") != "exec_agent_watch_sizing"
+            or policy.get("rejection_disposition") != "terminal"
+            or not (
+                exhausted_dynamic_retry
+                or explicitly_dynamic
+                or legacy_dynamic_reason
+            )
+            or not isinstance(previous_policy, dict)
+            or not is_exec_agent_sizing_policy(previous_policy)
+            or LIVE_DYNAMIC_WATCH_REOPEN_MARKER_KEY in risk_context
+            or SUBJECTIVE_WATCH_REOPEN_MARKER_KEY in risk_context
+        ):
+            continue
+
+        retry_after = checked_at + timedelta(seconds=WATCH_EXEC_AGENT_DEFER_SECONDS)
+        next_context = dict(risk_context)
+        next_context[LIVE_DYNAMIC_WATCH_REOPEN_MARKER_KEY] = {
+            "policy_version": "live_dynamic_watch_v1",
+            "prior_reason_code": policy.get("reason_code"),
+            "prior_reason_family": policy.get("reason_family"),
+            "reopened_at": checked_at.isoformat(),
+        }
+        next_context[WATCH_EXEC_AGENT_DEFER_KEY] = {
+            "reason_code": "live_dynamic_filter_recheck",
+            "reason_family": str(policy.get("reason_family") or "dynamic_filter"),
+            "disposition": "retry",
+            "reason": "live dynamic evidence must be re-evaluated instead of expiring the WAIT",
+            "deferred_at": checked_at.isoformat(),
+            "retry_after": retry_after.isoformat(),
+            "attempt_count": 0,
+            "max_attempts": int(settings.exec_agent_watch_sizing_max_attempts),
+            "persistent_live_dynamic_filter": True,
+        }
+        item.risk_context = compact_json_object(next_context)
+        item.quantity_policy = compact_json_object(previous_policy)
+        apply_plan_item_status(plan_item=item, status=WATCH_SIZING_PENDING_STATUS)
+        _add_plan_item_audit(
+            db=db,
+            item=item,
+            event_type="watch_exec_agent_live_dynamic_reopened_v1",
+            summary={
+                "symbol": item.symbol,
+                "prior_reason_code": policy.get("reason_code"),
+                "prior_reason_family": policy.get("reason_family"),
                 "retry_after": retry_after.isoformat(),
             },
             payload={
@@ -1497,10 +1718,14 @@ def _reopen_subjective_watch_sizing_terminal_rejections(
         )
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
-            ExecutionPlan.market_date == market_date,
+            (
+                ExecutionPlan.market_date <= market_date
+                if settings.runtime_mode == "live"
+                else ExecutionPlan.market_date == market_date
+            ),
             ExecutionPlan.status == "accepted",
             ExecutionPlanItem.side == "buy",
-            ExecutionPlanItem.intent == "intraday_watch_buy",
+            ExecutionPlanItem.intent.in_(tuple(INTRADAY_WATCH_BUY_INTENTS)),
             ExecutionPlanItem.status == "exec_agent_rejected",
             ~ExecutionPlanItem.jobs.any(),
             ~ExecutionPlanItem.broker_orders.any(),
@@ -1517,7 +1742,11 @@ def _reopen_subjective_watch_sizing_terminal_rejections(
             continue
         policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
         previous_policy = policy.get("previous_policy")
-        expires_at = _price_watch_session_expiry(settings=settings, item=item)
+        expires_at = (
+            None
+            if settings.runtime_mode == "live"
+            else _price_watch_session_expiry(settings=settings, item=item)
+        )
         if (
             policy.get("kind") != "exec_agent_rejected"
             or policy.get("source") != "exec_agent_watch_sizing"
@@ -1530,8 +1759,10 @@ def _reopen_subjective_watch_sizing_terminal_rejections(
             )
             or not isinstance(previous_policy, dict)
             or not is_exec_agent_sizing_policy(previous_policy)
-            or expires_at is None
-            or expires_at <= checked_at
+            or (
+                settings.runtime_mode != "live"
+                and (expires_at is None or expires_at <= checked_at)
+            )
         ):
             continue
 
@@ -1556,17 +1787,19 @@ def _reopen_subjective_watch_sizing_terminal_rejections(
             plan_item=item,
             status=WATCH_SIZING_PENDING_STATUS,
         )
+        summary = {
+            "symbol": item.symbol,
+            "reason_code": policy.get("reason_code"),
+            "reason_family": policy.get("reason_family"),
+            "policy_version": QUANTITY_ONLY_WATCH_SIZING_POLICY_VERSION,
+        }
+        if expires_at is not None:
+            summary["expires_at"] = expires_at.isoformat()
         _add_plan_item_audit(
             db=db,
             item=item,
             event_type="watch_exec_agent_subjective_rejection_reopened_v1",
-            summary={
-                "symbol": item.symbol,
-                "reason_code": policy.get("reason_code"),
-                "reason_family": policy.get("reason_family"),
-                "policy_version": QUANTITY_ONLY_WATCH_SIZING_POLICY_VERSION,
-                "expires_at": expires_at.isoformat(),
-            },
+            summary=summary,
             payload={
                 "prior_quantity_policy": prior_policy,
                 "restored_quantity_policy": previous_policy,
@@ -1884,6 +2117,17 @@ def _unsized_watch_items(
             continue
         if not _eligible_unsized_item_status(item):
             continue
+        if (
+            now is not None
+            and plan.mode == "live"
+            and item.intent == "next_open_buy"
+            and (
+                plan.market_date is None
+                or plan.market_date
+                != _utc_datetime(now).astimezone(ZoneInfo("Asia/Seoul")).date()
+            )
+        ):
+            continue
         if _watch_exec_agent_defer_is_active(item, now=now):
             continue
         if _has_exec_agent_decision(item):
@@ -1908,10 +2152,6 @@ def _watch_exec_agent_defer_is_active(
         return False
     checked_at = _utc_datetime(now or datetime.now(UTC))
     expires_at = _strict_aware_datetime(deferred.get("expires_at"))
-    if expires_at is not None and expires_at <= checked_at:
-        # Session expiry is a hard terminal boundary.  Keep the item out of
-        # candidate selection until the expiry sweep persists ``watch_expired``.
-        return True
     retry_after = _strict_aware_datetime(deferred.get("retry_after"))
     deferred_at = _strict_aware_datetime(deferred.get("deferred_at"))
     if (
@@ -1934,6 +2174,10 @@ def _price_watch_expiry_deadline(
     settings: Settings,
     item: ExecutionPlanItem,
 ) -> datetime | None:
+    if settings.runtime_mode == "live":
+        # A live price watch remains retryable across sessions until an
+        # authoritative replacement/revocation or a fill closes it.
+        return None
     context = item.risk_context if isinstance(item.risk_context, dict) else {}
     deferred = context.get(WATCH_EXEC_AGENT_DEFER_KEY)
     if not isinstance(deferred, dict) or not (
@@ -2158,12 +2402,19 @@ def _rejection_reason_family(reasons: list[str], raw_reason_code: object) -> str
         return "transaction_cost"
     if "liquidity" in normalized or "turnover" in normalized:
         return "liquidity"
-    if "envelope" in normalized or "allowed_action" in normalized:
-        return "action_envelope"
+    if "open_order" in normalized or "broker" in normalized:
+        return "broker_truth"
     if "account" in normalized or "cash" in normalized or "holding" in normalized:
         return "account_state"
+    if any(
+        marker in normalized
+        for marker in ("market_regime", "breadth", "sector", "risk_off")
+    ):
+        return "market_regime"
     if "runtime" in normalized or "contract" in normalized:
         return "runtime_contract"
+    if "envelope" in normalized or "allowed_action" in normalized:
+        return "action_envelope"
     return "agent_rejection"
 
 
@@ -2399,6 +2650,16 @@ def _candidate_payload(item: ExecutionPlanItem) -> dict[str, object]:
         ),
         "side": item.side,
         "status": item.status,
+        "market_date": (
+            item.plan.market_date.isoformat()
+            if item.plan is not None and item.plan.market_date is not None
+            else None
+        ),
+        "source_market_date": (
+            item.source_market_date.isoformat()
+            if item.source_market_date is not None
+            else None
+        ),
         "trigger_price": _json_decimal(item.trigger_price),
         "chase_limit_price": _json_decimal(chase_limit_price),
         "estimated_reference_price": _json_decimal(estimated_reference_price),
@@ -2819,6 +3080,8 @@ def _account_context_payload(
         "open_order_count": len(open_orders),
         "holdings": holdings,
         "open_orders": open_orders,
+        "holdings_complete": snapshot.holdings_complete,
+        "open_orders_complete": snapshot.open_orders_complete,
         "holdings_truth": holdings_truth,
         "open_orders_truth": open_orders_truth,
     }
@@ -4156,6 +4419,84 @@ def _server_quantity_only_decision_after_agent_reject(
     }
 
 
+def _defer_live_dynamic_sizing_gate(
+    *,
+    db: Session | None,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    record: dict[str, object],
+    envelope: dict[str, object],
+    reason_code: str,
+    reason_family: str,
+    reason: str,
+    decided_at: datetime,
+) -> dict[str, object] | None:
+    """Preserve a live intraday WAIT when only mutable evidence blocks sizing."""
+
+    raw_reasons = envelope.get("hard_reject_reasons")
+    hard_reasons = (
+        [str(value) for value in raw_reasons]
+        if isinstance(raw_reasons, list)
+        else []
+    )
+    if (
+        settings.runtime_mode != "live"
+        or not is_short_term_watch_buy_intent(item.intent)
+        or any(reason in _STRUCTURAL_DETERMINISTIC_REASONS for reason in hard_reasons)
+    ):
+        return None
+
+    context = dict(item.risk_context) if isinstance(item.risk_context, dict) else {}
+    prior = context.get(WATCH_EXEC_AGENT_DEFER_KEY)
+    prior_attempt_count = (
+        prior.get("attempt_count", 0) if isinstance(prior, dict) else 0
+    )
+    if isinstance(prior_attempt_count, bool) or not isinstance(
+        prior_attempt_count, int
+    ):
+        prior_attempt_count = 0
+    retry_after = decided_at + timedelta(seconds=WATCH_EXEC_AGENT_DEFER_SECONDS)
+    context[WATCH_EXEC_AGENT_DEFER_KEY] = {
+        "reason_code": reason_code,
+        "reason_family": reason_family,
+        "disposition": "retry",
+        "reason": reason,
+        "deferred_at": decided_at.isoformat(),
+        "retry_after": retry_after.isoformat(),
+        "attempt_count": prior_attempt_count + 1,
+        "max_attempts": int(settings.exec_agent_watch_sizing_max_attempts),
+        "deterministic_gate_reasons": hard_reasons,
+        "persistent_live_dynamic_filter": True,
+    }
+    item.risk_context = compact_json_object(context)
+    apply_plan_item_status(plan_item=item, status=WATCH_SIZING_PENDING_STATUS)
+    final_record = {
+        **record,
+        "action": "reject",
+        "decision": "rejected",
+        "reason_code": reason_code,
+        "reason_family": reason_family,
+        "rejection_disposition": "retry",
+        "reason": reason,
+    }
+    _add_plan_item_audit(
+        db=db,
+        item=item,
+        event_type="watch_exec_agent_live_dynamic_filter_deferred",
+        summary={
+            "symbol": item.symbol,
+            "reason_code": reason_code,
+            "reason_family": reason_family,
+            "retry_after": retry_after.isoformat(),
+        },
+        payload={
+            "decision": _decision_summary(final_record),
+            "allowed_action_envelope": envelope,
+        },
+    )
+    return final_record
+
+
 def _apply_decisions(
     *,
     db: Session,
@@ -4179,7 +4520,7 @@ def _apply_decisions(
             now=decision_at,
             only_item_ids=expected_ids,
         )
-        if settings is not None
+        if settings is not None and settings.runtime_mode != "live"
         else {
             "rejected": 0,
             "price_watch_expired_item_ids": [],
@@ -4355,6 +4696,7 @@ def _apply_decisions(
             plan=plan,
             item=item,
             now=decision_at,
+            settings=settings,
         ):
             previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
             record, item.quantity_policy = _canonical_terminal_rejection(
@@ -4445,15 +4787,37 @@ def _apply_decisions(
                     if isinstance(raw_reasons, list)
                     else []
                 )
+                reason_family = _rejection_reason_family(
+                    hard_reasons,
+                    "allowed_action_envelope_blocked",
+                )
+                deferred_record = _defer_live_dynamic_sizing_gate(
+                    db=db if isinstance(db, Session) else None,
+                    settings=settings,
+                    item=item,
+                    record=record,
+                    envelope=envelope,
+                    reason_code="allowed_action_envelope_blocked",
+                    reason_family=reason_family,
+                    reason=envelope_block_reason,
+                    decided_at=decision_at,
+                )
+                if deferred_record is not None:
+                    deferred += 1
+                    _add_final_sizing_decision_audit(
+                        db=db,
+                        item=item,
+                        agent_record=agent_record,
+                        final_record=deferred_record,
+                        deterministic_context={"allowed_action_envelope": envelope},
+                    )
+                    continue
                 record, item.quantity_policy = _canonical_terminal_rejection(
                     item=item,
                     record=record,
                     previous_policy=previous_policy,
                     reason_code="allowed_action_envelope_blocked",
-                    reason_family=_rejection_reason_family(
-                        hard_reasons,
-                        "allowed_action_envelope_blocked",
-                    ),
+                    reason_family=reason_family,
                     reason=envelope_block_reason,
                     audit_event_type="watch_exec_agent_sizing_decision",
                     decided_at=decision_at,
@@ -4494,15 +4858,52 @@ def _apply_decisions(
                     if isinstance(raw_reasons, list)
                     else []
                 )
+                reason_family = _rejection_reason_family(
+                    hard_reasons,
+                    sizing["reason_code"],
+                )
+                deferred_record = _defer_live_dynamic_sizing_gate(
+                    db=db if isinstance(db, Session) else None,
+                    settings=settings,
+                    item=item,
+                    record=record,
+                    envelope=envelope,
+                    reason_code=str(sizing["reason_code"]),
+                    reason_family=reason_family,
+                    reason=str(sizing["reason"]),
+                    decided_at=decision_at,
+                )
+                if deferred_record is not None:
+                    deferred += 1
+                    _add_plan_item_audit(
+                        db=db,
+                        item=item,
+                        event_type="watch_exec_agent_sizing_cap_decision",
+                        summary={
+                            "decision": "defer",
+                            "reason_code": sizing["reason_code"],
+                            "final_quantity": sizing["adjustment"].get("final_quantity"),
+                            "final_notional": sizing["adjustment"].get("final_notional"),
+                        },
+                        payload=sizing["adjustment"],
+                    )
+                    _add_final_sizing_decision_audit(
+                        db=db,
+                        item=item,
+                        agent_record=agent_record,
+                        final_record=deferred_record,
+                        deterministic_context={
+                            "allowed_action_envelope": envelope,
+                            "sizing_adjustment": sizing["adjustment"],
+                        },
+                    )
+                    continue
                 record, item.quantity_policy = _canonical_terminal_rejection(
                     item=item,
                     record=record,
                     previous_policy=previous_policy,
                     reason_code=str(sizing["reason_code"]),
-                    reason_family=_rejection_reason_family(
-                        hard_reasons,
-                        sizing["reason_code"],
-                    ),
+                    reason_family=reason_family,
                     reason=str(sizing["reason"]),
                     audit_event_type="watch_exec_agent_sizing_decision",
                     decided_at=decision_at,
@@ -4546,6 +4947,27 @@ def _apply_decisions(
                     version=str(decision_payload.get("version") or ""),
                     runtime_provenance=runtime_provenance,
                 )
+                deferred_record = _defer_live_dynamic_sizing_gate(
+                    db=db if isinstance(db, Session) else None,
+                    settings=settings,
+                    item=item,
+                    record=record,
+                    envelope=envelope,
+                    reason_code="allowed_action_envelope_blocked",
+                    reason_family="action_envelope",
+                    reason="allowed action envelope left no buyable quantity",
+                    decided_at=decision_at,
+                )
+                if deferred_record is not None:
+                    deferred += 1
+                    _add_final_sizing_decision_audit(
+                        db=db,
+                        item=item,
+                        agent_record=agent_record,
+                        final_record=deferred_record,
+                        deterministic_context={"allowed_action_envelope": envelope},
+                    )
+                    continue
                 previous_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else None
                 record, item.quantity_policy = _canonical_terminal_rejection(
                     item=item,
@@ -4698,16 +5120,24 @@ def _apply_decisions(
                 settings=settings,
                 item=item,
             )
+            persistent_live_price_watch = bool(
+                settings.runtime_mode == "live"
+                and disposition == "defer"
+                and reason_family == "reward_risk"
+                and reward_risk_cap is not None
+            )
             price_watch_expires_at = (
                 _price_watch_session_expiry(settings=settings, item=item)
                 if disposition == "defer"
                 and reason_family == "reward_risk"
                 and reward_risk_cap is not None
+                and not persistent_live_price_watch
                 else None
             )
             if (
                 disposition == "defer"
                 and reason_family == "reward_risk"
+                and not persistent_live_price_watch
                 and (
                     price_watch_expires_at is None
                     or price_watch_expires_at <= decision_at
@@ -4718,13 +5148,22 @@ def _apply_decisions(
                 disposition == "defer"
                 and reason_family == "reward_risk"
                 and reward_risk_cap is not None
-                and price_watch_expires_at is not None
                 and defer_attempt_count >= max_defer_attempts
+                and (
+                    persistent_live_price_watch
+                    or price_watch_expires_at is not None
+                )
+            )
+            persistent_live_dynamic_filter = bool(
+                settings.runtime_mode == "live"
+                and is_short_term_watch_buy_intent(item.intent)
+                and disposition in {"retry", "defer"}
             )
             exhausted = bool(
                 disposition in {"retry", "defer"}
                 and defer_attempt_count >= max_defer_attempts
                 and not price_watch_only
+                and not persistent_live_dynamic_filter
             )
             if exhausted:
                 disposition = "terminal"
@@ -4770,6 +5209,10 @@ def _apply_decisions(
                     "max_attempts": max_defer_attempts,
                     "deterministic_gate_reasons": envelope.get("hard_reject_reasons"),
                 }
+                if persistent_live_dynamic_filter:
+                    risk_context[WATCH_EXEC_AGENT_DEFER_KEY][
+                        "persistent_live_dynamic_filter"
+                    ] = True
                 if price_watch_only:
                     risk_context[WATCH_EXEC_AGENT_DEFER_KEY]["price_watch_only"] = True
                 if price_watch_expires_at is not None:
@@ -5577,18 +6020,43 @@ def _allowed_action_envelope_for_candidate(
             destination.append(reason)
 
     max_notional = min(cap_candidates).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    evaluated_at = datetime.now(UTC)
+    source_market_date = candidate.get("source_market_date")
     market_context = merge_live_market_regime_context(
         candidate if isinstance(candidate, dict) else {},
-        load_live_market_regime_context(settings=settings),
+        load_live_market_regime_context(settings=settings, now=evaluated_at),
+    )
+    market_context = merge_live_sector_regime_context(
+        market_context,
+        load_live_sector_regime_context(
+            settings=settings,
+            symbol=symbol,
+            source_market_date=source_market_date,
+            now=evaluated_at,
+        ),
+    )
+    market_regime_account_context = enrich_account_context_with_live_sector_identity(
+        settings=settings,
+        account_context=account_context,
+        source_market_date=source_market_date,
+        now=evaluated_at,
     )
     market_guardrail = evaluate_market_regime_guardrail(
         settings=settings,
         context=market_context,
-        market_date=candidate.get("market_date"),
+        # Live intraday watches may intentionally survive their originating
+        # plan date.  Dynamic breadth/sector evidence must therefore be judged
+        # against the current KRX session, not the older plan date.
+        market_date=(
+            evaluated_at.astimezone(ZoneInfo(settings.market_timezone)).date()
+            if settings.runtime_mode == "live"
+            else candidate.get("market_date")
+        ),
         original_notional=max_notional,
         reference_price=sizing_price if sizing_price > 0 else None,
         original_quantity=_floor_quantity(max_notional / sizing_price) if sizing_price > 0 else None,
-        account_context=account_context,
+        account_context=market_regime_account_context,
+        now=evaluated_at,
     )
     if market_guardrail.rejected:
         hard_reject_reasons.append(market_guardrail.reason_code)
@@ -5637,7 +6105,7 @@ def _allowed_action_envelope_for_candidate(
         "hard_reject_reasons": hard_reject_reasons,
         "soft_warnings": soft_warnings,
         "market_regime_guardrail": market_guardrail.audit,
-        "computed_at": datetime.now(UTC).isoformat(),
+        "computed_at": evaluated_at.isoformat(),
     }
 
 
