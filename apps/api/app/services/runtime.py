@@ -315,7 +315,7 @@ def fast_autonomous_safety(
             settings,
             f"runtime state unavailable: {exc.__class__.__name__}; run migrations",
         )
-    return runtime_safety_payload(state)
+    return runtime_safety_payload(state, settings=settings)
 
 
 def build_runtime_safety(
@@ -331,7 +331,7 @@ def build_runtime_safety(
             settings,
             f"runtime state unavailable: {exc.__class__.__name__}; run migrations",
         )
-    return runtime_safety_payload(state)
+    return runtime_safety_payload(state, settings=settings)
 
 
 def runtime_counts(
@@ -4275,7 +4275,7 @@ def build_runtime_status(
 
     try:
         state = ensure_runtime_control_state(settings=settings, db=db)
-        safety = runtime_safety_payload(state)
+        safety = runtime_safety_payload(state, settings=settings)
         counts = runtime_counts(
             settings=settings,
             db=db,

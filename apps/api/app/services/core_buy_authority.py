@@ -705,7 +705,6 @@ def _project_scope(
                 ExecutionPlanItem.provider == "kis",
                 ExecutionPlanItem.side == "buy",
                 ExecutionPlanItem.intent.in_(BUY_WATCH_INTENTS),
-                ExecutionPlanItem.intent != "intraday_watch_buy",
                 projection_candidate,
             )
             .order_by(ExecutionPlanItem.id)
@@ -811,11 +810,8 @@ def _project_block(
         }
         risk[ADJUSTMENT_KEY] = existing
         item.risk_context = risk
-        if item.status != "watch_expired" and item.status in RISK_OFF_EXPIRABLE_STATUSES:
-            item.status = "watch_expired"
-            item.updated_at = now
-            return True
-        return False
+        item.updated_at = now
+        return True
     if item.status not in RISK_OFF_EXPIRABLE_STATUSES:
         return False
     risk[ADJUSTMENT_KEY] = {
@@ -837,7 +833,6 @@ def _project_block(
         },
     }
     item.risk_context = risk
-    item.status = "watch_expired"
     item.updated_at = now
     return True
 
@@ -887,7 +882,19 @@ def _restore_blocked_item(
     previous_status = (
         str(previous.get("status") or "") if isinstance(previous, dict) else ""
     )
-    if item.status != "watch_expired" or previous_status not in BUY_MUTABLE_STATUSES:
+    if item.status != "watch_expired":
+        updated = dict(adjustment)
+        updated["action"] = "recovered"
+        updated["recovery"] = {
+            "status": "resumed",
+            "healthy_observation_count": state.healthy_observation_count,
+            "resumed_at": now.isoformat(),
+        }
+        risk[ADJUSTMENT_KEY] = updated
+        item.risk_context = risk
+        item.updated_at = now
+        return True
+    if previous_status not in BUY_MUTABLE_STATUSES:
         updated = dict(adjustment)
         updated["recovery"] = {
             "status": "not_restored_terminal",
@@ -946,13 +953,6 @@ def core_buy_authority_block_reason(
     lock: bool = False,
 ) -> str | None:
     if plan_item is None or not _item_matches_scope(settings=settings, item=plan_item):
-        return None
-    # A watch entry has no immediate market-order authority: monitoring still
-    # requires the symbol quote to enter its trigger/limit range before the
-    # broker-order path can run.  Do not let incomplete route-level breadth
-    # evidence disable that per-symbol watch.  Account, runtime, kill-switch,
-    # sizing, and order-level controls remain enforced by their own gates.
-    if plan_item.intent == "intraday_watch_buy":
         return None
     observed_at = _utc(now or datetime.now(UTC))
     identity = build_position_identity(

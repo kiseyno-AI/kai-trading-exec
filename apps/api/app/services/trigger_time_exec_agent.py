@@ -30,7 +30,11 @@ from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, Ex
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.account_drawdown_recovery import account_snapshot_freshness_failure
 from app.services.exec_agent_approval import load_strict_json_object
-from app.services.execution_semantics import KRX_EXCHANGES, is_short_term_watch_buy_intent
+from app.services.execution_semantics import (
+    KRX_EXCHANGES,
+    is_short_term_watch_buy_intent,
+    resolve_execution_market_scope,
+)
 from app.services.execution_account_route import classify_kis_account_route
 from app.services.live_market_context import (
     live_market_breadth_is_current,
@@ -1317,10 +1321,19 @@ def _live_market_buy_authority_gate_applies(
     provider = str(item.provider or "kis").strip().lower()
     if provider not in {"kis", "korea_investment", "korea-investment"}:
         return False
-    if str(item.asset_class or "stock").strip().lower() != "stock":
+    if provider in {"korea_investment", "korea-investment"}:
+        provider = "kis"
+    provider, asset_class, exchange = resolve_execution_market_scope(
+        provider=provider,
+        asset_class=item.asset_class,
+        symbol=item.symbol,
+        exchange=_plan_item_exchange(item),
+        venue=item.venue,
+        risk_context=item.risk_context,
+    )
+    if asset_class != "stock":
         return False
-    exchange = str(_plan_item_exchange(item) or item.venue or "").strip().upper()
-    if exchange not in {"KRX", "KOSPI", "KOSDAQ"}:
+    if exchange not in KRX_EXCHANGES:
         return False
     if str(session_type or "").strip().lower() in {"regular", "krx_regular"}:
         return True
@@ -2219,9 +2232,20 @@ def _context_timestamps(request_payload: dict[str, object]) -> dict[str, object]
 def _plan_item_exchange(item: ExecutionPlanItem) -> str:
     risk_context = item.risk_context if isinstance(item.risk_context, dict) else {}
     value = risk_context.get("exchange")
-    if isinstance(value, str) and value.strip():
-        return value.strip().upper()
-    return "KRX"
+    _, _, exchange = resolve_execution_market_scope(
+        provider=(
+            "kis"
+            if str(item.provider or "").strip().lower()
+            in {"kis", "korea-investment", "korea_investment"}
+            else item.provider
+        ),
+        asset_class=item.asset_class,
+        symbol=item.symbol,
+        exchange=value,
+        venue=item.venue,
+        risk_context=risk_context,
+    )
+    return exchange
 
 
 def _first_text(*payloads: dict[str, object], keys: tuple[str, ...]) -> str | None:

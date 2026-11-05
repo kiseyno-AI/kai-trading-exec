@@ -243,7 +243,7 @@ def test_risk_off_blocks_scheduled_next_open_dispatch_until_confirmed_recovery(
         risk_flags=3,
         risk_reasons=["broad market risk-off"],
     )
-    assert risk_off["changed_count"] == 1
+    assert risk_off["changed_count"] == 0
 
     with app.state.db_session_factory() as db:
         blocked_dispatch = dispatch_due_execution_jobs(
@@ -253,13 +253,15 @@ def test_risk_off_blocks_scheduled_next_open_dispatch_until_confirmed_recovery(
             now=started_at,
         )
     assert blocked_dispatch.status_code == 200
-    assert blocked_dispatch.payload["due_job_count"] == 0
+    assert blocked_dispatch.payload["due_job_count"] == 1
+    assert blocked_dispatch.payload["blocked_buy_job_count"] == 1
+    assert blocked_dispatch.payload["block_reason"] == "hourly_plan_risk_off"
     assert adapter.order_calls == []
     with app.state.db_session_factory() as db:
         item = db.get(ExecutionPlanItem, item_id)
         job = db.scalar(select(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item_id))
         assert item is not None
-        assert item.status == "watch_expired"
+        assert item.status == "next_open_buy_scheduled"
         assert job is not None
         assert job.status == "scheduled"
         assert job.attempts == 0
@@ -349,6 +351,52 @@ def test_pause_blocks_due_buy_job_before_broker_io_and_resume_releases_it(
     assert released.payload["blocked_buy_job_count"] == 0
     assert released.payload["completed_job_count"] == 1
     assert len(adapter.order_calls) == 1
+    engine.dispose()
+
+
+def test_krx_hourly_risk_off_keeps_future_kis_us_buy_scheduled(
+    tmp_path,
+) -> None:
+    app, engine, adapter, item_id = _next_open_app(
+        tmp_path,
+        plan_id="plan-us-future-visible-during-krx-risk-off",
+    )
+    triggered_at = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+    future_us_open = triggered_at + timedelta(hours=2)
+    with app.state.db_session_factory() as db:
+        item = db.get(ExecutionPlanItem, item_id)
+        job = db.scalar(
+            select(ExecutionJob).where(
+                ExecutionJob.execution_plan_item_id == item_id
+            )
+        )
+        control = db.get(RuntimeControlState, "global")
+        assert item is not None
+        assert job is not None
+        assert control is not None
+        item.symbol = "AAPL"
+        item.provider = "kis"
+        item.asset_class = "us_equity"
+        item.venue = "kis"
+        item.risk_context = {"exchange": "NASD"}
+        job.scheduled_for = future_us_open
+        control.hourly_risk_off_active = True
+        control.hourly_risk_off_epoch = 1
+        control.hourly_risk_off_context = {"reason": "krx-only risk fence"}
+        db.commit()
+
+        result = dispatch_due_execution_jobs(
+            settings=app.state.settings,
+            db=db,
+            adapter=adapter,
+            now=triggered_at,
+        )
+
+    assert result.status_code == 200
+    assert result.payload["due_job_count"] == 0
+    assert result.payload["blocked_buy_job_count"] == 0
+    assert result.payload["next_dispatch_at"] == future_us_open.isoformat()
+    assert adapter.order_calls == []
     engine.dispose()
 
 
@@ -1258,7 +1306,7 @@ def test_account_drawdown_state_change_reschedules_job_in_safe_retry_state(
     engine.dispose()
 
 
-def test_stale_running_job_is_reprojected_under_active_hourly_risk_off(
+def test_stale_running_job_keeps_retryable_item_under_active_hourly_risk_off(
     tmp_path,
 ) -> None:
     app, engine, adapter, item_id = _next_open_app(
@@ -1304,7 +1352,9 @@ def test_stale_running_job_is_reprojected_under_active_hourly_risk_off(
             now=attempted_at,
         )
 
-    assert result.payload["due_job_count"] == 0
+    assert result.payload["due_job_count"] == 1
+    assert result.payload["blocked_buy_job_count"] == 1
+    assert result.payload["block_reason"] == "hourly_plan_risk_off"
     assert adapter.order_calls == []
     with app.state.db_session_factory() as db:
         item = db.get(ExecutionPlanItem, item_id)
@@ -1315,11 +1365,8 @@ def test_stale_running_job_is_reprojected_under_active_hourly_risk_off(
         )
         assert item is not None
         assert job is not None
-        assert item.status == "watch_expired"
-        hourly_action = item.risk_context["hourly_plan_action"]
-        assert hourly_action["source"] == "hourly_runtime_check"
-        assert hourly_action["action"] == "risk_off_expire"
-        assert hourly_action["resume"]["status"] == "next_open_buy_retry_pending"
+        assert item.status == "next_open_buy_retry_pending"
+        assert "hourly_plan_action" not in item.risk_context
         assert job.status == "retrying"
         assert job.attempts == 1
     engine.dispose()

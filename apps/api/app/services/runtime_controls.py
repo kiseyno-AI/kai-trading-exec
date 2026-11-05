@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.models.runtime import RuntimeControlEvent, RuntimeControlState, new_id
+from app.services.execution_semantics import resolve_execution_market_scope
 
 RUNTIME_CONTROL_ID = "global"
 DEFAULT_CONTROL_SOURCE = "operator"
@@ -16,6 +18,22 @@ LEGACY_LIFESPAN_SHUTDOWN_REASON = "service lifespan shutdown started"
 LEGACY_LIFESPAN_SHUTDOWN_MESSAGE = "runtime paused; monitoring remains active"
 LEGACY_LIFESPAN_SHUTDOWN_READINESS_REASON = (
     "paused by operator; monitoring remains active"
+)
+KRX_BUY_EXCHANGES = frozenset({"KRX", "KOSPI", "KOSDAQ", "NXT", "SOR"})
+SEOUL = ZoneInfo("Asia/Seoul")
+TRANSIENT_MARKET_BUY_FILTER_REASONS = frozenset(
+    {
+        "paused",
+        "kill_switch",
+        "hourly_plan_risk_off",
+        "hourly_market_observation_missing",
+        "hourly_market_observation_stale",
+        "core_buy_authority_missing",
+        "core_buy_authority_projection_pending",
+        "core_buy_authority_blocked",
+        "core_buy_authority_unavailable",
+        "core_buy_authority_stale",
+    }
 )
 
 
@@ -167,8 +185,107 @@ def automated_buy_submission_block_reason(state: RuntimeControlState) -> str | N
     return None
 
 
+def hourly_market_observation_block_reason(
+    *,
+    settings: Settings,
+    state: RuntimeControlState,
+    now: datetime | None = None,
+) -> str | None:
+    context = (
+        state.hourly_risk_off_context
+        if isinstance(state.hourly_risk_off_context, dict)
+        else {}
+    )
+    market_date = context.get("last_market_observation_market_date")
+    received_at = _parse_utc_datetime(
+        context.get("last_market_observation_received_at")
+    )
+    source_observed_at = _parse_utc_datetime(
+        context.get("last_market_observation_source_observed_at")
+    )
+    if (
+        not isinstance(market_date, str)
+        or received_at is None
+        or source_observed_at is None
+    ):
+        return "hourly_market_observation_missing"
+    observed_at = _normalize_utc(now or datetime.now(UTC))
+    current_market_date = observed_at.astimezone(SEOUL).date().isoformat()
+    oldest_allowed = observed_at - timedelta(
+        seconds=settings.hourly_plan_judgment_max_observation_age_seconds
+    )
+    newest_allowed = observed_at + timedelta(
+        seconds=settings.hourly_plan_judgment_max_future_skew_seconds
+    )
+    if (
+        market_date != current_market_date
+        or not oldest_allowed <= received_at <= newest_allowed
+        or not oldest_allowed <= source_observed_at <= newest_allowed
+        or source_observed_at.astimezone(SEOUL).date().isoformat() != market_date
+    ):
+        return "hourly_market_observation_stale"
+    return None
+
+
+def market_scoped_automated_buy_submission_block_reason(
+    state: RuntimeControlState,
+    *,
+    settings: Settings,
+    provider: str | None,
+    asset_class: str | None,
+    exchange: str | None,
+    symbol: str | None = None,
+    venue: str | None = None,
+    risk_context: object = None,
+    now: datetime | None = None,
+) -> str | None:
+    runtime_reason = automated_order_submission_block_reason(state)
+    if runtime_reason is not None:
+        return runtime_reason
+    if state.paused:
+        return "paused"
+    normalized_provider, normalized_asset_class, normalized_exchange = (
+        resolve_execution_market_scope(
+            provider=provider,
+            asset_class=asset_class,
+            symbol=symbol,
+            exchange=exchange,
+            venue=venue,
+            risk_context=risk_context,
+        )
+        if symbol
+        else (
+            str(provider or "").strip().lower(),
+            str(asset_class or "").strip().lower(),
+            str(exchange or "").strip().upper(),
+        )
+    )
+    if (
+        normalized_provider != "kis"
+        or normalized_asset_class not in {"stock", "kr_equity"}
+        or normalized_exchange not in KRX_BUY_EXCHANGES
+    ):
+        return None
+    if state.hourly_risk_off_active:
+        return "hourly_plan_risk_off"
+    # Current-session market evidence is a live-order authority fence.  Paper
+    # simulations retain their historical deterministic fixtures and cannot
+    # mutate a real account even when no live observer is running.
+    if str(state.mode or "").strip().lower() != "live":
+        return None
+    return hourly_market_observation_block_reason(
+        settings=settings,
+        state=state,
+        now=now,
+    )
+
+
 def automated_buy_submission_allowed(state: RuntimeControlState) -> bool:
     return automated_buy_submission_block_reason(state) is None
+
+
+def is_transient_market_buy_filter_reason(reason: object) -> bool:
+    return str(reason or "").strip() in TRANSIENT_MARKET_BUY_FILTER_REASONS
 
 
 def hourly_risk_off_retry_after_at(
@@ -218,7 +335,21 @@ def last_change_payload(state: RuntimeControlState) -> dict[str, object]:
     }
 
 
-def runtime_safety_payload(state: RuntimeControlState) -> dict[str, object]:
+def runtime_safety_payload(
+    state: RuntimeControlState,
+    *,
+    settings: Settings | None = None,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    krx_market_observation_reason = (
+        hourly_market_observation_block_reason(
+            settings=settings,
+            state=state,
+            now=now,
+        )
+        if settings is not None
+        else None
+    )
     return {
         "mode": state.mode,
         "paused": state.paused,
@@ -233,6 +364,11 @@ def runtime_safety_payload(state: RuntimeControlState) -> dict[str, object]:
             "active": state.hourly_risk_off_active,
             "epoch": state.hourly_risk_off_epoch,
             "context": state.hourly_risk_off_context,
+        },
+        "krx_market_observation": {
+            "available": settings is not None,
+            "fresh": settings is not None and krx_market_observation_reason is None,
+            "block_reason": krx_market_observation_reason,
         },
         "readiness_reason": state.readiness_reason,
         "updated_at": state.updated_at.isoformat() if state.updated_at else None,

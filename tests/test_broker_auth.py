@@ -541,6 +541,7 @@ def build_test_app(
     monitoring_price_source: object | None = None,
     autonomous_runtime_enabled: bool = False,
     auto_bind_live_test_scope: bool = True,
+    auto_seed_live_market_observation: bool = True,
 ):
     setting_updates: dict[str, object] = {
         "autonomous_runtime_enabled": autonomous_runtime_enabled
@@ -599,6 +600,32 @@ def build_test_app(
         ),
         monitoring_price_source=monitoring_price_source,
     )
+    if effective_settings.runtime_mode == "live" and auto_seed_live_market_observation:
+        snapshot = broker_adapter.account_snapshot if broker_adapter is not None else None
+        observed_at = (
+            snapshot.observed_at
+            if snapshot is not None and snapshot.observed_at is not None
+            else datetime.now(UTC)
+        )
+        with session_factory() as session:
+            state = session.get(RuntimeControlState, "global")
+            if state is None:
+                state = RuntimeControlState(
+                    id="global",
+                    mode="live",
+                    paused=True,
+                )
+                session.add(state)
+            state.hourly_risk_off_context = {
+                "last_market_observation_id": "broker-auth-fixture",
+                "last_market_observation_market_date": observed_at.astimezone(
+                    ZoneInfo("Asia/Seoul")
+                ).date().isoformat(),
+                "last_market_observation_received_at": observed_at.isoformat(),
+                "last_market_observation_source_observed_at": observed_at.isoformat(),
+                "last_market_observation_risk_flags": 0,
+            }
+            session.commit()
     return app, engine
 
 
@@ -4747,6 +4774,7 @@ def test_runtime_fenced_recovery_child_cannot_cross_kis_account_scope() -> None:
 
 
 def test_automated_buy_rechecks_hourly_risk_off_after_account_snapshot(
+    monkeypatch,
     tmp_path,
 ) -> None:
     snapshot_entered = Event()
@@ -4768,6 +4796,8 @@ def test_automated_buy_rechecks_hourly_risk_off_after_account_snapshot(
         kis_app_key="paper-key",
         kis_app_secret="paper-secret",
         kis_account_number="12345678",
+        hourly_plan_judgment_recovery_cooldown_seconds=0,
+        hourly_plan_judgment_recovery_min_observation_interval_seconds=1,
     )
     broker_adapter = BlockingSnapshotAdapter(
         config=BrokerConfig(
@@ -4794,6 +4824,18 @@ def test_automated_buy_rechecks_hourly_risk_off_after_account_snapshot(
     assert client.post(
         "/controls/resume",
         json={"actor": "ops", "source": "test", "reason": "enable order"},
+    ).status_code == 200
+    initial_observed_at = datetime.now(UTC)
+    market_date = initial_observed_at.astimezone(ZoneInfo("Asia/Seoul")).date().isoformat()
+    assert client.post(
+        "/runtime/plan-judgment/action",
+        json={
+            "risk_flags": 0,
+            "risk_reasons": [],
+            "observation_id": "watch-race-initial-healthy",
+            "market_date": market_date,
+            "source_observed_at": initial_observed_at.isoformat(),
+        },
     ).status_code == 200
     item_id = _create_watch_buy_candidate(
         client,
@@ -4844,17 +4886,17 @@ def test_automated_buy_rechecks_hourly_risk_off_after_account_snapshot(
             json={
                 "risk_flags": 3,
                 "risk_reasons": ["severe risk appeared during buy preparation"],
+                "observation_id": "watch-race-risk-off",
+                "market_date": market_date,
+                "source_observed_at": initial_observed_at.isoformat(),
             },
         )
         assert risk_off.status_code == 200
-        assert risk_off.json()["action"] == "risk_off_expire"
+        assert risk_off.json()["action"] == "risk_off_fence"
         with app.state.db_session_factory() as session:
             fenced_item = session.get(ExecutionPlanItem, item_id)
             assert fenced_item is not None
-            assert fenced_item.status == "watch_expired"
-            assert fenced_item.risk_context["hourly_plan_action"]["action"] == (
-                "risk_off_expire"
-            )
+            assert fenced_item.status == "watch_monitoring_active"
     finally:
         release_snapshot.set()
     thread.join(timeout=3)
@@ -4865,6 +4907,46 @@ def test_automated_buy_rechecks_hourly_risk_off_after_account_snapshot(
     assert isinstance(placement, broker_orders_service.PlaceBrokerOrderResult)
     assert (placement.status_code, len(broker_adapter.order_calls)) == (409, 0)
     assert placement.payload["block_reason"] == "hourly_plan_risk_off"
+    with app.state.db_session_factory() as session:
+        fenced_item = session.get(ExecutionPlanItem, item_id)
+        assert fenced_item is not None
+        assert fenced_item.status == "watch_monitoring_active"
+        assert fenced_item.trigger_price == Decimal("100.00")
+        assert fenced_item.risk_context["chase_limit_price"] == "110.00"
+
+    class FrozenRecoveryDateTime(datetime):
+        current = initial_observed_at + timedelta(seconds=1)
+
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.current.replace(tzinfo=None)
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr(plan_judgment_actions, "datetime", FrozenRecoveryDateTime)
+    for index in (1, 2):
+        recovered = client.post(
+            "/runtime/plan-judgment/action",
+            json={
+                "risk_flags": 0,
+                "risk_reasons": [],
+                "observation_id": f"watch-race-recovery-{index}",
+                "market_date": market_date,
+                "source_observed_at": FrozenRecoveryDateTime.current.isoformat(),
+            },
+        )
+        assert recovered.status_code == 200
+        FrozenRecoveryDateTime.current += timedelta(seconds=1)
+    with app.state.db_session_factory() as session:
+        retried = broker_orders_service.place_broker_order(
+            settings=settings,
+            db=session,
+            adapter=broker_adapter,
+            command=command,
+            request_source="monitoring:intraday_target_stop_monitor",
+        )
+    assert retried.status_code == 201
+    assert len(broker_adapter.order_calls) == 1
     engine.dispose()
 
 
@@ -5769,6 +5851,19 @@ def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
         "datetime",
         FrozenHourlyDateTime,
     )
+    initial_observation = client.post(
+        "/runtime/plan-judgment/action",
+        json={
+            "risk_flags": 0,
+            "risk_reasons": [],
+            "observation_id": "pending-intent-initial-healthy",
+            "market_date": FrozenHourlyDateTime.current.astimezone(
+                ZoneInfo("Asia/Seoul")
+            ).date().isoformat(),
+            "source_observed_at": FrozenHourlyDateTime.current.isoformat(),
+        },
+    )
+    assert initial_observation.status_code == 200
 
     def dispatch_first_attempt() -> None:
         try:
@@ -5786,6 +5881,7 @@ def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
     thread.start()
     assert boundary_entered.wait(timeout=3)
     risk_off_payload: dict[str, object]
+    pre_submit_status: str
     try:
         with app.state.db_session_factory() as session:
             pending_order = session.scalar(
@@ -5796,6 +5892,9 @@ def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
             assert pending_order.status == "submission_pending"
             assert pending_item is not None
             assert pending_item.status == "broker_order_submission_pending"
+            pre_submit_status = str(
+                pending_order.request_metadata["plan_item_status_before_submission"]
+            )
         risk_off = client.post(
             "/runtime/plan-judgment/action",
             json={
@@ -5805,7 +5904,7 @@ def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
         )
         assert risk_off.status_code == 200
         risk_off_payload = risk_off.json()
-        assert risk_off_payload["action"] == "risk_off_expire"
+        assert risk_off_payload["action"] == "risk_off_fence"
     finally:
         release_boundary.set()
     thread.join(timeout=4)
@@ -5828,7 +5927,7 @@ def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
         assert fenced_order.last_error_code == "hourly_plan_risk_off"
         fenced_order_id = fenced_order.id
         assert fenced_item is not None
-        assert fenced_item.status == "watch_expired"
+        assert fenced_item.status == "next_open_buy_retry_pending"
         assert fenced_job is not None
         assert fenced_job.status == "scheduled"
 
@@ -5861,7 +5960,7 @@ def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
     assert first_healthy.status_code == 200
     assert first_healthy.json()["recovery_resumed_count"] == 0
     assert second_healthy.status_code == 200
-    assert second_healthy.json()["recovery_resumed_count"] == 1
+    assert second_healthy.json()["recovery_resumed_count"] == 0
     with app.state.db_session_factory() as session:
         resumed_item = session.get(ExecutionPlanItem, item_id)
         resumed_job = session.get(ExecutionJob, job_id)
@@ -5909,7 +6008,6 @@ def test_next_open_pending_intent_resumes_same_job_once_after_hourly_recovery(
     "payload",
     [
         {"risk_reasons": ["test"]},
-        {"risk_flags": 1},
         {"risk_flags": 0, "risk_reasons": []},
     ],
 )
@@ -5929,6 +6027,34 @@ def test_plan_judgment_endpoint_rejects_incomplete_observation_contract(
     )
 
     assert response.status_code == 422
+    engine.dispose()
+
+
+def test_legacy_risky_observation_is_conservative_without_creating_freshness(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'legacy-risk-observation.db'}",
+        runtime_mode="mock",
+    )
+    app, engine = build_test_app(settings=settings)
+    client = TestClient(app)
+    assert client.post(
+        "/controls/resume",
+        json={"actor": "ops", "source": "test", "reason": "initialize runtime"},
+    ).status_code == 200
+
+    response = client.post(
+        "/runtime/plan-judgment/action",
+        json={"risk_flags": 1, "risk_reasons": ["legacy emergency caution"]},
+    )
+
+    assert response.status_code == 200
+    state = client.get("/runtime/status").json()
+    assert state["safety"]["krx_market_observation"]["fresh"] is False
+    assert state["safety"]["krx_market_observation"]["block_reason"] == (
+        "hourly_market_observation_missing"
+    )
     engine.dispose()
 
 
@@ -12124,13 +12250,13 @@ def test_watch_buy_exec_agent_notional_cap_rejects_when_price_exceeds_cap() -> N
     payload = response.json()
     assert payload["triggered_item_count"] == 1
     assert payload["submitted_order_count"] == 0
-    assert payload["items"][0]["outcome"] == "rejected"
+    assert payload["items"][0]["outcome"] == "blocked"
     assert broker_adapter.order_calls == []
 
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        assert item.status == "watch_buy_rejected"
+        assert item.status == "watch_buy_triggered_blocked"
         event = item.risk_context["last_monitoring_event"]
         assert event["reason"] == "exec_agent_approved_notional_exhausted"
         assert event["details"]["exec_agent_approved_notional_cap"] == "1000.0000"
@@ -13059,14 +13185,14 @@ def test_watch_buy_rejects_high_atr_weak_trend_before_submit() -> None:
     assert payload["triggered_item_count"] == 1
     assert payload["submitted_order_count"] == 0
     assert payload["blocked_item_count"] == 1
-    assert payload["items"][0]["outcome"] == "rejected"
+    assert payload["items"][0]["outcome"] == "blocked"
     assert payload["items"][0]["block_reason"] == "short_term_high_atr_weak_trend_block"
     assert broker_adapter.order_calls == []
 
     with app.state.db_session_factory() as session:
         item = session.get(ExecutionPlanItem, item_id)
         assert item is not None
-        assert item.status == "watch_buy_rejected"
+        assert item.status == "watch_buy_triggered_blocked"
         last_event = item.risk_context["last_monitoring_event"]
         assert last_event["reason"] == "short_term_high_atr_weak_trend_block"
         assert last_event["details"]["atr_pct_14"] == "9.4000"
@@ -14014,7 +14140,7 @@ def test_watch_buy_cycle_reserves_orderable_cash_before_broker_submission() -> N
     assert submitted_item_id in {first_item_id, second_item_id}
     rejected_item_id = second_item_id if submitted_item_id == first_item_id else first_item_id
     assert results[submitted_item_id]["outcome"] == "submitted"
-    assert results[rejected_item_id]["outcome"] == "rejected"
+    assert results[rejected_item_id]["outcome"] == "blocked"
     assert results[rejected_item_id]["block_reason"] == "reserved_cash_exhausted"
 
     with app.state.db_session_factory() as session:
@@ -14027,7 +14153,7 @@ def test_watch_buy_cycle_reserves_orderable_cash_before_broker_submission() -> N
         assert submitted_item is not None
         assert rejected_item is not None
         assert submitted_item.status == "watch_buy_submitted"
-        assert rejected_item.status == "watch_buy_rejected"
+        assert rejected_item.status == "watch_buy_triggered_blocked"
         last_event = rejected_item.risk_context["last_monitoring_event"]
         assert last_event["reason"] == "reserved_cash_exhausted"
         details = last_event["details"]
@@ -21416,8 +21542,15 @@ def test_execution_failures_persist_after_restart(tmp_path) -> None:
     restarted_engine.dispose()
 
 
-def test_live_mode_cycle_exposes_symbol_readback_and_daily_board_views() -> None:
+def test_live_mode_cycle_exposes_symbol_readback_and_daily_board_views(
+    monkeypatch,
+) -> None:
     dispatch_at = datetime(2024, 1, 3, 0, 0, 1, tzinfo=UTC)
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        lambda **_kwargs: dispatch_at,
+    )
 
     class LiveReadbackAdapter(StubBrokerAdapter):
         def get_live_market_context(self, access_token: str, **kwargs: object):
@@ -23152,6 +23285,7 @@ def test_kis_us_live_market_context_rejects_conflicting_response_identity() -> N
     ],
 )
 def test_manual_review_us_holding_does_not_override_krx_buy_boundary_guards(
+    monkeypatch,
     calendar_open: bool | None,
     freshness_source: str,
     ask: Decimal | None,
@@ -23160,6 +23294,11 @@ def test_manual_review_us_holding_does_not_override_krx_buy_boundary_guards(
     expected_reason: str | None,
 ) -> None:
     observed_at = datetime(2026, 9, 9, 1, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        lambda **_kwargs: observed_at,
+    )
 
     class LiveEvidenceAdapter(StubBrokerAdapter):
         def get_live_market_context(self, access_token: str, **kwargs: object):
@@ -23329,8 +23468,15 @@ def test_manual_review_us_holding_does_not_override_krx_buy_boundary_guards(
     engine.dispose()
 
 
-def test_live_automated_krx_buy_uses_the_route_recomputed_at_the_final_boundary() -> None:
+def test_live_automated_krx_buy_uses_the_route_recomputed_at_the_final_boundary(
+    monkeypatch,
+) -> None:
     final_reference_at = datetime(2026, 9, 9, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        lambda **_kwargs: final_reference_at,
+    )
 
     class LiveEvidenceAdapter(StubBrokerAdapter):
         def get_live_market_context(self, access_token: str, **kwargs: object):
@@ -23478,6 +23624,11 @@ def test_final_broker_command_is_durable_before_process_loss_at_broker_boundary(
     monkeypatch,
 ) -> None:
     final_reference_at = datetime(2026, 9, 9, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        broker_orders_service,
+        "_final_buy_boundary_checked_at",
+        lambda **_kwargs: final_reference_at,
+    )
 
     class ProcessLossAdapter(StubBrokerAdapter):
         crash_after_submission = True

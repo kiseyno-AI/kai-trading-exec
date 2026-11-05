@@ -992,6 +992,31 @@ def test_live_regular_buy_authority_veto_precedes_configurable_guardrail(
     assert captured["evaluated_at"] == evaluated_at
 
 
+def test_dynamic_market_filters_are_retryable_watch_blocks() -> None:
+    for reason in (
+        "hourly_market_observation_missing",
+        "hourly_market_observation_stale",
+        "market_breadth_stale",
+        "untrusted_quote_provenance",
+        "zero_trigger_volume",
+        "zero_trigger_turnover",
+        "missing_day_high_low",
+        "low_trigger_turnover",
+        "account_basis_unavailable",
+        "insufficient_cash",
+        "risk_budget_too_small",
+        "symbol_exposure_cap_exceeded",
+        "daily_new_buy_cap_reached",
+        "market_regime_min_lot_rejected",
+        "vol_corr_min_lot_rejected",
+    ):
+        assert monitoring_service._watch_buy_approval_reason_is_transient(reason)
+        assert reason in monitoring_service.RETRYABLE_WATCH_BUY_APPROVAL_REASONS
+    assert not monitoring_service._watch_buy_approval_reason_is_transient(
+        "live_buy_target_geometry_invalid"
+    )
+
+
 def test_monitoring_checkpoint_scope_uses_canonical_kis_account_identity() -> None:
     settings = _settings()
     identity = build_position_identity(

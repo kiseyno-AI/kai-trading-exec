@@ -84,6 +84,7 @@ from app.services.execution_semantics import (
     is_delegated_exec_agent_sizing_policy,
     is_exec_agent_sizing_policy,
     is_short_term_watch_buy_intent,
+    resolve_execution_market_scope,
     watch_buy_direction_from_payloads,
 )
 from app.services.execution_lineage import (
@@ -135,9 +136,8 @@ from app.services.monitoring_price_source import (
     monitoring_price_from_broker_quote,
 )
 from app.services.runtime_controls import (
-    automated_buy_submission_allowed,
-    automated_buy_submission_block_reason,
     ensure_runtime_control_state,
+    market_scoped_automated_buy_submission_block_reason,
 )
 from app.services.trading_sessions import (
     TradingSessionDeadline,
@@ -213,6 +213,27 @@ BLOCKED_MONITORING_STATUSES = SELL_TRIGGERED_BLOCKED_STATUSES | frozenset(
         "watch_cancelled",
     }
 )
+DYNAMIC_WATCH_BUY_APPROVAL_REASONS = frozenset(
+    {
+        "hourly_market_observation_missing",
+        "hourly_market_observation_stale",
+        "market_breadth_stale",
+        "untrusted_quote_provenance",
+        "zero_trigger_volume",
+        "zero_trigger_turnover",
+        "missing_day_high_low",
+        "low_trigger_turnover",
+        "account_basis_unavailable",
+        "insufficient_cash",
+        "risk_budget_too_small",
+        "symbol_exposure_cap_exceeded",
+        "daily_new_buy_cap_reached",
+        "market_regime_min_lot_rejected",
+        "vol_corr_min_lot_rejected",
+        "exec_agent_approved_notional_exhausted",
+        "reserved_cash_exhausted",
+    }
+)
 RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
     {
         "account_snapshot_unavailable",
@@ -231,8 +252,6 @@ RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
         "live_buy_ask_unavailable",
         "live_buy_target_missing",
         "live_buy_stop_missing",
-        "live_buy_target_geometry_invalid",
-        "live_buy_stop_geometry_invalid",
         "live_market_breadth_unavailable",
         "market_breadth_risk_off",
         "sector_weakness_reject",
@@ -241,18 +260,39 @@ RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
         "entry_lane_attribution_unavailable",
         "duplicate_open_buy_order",
     }
-)
+) | DYNAMIC_WATCH_BUY_APPROVAL_REASONS
 BLOCKED_WATCH_BUY_APPROVAL_REASONS = frozenset(
     {
         "paused",
         "kill_switch",
         "hourly_plan_risk_off",
+        "hourly_market_observation_missing",
+        "hourly_market_observation_stale",
         "stale_trigger_reclaim_required",
         "late_entry_cutoff",
         "watch_buy_very_weak_liquidity",
         "same_lane_existing_holding",
     }
 )
+
+
+def _watch_buy_approval_reason_is_transient(reason: object) -> bool:
+    normalized = str(reason or "").strip()
+    return bool(
+        normalized in BLOCKED_WATCH_BUY_APPROVAL_REASONS
+        or normalized in RETRYABLE_WATCH_BUY_APPROVAL_REASONS
+        or normalized.startswith("market_breadth_stale")
+        or normalized.startswith("market_regime_")
+        or normalized.startswith("vol_corr_")
+    )
+
+
+def _watch_buy_approval_reason_requires_cooldown(reason: object) -> bool:
+    normalized = str(reason or "").strip()
+    return bool(
+        normalized in RETRYABLE_WATCH_BUY_APPROVAL_REASONS
+        and normalized not in BLOCKED_WATCH_BUY_APPROVAL_REASONS
+    )
 PENDING_DISPATCH_MONITORING_STATUSES = (
     SELL_TRIGGERED_PENDING_DISPATCH_STATUSES
     | frozenset(
@@ -3093,6 +3133,35 @@ def _evaluate_monitoring_cycle(
             )
             continue
 
+        if _is_watch_buy_item(item) and item.status in AGENT_ACTIVE_STATUSES:
+            previous_status = item.status
+            item.status = _monitoring_status(item.intent)
+            recovery_event = {
+                "event": "retired_trigger_time_buy_agent_state_rearmed",
+                "reason": "trigger_time_buy_agent_path_retired",
+                "message": (
+                    "legacy trigger-time BUY agent state was returned to deterministic "
+                    "price-line monitoring"
+                ),
+                "previous_status": previous_status,
+                "recorded_at": triggered_at.isoformat(),
+            }
+            _record_monitoring_event(item=item, event=recovery_event)
+            db.add(
+                ExecutionPlanItemAudit(
+                    execution_plan_item_id=item.id,
+                    event_type="retired_trigger_time_buy_agent_state_rearmed",
+                    source=MONITORING_WORKER_NAME,
+                    summary={
+                        "symbol": item.symbol,
+                        "previous_status": previous_status,
+                        "status": item.status,
+                    },
+                    payload=recovery_event,
+                    occurred_at=triggered_at,
+                )
+            )
+
         retry_blocked_until = _watch_buy_retry_blocked_until(
             settings=settings,
             item=item,
@@ -3404,15 +3473,15 @@ def _evaluate_monitoring_cycle(
                 retryable_pullback_gate = _is_retryable_watch_buy_pullback_gate(
                     risk_gate["reason"]
                 )
-                retryable_gate = (
-                    retryable_pullback_gate or recovery_source_must_remain_retryable
-                )
+                # Technical and intraday context are observations, not a
+                # permanent contract verdict.  Keep the candidate eligible
+                # for a later cycle when those observations recover.
                 item.status = (
                     "watch_buy_triggered_blocked"
                     if recovery_source_must_remain_retryable
                     else "watch_monitoring_active"
                     if retryable_pullback_gate
-                    else "watch_buy_rejected"
+                    else "watch_buy_triggered_blocked"
                 )
                 _record_monitoring_event(
                     item=item,
@@ -3422,19 +3491,25 @@ def _evaluate_monitoring_cycle(
                             if recovery_source_must_remain_retryable
                             else "watch_buy_pullback_wait"
                             if retryable_pullback_gate
-                            else "watch_buy_rejected"
+                            else "watch_buy_triggered_blocked"
                         ),
                         "reason": risk_gate["reason"],
                         "message": risk_gate["message"],
                         "details": risk_gate["details"],
                         "observed_price": _serialize_decimal(observed_price),
                         "recorded_at": triggered_at.isoformat(),
+                        "retry_after_at": (
+                            triggered_at
+                            + timedelta(
+                                seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                            )
+                        ).isoformat(),
                     },
                 )
                 result_by_item_id[item.id] = _monitoring_result_payload(
                     item=item,
                     observed_price=observed_price,
-                    outcome="blocked" if retryable_gate else "rejected",
+                    outcome="blocked",
                     block_reason=risk_gate["reason"],
                     message=risk_gate["message"],
                     risk_decision=risk_gate["details"],
@@ -3663,7 +3738,17 @@ def _evaluate_monitoring_cycle(
             trigger_time_agent_quantity: int | None = None
             trigger_time_agent_stop_price: Decimal | None = None
             control_state = ensure_runtime_control_state(settings=settings, db=db)
-            entry_block_reason = automated_buy_submission_block_reason(control_state)
+            entry_block_reason = market_scoped_automated_buy_submission_block_reason(
+                control_state,
+                settings=settings,
+                provider=action.item.provider,
+                asset_class=action.item.asset_class,
+                exchange=_plan_item_exchange(action.item),
+                symbol=action.item.symbol,
+                venue=action.item.venue,
+                risk_context=action.item.risk_context,
+                now=triggered_at,
+            )
             if entry_block_reason is not None:
                 approval = WatchBuyOrderApproval(
                     quantity=None,
@@ -3673,54 +3758,10 @@ def _evaluate_monitoring_cycle(
                     ),
                 )
             else:
-                trigger_time_agent_enabled = (
-                    trigger_time_exec_agent.trigger_time_exec_agent_enabled(
-                        settings=settings,
-                        item=action.item,
-                    )
-                )
-                if (
-                    trigger_time_agent_enabled
-                    and not _watch_buy_entry_line_bypasses_agent(action)
-                ):
-                    if _watch_buy_trigger_cross_pullback_bypasses_agent(action):
-                        agent_result = _resolve_trigger_time_quality_gate_delay(
-                            settings=settings,
-                            db=db,
-                            adapter=adapter,
-                            action=action,
-                            triggered_at=triggered_at,
-                            quote_freshness_at=quote_freshness_at,
-                            cycle_started=cycle_started,
-                        )
-                    else:
-                        agent_result = _resolve_trigger_time_agent_action(
-                            settings=settings,
-                            db=db,
-                            adapter=adapter,
-                            action=action,
-                            triggered_at=triggered_at,
-                            quote_freshness_at=quote_freshness_at,
-                            cycle_started=cycle_started,
-                            intended_quantity=None,
-                            remaining_quantity=None,
-                        )
-                    if agent_result is not None:
-                        if agent_result.refreshed_price is not None:
-                            action = _action_with_refreshed_price(
-                                action=action,
-                                price=agent_result.refreshed_price,
-                            )
-                            prices[action.item.symbol] = agent_result.refreshed_price
-                        if agent_result.quantity is None:
-                            blocked_item_count += 1
-                            result_by_item_id[action.item.id] = agent_result.result_payload
-                            if symbol_actions:
-                                pending_symbols.append(symbol)
-                            continue
-                        trigger_time_agent_quantity = agent_result.quantity
-                        trigger_time_agent_stop_price = agent_result.stop_price
-                        limit_price_override = agent_result.limit_price
+                # The persisted decider geometry is already the buy decision.
+                # A price-line touch proceeds directly through deterministic
+                # sizing and live safety fences; it must not invoke another
+                # agent/decider round that can override or delay that decision.
                 approval = _resolve_watch_buy_order(
                     settings=settings,
                     db=db,
@@ -3741,9 +3782,7 @@ def _evaluate_monitoring_cycle(
             quantity = approval.quantity
             if quantity is None:
                 blocked_item_count += 1
-                if approval.reason in (
-                    BLOCKED_WATCH_BUY_APPROVAL_REASONS | RETRYABLE_WATCH_BUY_APPROVAL_REASONS
-                ):
+                if _watch_buy_approval_reason_is_transient(approval.reason):
                     action.item.status = "watch_buy_triggered_blocked"
                     event: dict[str, object] = {
                         "event": "watch_buy_triggered_blocked",
@@ -3754,7 +3793,7 @@ def _evaluate_monitoring_cycle(
                     }
                     if approval.details:
                         event["details"] = approval.details
-                    if approval.reason in RETRYABLE_WATCH_BUY_APPROVAL_REASONS:
+                    if _watch_buy_approval_reason_requires_cooldown(approval.reason):
                         event["retry_after_at"] = (
                             triggered_at
                             + timedelta(
@@ -3963,7 +4002,17 @@ def _evaluate_monitoring_cycle(
                 )
             else:
                 control_state = ensure_runtime_control_state(settings=settings, db=db)
-                if automated_buy_submission_allowed(control_state):
+                if market_scoped_automated_buy_submission_block_reason(
+                    control_state,
+                    settings=settings,
+                    provider=action.item.provider,
+                    asset_class=action.item.asset_class,
+                    exchange=_plan_item_exchange(action.item),
+                    symbol=action.item.symbol,
+                    venue=action.item.venue,
+                    risk_context=action.item.risk_context,
+                    now=triggered_at,
+                ) is None:
                     if watch_buy_cash_reservation is None:
                         watch_buy_cash_reservation = _load_watch_buy_cash_reservation(
                             settings=settings,
@@ -4038,8 +4087,9 @@ def _evaluate_monitoring_cycle(
                     )
                     if candidate_notional > watch_buy_cash_reservation.remaining_cash:
                         blocked_item_count += 1
-                        action.item.status = "watch_buy_rejected"
+                        action.item.status = "watch_buy_triggered_blocked"
                         _record_reserved_cash_exhausted(
+                            settings=settings,
                             db=db,
                             item=action.item,
                             payload=reservation_payload,
@@ -4048,7 +4098,7 @@ def _evaluate_monitoring_cycle(
                         result_by_item_id[action.item.id] = _monitoring_result_payload(
                             item=action.item,
                             observed_price=action.observed_price,
-                            outcome="rejected",
+                            outcome="blocked",
                             block_reason=RESERVED_CASH_EXHAUSTED_REASON,
                             message="watch buy reserved cash budget exhausted before broker submission",
                             trigger_metadata=reservation_payload,
@@ -6080,46 +6130,6 @@ def _trigger_time_agent_preflight_failure(
     )
 
 
-def _resolve_trigger_time_quality_gate_delay(
-    *,
-    settings: Settings,
-    db: Session,
-    adapter: BrokerAdapter,
-    action: PendingMonitoringAction,
-    triggered_at: datetime,
-    quote_freshness_at: datetime | None,
-    cycle_started: float,
-) -> TriggerTimeAgentActionResult | None:
-    evaluated_at = _cycle_evaluated_at(
-        triggered_at=triggered_at,
-        quote_freshness_at=quote_freshness_at,
-        cycle_started=cycle_started,
-    )
-    market_context, stale_reason = trigger_time_exec_agent._market_context(
-        settings=settings,
-        item=action.item,
-        observed_price=action.observed_price,
-        observed_at=_price_observed_at_from_action(action=action, fallback=triggered_at),
-        triggered_at=evaluated_at,
-        trigger_reason=action.trigger_reason,
-        trigger_metadata=action.trigger_metadata,
-        live_market_context=action.market_quality_context,
-    )
-    if stale_reason is None and market_context.get("live_execution_context_available") is True:
-        return None
-    return _resolve_trigger_time_agent_action(
-        settings=settings,
-        db=db,
-        adapter=adapter,
-        action=action,
-        triggered_at=triggered_at,
-        quote_freshness_at=quote_freshness_at,
-        cycle_started=cycle_started,
-        intended_quantity=None,
-        remaining_quantity=None,
-    )
-
-
 def _price_observed_at_from_action(
     *,
     action: PendingMonitoringAction,
@@ -6886,7 +6896,7 @@ def _record_trigger_time_watch_buy_sizing_result(
 
     if approval.quantity is not None:
         outcome = "approved"
-    elif approval.reason in ({"paused", "kill_switch"} | RETRYABLE_WATCH_BUY_APPROVAL_REASONS):
+    elif _watch_buy_approval_reason_is_transient(approval.reason):
         outcome = "blocked"
     else:
         outcome = "rejected"
@@ -9822,7 +9832,7 @@ def _watch_buy_retry_blocked_until(
     if event is None:
         return None
     reason = str(event.get("reason") or "")
-    if reason not in RETRYABLE_WATCH_BUY_APPROVAL_REASONS:
+    if not _watch_buy_approval_reason_requires_cooldown(reason):
         return None
     retry_after_at = _parse_event_datetime(event.get("retry_after_at"))
     if retry_after_at is not None:
@@ -13961,6 +13971,25 @@ def _resolve_sell_quantity(
     return None
 
 
+def _dynamic_buy_filter_market_date(
+    *,
+    settings: Settings,
+    item: ExecutionPlanItem,
+    evaluated_at: datetime,
+) -> date | None:
+    if settings.runtime_mode == "live":
+        _, _, exchange = resolve_execution_market_scope(
+            provider=item.provider,
+            asset_class=item.asset_class,
+            symbol=item.symbol,
+            venue=item.venue,
+            risk_context=item.risk_context,
+        )
+        if exchange in {"KRX", "KOSPI", "KOSDAQ", "NXT", "SOR"}:
+            return _normalize_utc(evaluated_at).astimezone(KRX_TIMEZONE).date()
+    return item.plan.market_date if item.plan is not None else None
+
+
 def _resolve_watch_buy_order(
     *,
     settings: Settings,
@@ -14056,6 +14085,11 @@ def _resolve_watch_buy_order(
         return late_entry_veto
 
     live_veto_recorded_at = _price_observed_at(price, datetime.now(UTC)) if price is not None else datetime.now(UTC)
+    live_filter_market_date = _dynamic_buy_filter_market_date(
+        settings=settings,
+        item=item,
+        evaluated_at=live_veto_recorded_at,
+    )
     live_veto = _live_watch_buy_submission_veto(
         settings=settings,
         item=item,
@@ -14074,7 +14108,17 @@ def _resolve_watch_buy_order(
         return live_veto
 
     control_state = ensure_runtime_control_state(settings=settings, db=db)
-    block_reason = automated_buy_submission_block_reason(control_state)
+    block_reason = market_scoped_automated_buy_submission_block_reason(
+        control_state,
+        settings=settings,
+        provider=item.provider,
+        asset_class=item.asset_class,
+        exchange=_plan_item_exchange(item),
+        symbol=item.symbol,
+        venue=item.venue,
+        risk_context=item.risk_context,
+        now=live_veto_recorded_at,
+    )
     if block_reason is not None:
         return WatchBuyOrderApproval(
             quantity=None,
@@ -14158,7 +14202,8 @@ def _resolve_watch_buy_order(
             market_date=item.plan.market_date,
         ),
         market_regime_context=market_regime_context,
-        market_date=item.plan.market_date,
+        market_date=live_filter_market_date,
+        evaluated_at=live_veto_recorded_at,
     )
     if isinstance(risk_decision, RiskSizingRejection):
         details = dict(risk_decision.details)
@@ -14334,7 +14379,11 @@ def _live_watch_buy_submission_veto(
     market_guardrail = evaluate_market_regime_guardrail(
         settings=settings,
         context=market_context,
-        market_date=item.plan.market_date,
+        market_date=_dynamic_buy_filter_market_date(
+            settings=settings,
+            item=item,
+            evaluated_at=recorded_at,
+        ),
         original_notional=skipped_notional,
         original_quantity=quantity,
         reference_price=observed_price,
@@ -14568,10 +14617,13 @@ def _record_live_watch_buy_submission_veto(
     recorded_at: datetime,
 ) -> None:
     payload = approval.details or {}
+    transient = _watch_buy_approval_reason_is_transient(approval.reason)
+    event_name = "watch_buy_triggered_blocked" if transient else "watch_buy_rejected"
+    status = event_name
     _record_monitoring_event(
         item=item,
         event={
-            "event": "watch_buy_rejected",
+            "event": event_name,
             "reason": approval.reason or "live_watch_buy_submission_veto",
             "message": approval.message,
             "details": payload,
@@ -14584,7 +14636,7 @@ def _record_live_watch_buy_submission_veto(
             event_type=LIVE_WATCH_BUY_VETO_EVENT_TYPE,
             source=MONITORING_WORKER_NAME,
             summary={
-                "status": "watch_buy_rejected",
+                "status": status,
                 "reason": approval.reason,
                 "symbol": item.symbol,
                 "skipped_quantity": payload.get("skipped_quantity"),
@@ -15178,6 +15230,7 @@ def _watch_buy_cash_reservation_payload(
 
 def _record_reserved_cash_exhausted(
     *,
+    settings: Settings,
     db: Session,
     item: ExecutionPlanItem,
     payload: dict[str, object],
@@ -15186,11 +15239,17 @@ def _record_reserved_cash_exhausted(
     _record_monitoring_event(
         item=item,
         event={
-            "event": "watch_buy_rejected",
+            "event": "watch_buy_triggered_blocked",
             "reason": RESERVED_CASH_EXHAUSTED_REASON,
             "message": "watch buy reserved cash budget exhausted before broker submission",
             "details": payload,
             "recorded_at": triggered_at.isoformat(),
+            "retry_after_at": (
+                triggered_at
+                + timedelta(
+                    seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
+                )
+            ).isoformat(),
         },
     )
     db.add(
@@ -15199,6 +15258,7 @@ def _record_reserved_cash_exhausted(
             event_type=RESERVED_CASH_EXHAUSTED_REASON,
             source=MONITORING_WORKER_NAME,
             summary={
+                "status": "watch_buy_triggered_blocked",
                 "reason": RESERVED_CASH_EXHAUSTED_REASON,
                 "batch_id": payload.get("batch_id"),
                 "symbol": item.symbol,
@@ -17085,15 +17145,14 @@ def _core_v4_monitoring_contract_fields(
 
 def _plan_item_exchange(item: ExecutionPlanItem) -> str:
     risk_context = _loaded_risk_context(item, allow_file_backed_load=True)
-    if not isinstance(risk_context, dict):
-        return "KRX"
-    exchange = risk_context.get("exchange")
-    if isinstance(exchange, str) and exchange.strip():
-        return exchange.strip().upper()
-    venue = str(item.venue or "").strip().upper()
-    if venue in set(MONITORED_KIS_POSITION_EXCHANGES) | {"US", "UPBIT"}:
-        return venue
-    return "KRX"
+    _, _, exchange = resolve_execution_market_scope(
+        provider=item.provider,
+        asset_class=item.asset_class,
+        symbol=item.symbol,
+        venue=item.venue,
+        risk_context=risk_context,
+    )
+    return exchange
 
 
 def _update_monitoring_checkpoint(
@@ -17530,33 +17589,6 @@ def _watch_buy_limit_price(
     if chase_limit_price is None:
         return reference_price
     return min(reference_price, chase_limit_price)
-
-
-def _watch_buy_trigger_cross_pullback_bypasses_agent(action: PendingMonitoringAction) -> bool:
-    if not _is_watch_buy_item(action.item) or action.observed_price is None:
-        return False
-    metadata = action.trigger_metadata
-    if not isinstance(metadata, dict):
-        return False
-    reason = metadata.get("reason")
-    if reason not in {"intraday_watch_buy_day_high_cross", "intraday_watch_buy_day_low_cross"}:
-        return False
-    trigger_price = _watch_buy_trigger_price(action.item)
-    if trigger_price is None:
-        return False
-    direction = _watch_buy_direction(action.item)
-    if direction == "at_or_below":
-        return action.observed_price >= trigger_price
-    return action.observed_price <= trigger_price
-
-
-def _watch_buy_entry_line_bypasses_agent(action: PendingMonitoringAction) -> bool:
-    if not _is_watch_buy_item(action.item) or action.observed_price is None:
-        return False
-    if _watch_buy_direction(action.item) != "at_or_below":
-        return False
-    trigger_price = _watch_buy_trigger_price(action.item)
-    return trigger_price is not None and action.observed_price <= trigger_price
 
 
 def _monitoring_result_payload(

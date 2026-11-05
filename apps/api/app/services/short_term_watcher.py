@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
@@ -15,6 +16,7 @@ from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, Ex
 from app.services.broker_auth import ensure_authenticated_broker_session
 from app.services.broker_orders import place_broker_order
 from app.services.execution_api import serialize_broker_order
+from app.services.execution_semantics import resolve_execution_market_scope
 from app.services.execution_account_route import (
     KIS_ACCOUNT_ROUTE_BINDING_KEY,
     kis_account_route_binding_from_payloads,
@@ -28,9 +30,8 @@ from app.services.broker_order_state import (
     active_local_broker_order_filters,
 )
 from app.services.runtime_controls import (
-    automated_buy_submission_allowed,
-    automated_buy_submission_block_reason,
     ensure_runtime_control_state,
+    market_scoped_automated_buy_submission_block_reason,
     runtime_safety_payload,
 )
 from app.services.position_identity import (
@@ -76,16 +77,30 @@ def evaluate_short_term_watcher_decision(
     item = _load_candidate(settings=settings, db=db, execution_plan_item_id=command.execution_plan_item_id)
     if item is None:
         return _rejected(404, "candidate_not_found", "execution_plan_item_id was not found")
+    item_provider, item_asset_class, item_exchange = resolve_execution_market_scope(
+        provider=item.provider,
+        asset_class=item.asset_class,
+        symbol=item.symbol,
+        venue=item.venue,
+        risk_context=item.risk_context,
+    )
 
     safety_state = ensure_runtime_control_state(settings=settings, db=db)
-    safety = runtime_safety_payload(safety_state)
+    safety = runtime_safety_payload(safety_state, settings=settings, now=now)
     candidate_rejection = _validate_candidate(item=item)
     account_context = command.account_context
     broker_account_snapshot = None
     if (
         candidate_rejection is None
         and not command.dry_run
-        and automated_buy_submission_allowed(safety_state)
+        and market_scoped_automated_buy_submission_block_reason(
+            safety_state,
+            settings=settings,
+            provider=item_provider,
+            asset_class=item_asset_class,
+            exchange=item_exchange,
+            now=now,
+        ) is None
     ):
         try:
             session_state = ensure_authenticated_broker_session(
@@ -136,7 +151,7 @@ def evaluate_short_term_watcher_decision(
                     "safety": safety,
                 },
             )
-    safety = runtime_safety_payload(safety_state)
+    safety = runtime_safety_payload(safety_state, settings=settings, now=now)
     context = _candidate_context(
         settings=settings,
         db=db,
@@ -144,8 +159,14 @@ def evaluate_short_term_watcher_decision(
         command=command,
         account_context=account_context,
         broker_account_snapshot=broker_account_snapshot,
+        evaluated_at=now,
     )
-    context["allowed_action_envelope"] = _allowed_action_envelope(settings=settings, context=context, command=command)
+    context["allowed_action_envelope"] = _allowed_action_envelope(
+        settings=settings,
+        context=context,
+        command=command,
+        evaluated_at=now,
+    )
 
     rejection = candidate_rejection
     if rejection is None:
@@ -157,9 +178,23 @@ def evaluate_short_term_watcher_decision(
     if (
         rejection is None
         and not command.dry_run
-        and not automated_buy_submission_allowed(safety_state)
+        and market_scoped_automated_buy_submission_block_reason(
+            safety_state,
+            settings=settings,
+            provider=item_provider,
+            asset_class=item_asset_class,
+            exchange=item_exchange,
+            now=now,
+        ) is not None
     ):
-        block_reason = automated_buy_submission_block_reason(safety_state)
+        block_reason = market_scoped_automated_buy_submission_block_reason(
+            safety_state,
+            settings=settings,
+            provider=item_provider,
+            asset_class=item_asset_class,
+            exchange=item_exchange,
+            now=now,
+        )
         rejection = ("runtime_safety_blocked", str(block_reason))
 
     audit = {
@@ -430,6 +465,7 @@ def _candidate_context(
     command: ShortTermWatcherDecisionRequest,
     account_context,
     broker_account_snapshot: BrokerAccountSnapshot | None = None,
+    evaluated_at: datetime | None = None,
 ) -> dict[str, Any]:
     reference_price = command.agent_output.reference_price or item.limit_price or item.trigger_price
     if reference_price is None:
@@ -487,6 +523,26 @@ def _candidate_context(
     existing_symbol_exposure = (
         Decimal(aggregate_holding_quantity) * reference_price + open_buy_notional
     ).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+    filter_market_date = (
+        item.plan.market_date.isoformat()
+        if item.plan is not None and item.plan.market_date
+        else None
+    )
+    _, _, execution_exchange = resolve_execution_market_scope(
+        provider=item.provider,
+        asset_class=item.asset_class,
+        symbol=item.symbol,
+        venue=item.venue,
+        risk_context=item.risk_context,
+    )
+    if (
+        settings.runtime_mode == "live"
+        and evaluated_at is not None
+        and execution_exchange in {"KRX", "KOSPI", "KOSDAQ", "NXT", "SOR"}
+    ):
+        filter_market_date = evaluated_at.astimezone(
+            ZoneInfo("Asia/Seoul")
+        ).date().isoformat()
     return {
         "symbol": item.symbol,
         "reference_price": str(reference_price),
@@ -505,7 +561,7 @@ def _candidate_context(
             market_regime_context_from_item_payloads(item.risk_context, item.quantity_policy),
             load_live_market_regime_context(settings=settings),
         ),
-        "market_date": item.plan.market_date.isoformat() if item.plan is not None and item.plan.market_date else None,
+        "market_date": filter_market_date,
     }
 
 
@@ -931,7 +987,13 @@ def _entry_route_identity(
     )
 
 
-def _allowed_action_envelope(*, settings: Settings, context: dict[str, Any], command: ShortTermWatcherDecisionRequest) -> dict[str, Any]:
+def _allowed_action_envelope(
+    *,
+    settings: Settings,
+    context: dict[str, Any],
+    command: ShortTermWatcherDecisionRequest,
+    evaluated_at: datetime | None = None,
+) -> dict[str, Any]:
     reference_price = Decimal(str(context["reference_price"]))
     available_cash = Decimal(str(context["available_cash"]))
     resolved_quantity = int(context["resolved_quantity"] or 0)
@@ -979,6 +1041,7 @@ def _allowed_action_envelope(*, settings: Settings, context: dict[str, Any], com
         original_notional=max_notional,
         reference_price=reference_price,
         account_context=None,
+        now=evaluated_at,
     )
     if market_guardrail.rejected:
         hard_reject_reasons.append(market_guardrail.reason_code)

@@ -3,7 +3,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, func, select, update
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -26,31 +26,6 @@ class _FrozenDateTime(datetime):
         if tz is None:
             return cls.current.replace(tzinfo=None)
         return cls.current.astimezone(tz)
-
-
-def test_postgres_projection_takes_table_lock_before_final_reconciliation() -> None:
-    statements: list[str] = []
-
-    class _Dialect:
-        name = "postgresql"
-
-    class _Bind:
-        dialect = _Dialect()
-
-    class _RecordingSession:
-        def get_bind(self):
-            return _Bind()
-
-        def execute(self, statement):
-            statements.append(str(statement))
-
-    plan_judgment_actions._lock_execution_plan_items_for_hourly_projection(
-        _RecordingSession()
-    )
-
-    assert statements == [
-        "LOCK TABLE execution_plan_items IN EXCLUSIVE MODE"
-    ]
 
 
 def _create_plan_judgment_db(path) -> None:
@@ -82,6 +57,35 @@ def _create_plan_judgment_db(path) -> None:
           created_at text,
           updated_at text
         );
+        create table runtime_control_state (
+          id text primary key,
+          mode text not null,
+          paused integer not null,
+          kill_switch_enabled integer not null,
+          hourly_risk_off_active integer not null,
+          hourly_risk_off_epoch integer not null,
+          hourly_risk_off_context text,
+          updated_at text
+        );
+        create table runtime_control_events (
+          id text primary key,
+          runtime_control_state_id text,
+          action text,
+          outcome text,
+          actor text,
+          source text,
+          reason text,
+          message text,
+          previous_state text,
+          current_state text,
+          occurred_at text,
+          created_at text,
+          updated_at text
+        );
+        insert into runtime_control_state(
+          id, mode, paused, kill_switch_enabled, hourly_risk_off_active,
+          hourly_risk_off_epoch, hourly_risk_off_context, updated_at
+        ) values ('global', 'live', 0, 0, 0, 0, null, '2026-07-28');
         insert into execution_plans(id, mode, accepted_at) values ('plan-live', 'live', '2026-07-28T00:00:00Z');
         insert into execution_plan_items(
           id, execution_plan_id, symbol, side, intent, status,
@@ -238,7 +242,7 @@ def test_legacy_single_healthy_id_is_promoted_into_replay_history() -> None:
         )
 
 
-def test_sqlite_risk_off_projection_pending_survives_failure_and_blocks_recovery(
+def test_sqlite_risk_off_fence_never_invokes_legacy_expiry_projection(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -286,31 +290,20 @@ def test_sqlite_risk_off_projection_pending_survives_failure_and_blocks_recovery
         db.commit()
         item_id = item.id
 
-    original_expire = plan_judgment_actions._expire_buy_watches
-    projection_attempts = 0
-
-    def fail_first_projection(conn, runtime_settings, risk_flags, risk_reasons):
-        nonlocal projection_attempts
-        projection_attempts += 1
-        if projection_attempts == 1:
-            raise sqlite3.OperationalError("database is locked")
-        return original_expire(conn, runtime_settings, risk_flags, risk_reasons)
-
-    monkeypatch.setattr(plan_judgment_actions, "_expire_buy_watches", fail_first_projection)
-
     activation = apply_hourly_plan_judgment_action(
         settings=settings,
         risk_flags=3,
         risk_reasons=["broad market risk-off"],
     )
 
-    assert activation["projection_status"] == "pending"
+    assert activation["action"] == "risk_off_fence"
+    assert activation["changed_count"] == 0
     with Session(engine) as db:
         state = db.get(RuntimeControlState, "global")
         item = db.get(ExecutionPlanItem, item_id)
         assert state is not None
         assert state.hourly_risk_off_active is True
-        assert state.hourly_risk_off_context["projection_pending"] is True
+        assert state.hourly_risk_off_context["projection_pending"] is False
         assert item is not None
         assert item.status == "watch_monitoring_active"
 
@@ -327,7 +320,7 @@ def test_sqlite_risk_off_projection_pending_survives_failure_and_blocks_recovery
         assert state.hourly_risk_off_active is True
         assert state.hourly_risk_off_context["projection_pending"] is False
         assert item is not None
-        assert item.status == "watch_expired"
+        assert item.status == "watch_monitoring_active"
         assert first_healthy["hourly_risk_off"]["active"] is True
 
     _FrozenDateTime.current = started_at + timedelta(seconds=2)
@@ -348,7 +341,7 @@ def test_sqlite_risk_off_projection_pending_survives_failure_and_blocks_recovery
     engine.dispose()
 
 
-def test_active_risk_off_reconciles_late_mutable_buy_before_global_recovery(
+def test_active_risk_off_preserves_late_mutable_buy_before_global_recovery(
     monkeypatch,
 ) -> None:
     engine = create_engine("sqlite:///:memory:")
@@ -416,8 +409,8 @@ def test_active_risk_off_reconciles_late_mutable_buy_before_global_recovery(
         assert state.hourly_risk_off_active is True
         assert state.hourly_risk_off_context["projection_pending"] is False
         assert first_healthy["hourly_risk_off"]["active"] is True
-        assert late.status == "watch_expired"
-        assert late.risk_context[ADJUSTMENT_KEY]["action"] == "risk_off_expire"
+        assert late.status == "watch_monitoring_active"
+        assert ADJUSTMENT_KEY not in late.risk_context
 
         _FrozenDateTime.current = started_at + timedelta(seconds=2)
         second_healthy = apply_hourly_plan_judgment_action(
@@ -436,7 +429,7 @@ def test_active_risk_off_reconciles_late_mutable_buy_before_global_recovery(
     engine.dispose()
 
 
-def test_global_risk_off_waits_for_every_recovery_beyond_single_batch(
+def test_global_risk_off_preserves_every_watch_beyond_single_batch(
     monkeypatch,
 ) -> None:
     engine = create_engine("sqlite:///:memory:")
@@ -493,7 +486,7 @@ def test_global_risk_off_waits_for_every_recovery_beyond_single_batch(
         assert db.scalar(
             select(func.count())
             .select_from(ExecutionPlanItem)
-            .where(ExecutionPlanItem.status == "watch_expired")
+            .where(ExecutionPlanItem.status == "watch_monitoring_active")
         ) == candidate_count
 
         _FrozenDateTime.current = started_at + timedelta(seconds=2)
@@ -505,7 +498,7 @@ def test_global_risk_off_waits_for_every_recovery_beyond_single_batch(
         )
         state = db.get(RuntimeControlState, "global")
         assert state is not None
-        assert second_healthy["recovery_resumed_count"] == candidate_count
+        assert second_healthy["recovery_resumed_count"] == 0
         assert second_healthy["hourly_risk_off"]["active"] is False
         assert state.hourly_risk_off_active is False
         assert db.scalar(
@@ -536,7 +529,7 @@ def test_normal_plan_judgment_does_not_resume_rejected_buy_candidates(tmp_path) 
     assert audit_count == 0
 
 
-def test_risk_off_expired_buy_resumes_only_after_healthy_streak_and_cooldown(monkeypatch, tmp_path) -> None:
+def test_risk_off_fence_clears_only_after_healthy_streak_and_cooldown(monkeypatch, tmp_path) -> None:
     db_path = tmp_path / "exec.db"
     _create_plan_judgment_db(db_path)
     conn = sqlite3.connect(db_path)
@@ -580,13 +573,20 @@ def test_risk_off_expired_buy_resumes_only_after_healthy_streak_and_cooldown(mon
     )
 
     _FrozenDateTime.current = started_at + timedelta(seconds=100)
-    apply_hourly_plan_judgment_action(settings=settings, risk_flags=0, risk_reasons=[])
+    first_healthy = apply_hourly_plan_judgment_action(
+        settings=settings, risk_flags=0, risk_reasons=[]
+    )
     conn = sqlite3.connect(db_path)
     status, raw_context = conn.execute(
         "select status, risk_context from execution_plan_items where id = 'risk-off-buy'"
     ).fetchone()
-    recovery = json.loads(raw_context)[ADJUSTMENT_KEY]["recovery"]
-    assert status == "watch_expired"
+    recovery = json.loads(
+        conn.execute(
+            "select hourly_risk_off_context from runtime_control_state where id = 'global'"
+        ).fetchone()[0]
+    )
+    assert status == "watch_monitoring_active"
+    assert json.loads(raw_context) == {}
     assert recovery["status"] == "observing"
     assert recovery["consecutive_healthy_observations"] == 1
     assert recovery["required_healthy_observations"] == 2
@@ -597,11 +597,11 @@ def test_risk_off_expired_buy_resumes_only_after_healthy_streak_and_cooldown(mon
         where execution_plan_item_id = 'risk-off-buy'
           and event_type = 'hourly_plan_judgment_buy_watch_recovery_observed'
         """
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 0
     conn.close()
 
     _FrozenDateTime.current = started_at + timedelta(seconds=200)
-    apply_hourly_plan_judgment_action(
+    reset = apply_hourly_plan_judgment_action(
         settings=settings,
         risk_flags=1,
         risk_reasons=["caution returned"],
@@ -610,8 +610,15 @@ def test_risk_off_expired_buy_resumes_only_after_healthy_streak_and_cooldown(mon
     status, raw_context = conn.execute(
         "select status, risk_context from execution_plan_items where id = 'risk-off-buy'"
     ).fetchone()
-    recovery = json.loads(raw_context)[ADJUSTMENT_KEY]["recovery"]
-    assert status == "watch_expired"
+    recovery = json.loads(
+        conn.execute(
+            "select hourly_risk_off_context from runtime_control_state where id = 'global'"
+        ).fetchone()[0]
+    )
+    assert status == "watch_monitoring_active"
+    assert json.loads(raw_context)[ADJUSTMENT_KEY]["action"] == (
+        "conservative_price_adjust"
+    )
     assert recovery["status"] == "reset"
     assert recovery["consecutive_healthy_observations"] == 0
     assert recovery["last_risk_flags"] == 1
@@ -621,19 +628,26 @@ def test_risk_off_expired_buy_resumes_only_after_healthy_streak_and_cooldown(mon
         where execution_plan_item_id = 'risk-off-buy'
           and event_type = 'hourly_plan_judgment_buy_watch_recovery_reset'
         """
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 0
     conn.close()
 
     _FrozenDateTime.current = started_at + timedelta(seconds=300)
     apply_hourly_plan_judgment_action(settings=settings, risk_flags=0, risk_reasons=[])
     _FrozenDateTime.current = started_at + timedelta(seconds=899)
-    apply_hourly_plan_judgment_action(settings=settings, risk_flags=0, risk_reasons=[])
+    second_healthy = apply_hourly_plan_judgment_action(
+        settings=settings, risk_flags=0, risk_reasons=[]
+    )
     conn = sqlite3.connect(db_path)
     status, raw_context = conn.execute(
         "select status, risk_context from execution_plan_items where id = 'risk-off-buy'"
     ).fetchone()
-    recovery = json.loads(raw_context)[ADJUSTMENT_KEY]["recovery"]
-    assert status == "watch_expired"
+    recovery = json.loads(
+        conn.execute(
+            "select hourly_risk_off_context from runtime_control_state where id = 'global'"
+        ).fetchone()[0]
+    )
+    assert status == "watch_monitoring_active"
+    assert json.loads(raw_context) == {}
     assert recovery["consecutive_healthy_observations"] == 2
     assert recovery["cooldown_satisfied"] is False
     conn.close()
@@ -644,28 +658,27 @@ def test_risk_off_expired_buy_resumes_only_after_healthy_streak_and_cooldown(mon
     status = conn.execute(
         "select status from execution_plan_items where id = 'risk-off-buy'"
     ).fetchone()[0]
-    assert status == "watch_expired"
+    assert status == "watch_monitoring_active"
     conn.close()
 
     _FrozenDateTime.current = started_at + timedelta(seconds=1100)
-    apply_hourly_plan_judgment_action(settings=settings, risk_flags=0, risk_reasons=[])
+    recovered = apply_hourly_plan_judgment_action(
+        settings=settings, risk_flags=0, risk_reasons=[]
+    )
     conn = sqlite3.connect(db_path)
     status, raw_context = conn.execute(
         "select status, risk_context from execution_plan_items where id = 'risk-off-buy'"
     ).fetchone()
-    resumed_action = json.loads(raw_context)[ADJUSTMENT_KEY]
+    assert json.loads(raw_context) == {}
     assert status == "watch_monitoring_active"
-    assert resumed_action["action"] == "risk_off_resume"
-    assert resumed_action["recovery"]["status"] == "resumed"
-    assert resumed_action["recovery"]["cooldown_satisfied"] is True
-    assert resumed_action["recovery"]["resumed_at"] == _FrozenDateTime.current.isoformat()
+    assert recovered["hourly_risk_off"]["active"] is False
     assert conn.execute(
         """
         select count(*) from execution_plan_item_audits
         where execution_plan_item_id = 'risk-off-buy'
           and event_type = 'hourly_plan_judgment_buy_watch_resumed'
         """
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 0
     conn.close()
 
 
@@ -777,7 +790,7 @@ def test_risk_off_recovery_session_path_matches_sqlite_and_ignores_manual_expiry
     engine.dispose()
 
 
-def test_risk_off_expires_scheduled_next_open_and_restores_it_without_touching_open_buy(
+def test_risk_off_preserves_scheduled_next_open_and_open_buy(
     monkeypatch,
 ) -> None:
     engine = create_engine("sqlite:///:memory:")
@@ -827,28 +840,28 @@ def test_risk_off_expires_scheduled_next_open_and_restores_it_without_touching_o
         )
         db.refresh(scheduled_item)
         db.refresh(open_item)
-        assert scheduled_item.status == "watch_expired"
-        assert scheduled_item.risk_context[ADJUSTMENT_KEY]["previous"]["status"] == "next_open_buy_scheduled"
+        assert scheduled_item.status == "next_open_buy_scheduled"
+        assert scheduled_item.risk_context == {}
         assert open_item.status == "open"
         assert open_item.risk_context == {}
 
         _FrozenDateTime.current = started_at + timedelta(seconds=1)
         apply_hourly_plan_judgment_action(settings=settings, db=db, risk_flags=0, risk_reasons=[])
         db.refresh(scheduled_item)
-        assert scheduled_item.status == "watch_expired"
+        assert scheduled_item.status == "next_open_buy_scheduled"
 
         _FrozenDateTime.current = started_at + timedelta(seconds=2)
         apply_hourly_plan_judgment_action(settings=settings, db=db, risk_flags=0, risk_reasons=[])
         db.refresh(scheduled_item)
         db.refresh(open_item)
         assert scheduled_item.status == "next_open_buy_scheduled"
-        assert scheduled_item.risk_context[ADJUSTMENT_KEY]["action"] == "risk_off_resume"
+        assert scheduled_item.risk_context == {}
         assert open_item.status == "open"
         assert open_item.risk_context == {}
     engine.dispose()
 
 
-def test_risk_off_expires_recovery_wait_states_and_restores_each_exact_status(
+def test_risk_off_preserves_every_recovery_wait_state(
     monkeypatch,
 ) -> None:
     engine = create_engine("sqlite:///:memory:")
@@ -899,11 +912,11 @@ def test_risk_off_expires_recovery_wait_states_and_restores_each_exact_status(
             risk_flags=3,
             risk_reasons=["broad market risk-off"],
         )
-        assert risk_off["changed_count"] == len(items)
+        assert risk_off["changed_count"] == 0
         for item in items:
             db.refresh(item)
-            assert item.status == "watch_expired"
-            assert item.risk_context[ADJUSTMENT_KEY]["previous"]["status"] == expected_statuses[item.id]
+            assert item.status == expected_statuses[item.id]
+            assert item.risk_context == {}
 
         _FrozenDateTime.current = started_at + timedelta(seconds=1)
         first_healthy = apply_hourly_plan_judgment_action(
@@ -915,7 +928,7 @@ def test_risk_off_expires_recovery_wait_states_and_restores_each_exact_status(
         assert first_healthy["recovery_resumed_count"] == 0
         for item in items:
             db.refresh(item)
-            assert item.status == "watch_expired"
+            assert item.status == expected_statuses[item.id]
 
         _FrozenDateTime.current = started_at + timedelta(seconds=2)
         second_healthy = apply_hourly_plan_judgment_action(
@@ -924,11 +937,11 @@ def test_risk_off_expires_recovery_wait_states_and_restores_each_exact_status(
             risk_flags=0,
             risk_reasons=[],
         )
-        assert second_healthy["recovery_resumed_count"] == len(items)
+        assert second_healthy["recovery_resumed_count"] == 0
         for item in items:
             db.refresh(item)
             assert item.status == expected_statuses[item.id]
-            assert item.risk_context[ADJUSTMENT_KEY]["action"] == "risk_off_resume"
+            assert item.risk_context == {}
     engine.dispose()
 
 
@@ -977,10 +990,10 @@ def test_risk_off_recovery_requires_minimum_interval_between_healthy_observation
             risk_reasons=[],
         )
         db.refresh(item)
-        assert first["recovery_observed_count"] == 1
-        assert item.status == "watch_expired"
-        assert item.risk_context[ADJUSTMENT_KEY]["recovery"]["consecutive_healthy_observations"] == 1
-        assert item.risk_context[ADJUSTMENT_KEY]["recovery"]["last_observed_at"] == first_healthy_at.isoformat()
+        assert first["recovery_observed_count"] == 0
+        assert first["hourly_risk_off"]["context"]["consecutive_healthy_observations"] == 1
+        assert item.status == "watch_monitoring_active"
+        assert item.risk_context == {}
 
         _FrozenDateTime.current = first_healthy_at + timedelta(seconds=1)
         too_soon = apply_hourly_plan_judgment_action(
@@ -992,9 +1005,9 @@ def test_risk_off_recovery_requires_minimum_interval_between_healthy_observation
         db.refresh(item)
         assert too_soon["recovery_observed_count"] == 0
         assert too_soon["recovery_resumed_count"] == 0
-        assert item.status == "watch_expired"
-        assert item.risk_context[ADJUSTMENT_KEY]["recovery"]["consecutive_healthy_observations"] == 1
-        assert item.risk_context[ADJUSTMENT_KEY]["recovery"]["last_observed_at"] == first_healthy_at.isoformat()
+        assert item.status == "watch_monitoring_active"
+        assert too_soon["hourly_risk_off"]["context"]["consecutive_healthy_observations"] == 1
+        assert item.risk_context == {}
 
         _FrozenDateTime.current = first_healthy_at + timedelta(seconds=300)
         spaced = apply_hourly_plan_judgment_action(
@@ -1005,7 +1018,8 @@ def test_risk_off_recovery_requires_minimum_interval_between_healthy_observation
         )
         db.refresh(item)
         assert spaced["recovery_observed_count"] == 0
-        assert spaced["recovery_resumed_count"] == 1
+        assert spaced["recovery_resumed_count"] == 0
+        assert spaced["hourly_risk_off"]["active"] is False
         assert item.status == "watch_monitoring_active"
     engine.dispose()
 
@@ -1220,7 +1234,7 @@ def test_risk_off_recovery_corrupted_healthy_count_fails_closed(corrupted_count)
     engine.dispose()
 
 
-def test_severe_risk_off_expires_every_buy_candidate_beyond_single_batch_limit() -> None:
+def test_severe_risk_off_preserves_every_buy_candidate_beyond_single_batch_limit() -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     settings = Settings(
@@ -1254,12 +1268,12 @@ def test_severe_risk_off_expires_every_buy_candidate_beyond_single_batch_limit()
             risk_reasons=["broad market risk-off"],
         )
 
-        expired_count = db.scalar(
+        active_count = db.scalar(
             select(func.count())
             .select_from(ExecutionPlanItem)
             .where(
                 ExecutionPlanItem.execution_plan_id == plan.id,
-                ExecutionPlanItem.status == "watch_expired",
+                ExecutionPlanItem.status == "watch_monitoring_active",
             )
         )
         audit_count = db.scalar(
@@ -1270,9 +1284,51 @@ def test_severe_risk_off_expires_every_buy_candidate_beyond_single_batch_limit()
                 ExecutionPlanItemAudit.event_type == "hourly_plan_judgment_buy_watch_expired",
             )
         )
-        assert result["changed_count"] == candidate_count
-        assert expired_count == candidate_count
-        assert audit_count == candidate_count
+        assert result["changed_count"] == 0
+        assert active_count == candidate_count
+        assert audit_count == 0
+    engine.dispose()
+
+
+def test_severe_risk_off_fences_buys_without_expiring_active_monitoring() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settings = Settings(
+        runtime_mode="live",
+        database_url="postgresql+psycopg://unused/test",
+    )
+    with Session(engine) as db:
+        plan = ExecutionPlan(
+            external_plan_id="risk-off-keeps-monitoring",
+            source="test",
+            mode="live",
+        )
+        item = ExecutionPlanItem(
+            plan=plan,
+            plan_item_index=0,
+            symbol="005930",
+            side="buy",
+            intent="intraday_watch_buy",
+            status="watch_monitoring_active",
+            trigger_price=100,
+            limit_price=101,
+            risk_context={},
+        )
+        db.add(plan)
+        db.commit()
+
+        result = apply_hourly_plan_judgment_action(
+            settings=settings,
+            db=db,
+            risk_flags=3,
+            risk_reasons=["broad market risk-off"],
+        )
+
+        db.refresh(item)
+        assert result["hourly_risk_off"]["active"] is True
+        assert result["changed_count"] == 0
+        assert item.status == "watch_monitoring_active"
+        assert ADJUSTMENT_KEY not in item.risk_context
     engine.dispose()
 
 
@@ -1287,7 +1343,7 @@ def test_severe_risk_off_expires_every_buy_candidate_beyond_single_batch_limit()
         "next_open_buy_dispatching",
     ],
 )
-def test_severe_risk_off_expires_every_pre_broker_dispatch_buy_state(active_status) -> None:
+def test_severe_risk_off_preserves_every_pre_broker_dispatch_buy_state(active_status) -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     settings = Settings(
@@ -1326,9 +1382,9 @@ def test_severe_risk_off_expires_every_pre_broker_dispatch_buy_state(active_stat
         )
 
         db.refresh(item)
-        assert result["changed_count"] == 1
-        assert item.status == "watch_expired"
-        assert item.risk_context[ADJUSTMENT_KEY]["previous"]["status"] == active_status
+        assert result["changed_count"] == 0
+        assert item.status == active_status
+        assert item.risk_context == {}
     engine.dispose()
 
 
@@ -1442,7 +1498,7 @@ def test_plan_judgment_supports_non_sqlite_session() -> None:
     engine.dispose()
 
 
-def test_postgres_expiry_preserves_status_compare_and_set_before_audit(monkeypatch) -> None:
+def test_postgres_risk_off_fence_does_not_load_or_mutate_watch_rows(monkeypatch) -> None:
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     settings = Settings(runtime_mode="live", database_url="postgresql+psycopg://unused/test")
@@ -1463,24 +1519,14 @@ def test_postgres_expiry_preserves_status_compare_and_set_before_audit(monkeypat
         db.commit()
         item_id = item.id
 
-    original_loader = plan_judgment_actions._load_mutable_buy_items_session
+    def fail_if_loaded(*_args, **_kwargs):
+        raise AssertionError("risk-off fence must not scan or mutate watch rows")
 
-    def load_then_change_status(db: Session, settings: Settings, *, after=None, statuses=None):
-        items = original_loader(
-            db,
-            settings,
-            after=after,
-            **({"statuses": statuses} if statuses is not None else {}),
-        )
-        db.execute(
-            update(ExecutionPlanItem)
-            .where(ExecutionPlanItem.id == item_id)
-            .values(status="watch_buy_submitted")
-            .execution_options(synchronize_session=False)
-        )
-        return items
-
-    monkeypatch.setattr(plan_judgment_actions, "_load_mutable_buy_items_session", load_then_change_status)
+    monkeypatch.setattr(
+        plan_judgment_actions,
+        "_load_mutable_buy_items_session",
+        fail_if_loaded,
+    )
 
     with Session(engine) as db:
         result = apply_hourly_plan_judgment_action(
@@ -1495,7 +1541,7 @@ def test_postgres_expiry_preserves_status_compare_and_set_before_audit(monkeypat
         audits = db.scalars(select(ExecutionPlanItemAudit)).all()
         assert result["changed_count"] == 0
         assert item is not None
-        assert item.status == "watch_buy_submitted"
+        assert item.status == "watch_monitoring_active"
         assert item.risk_context == {}
         assert audits == []
     engine.dispose()

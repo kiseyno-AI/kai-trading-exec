@@ -235,12 +235,49 @@ def test_block_projects_only_exact_core_v4_krx_scope() -> None:
         db.refresh(paper_item)
         db.refresh(legacy_item)
         db.refresh(watch_item)
-        assert matching.status == "watch_expired"
+        assert matching.status == "next_open_buy_scheduled"
         assert matching.risk_context["core_buy_authority"]["action"] == "block_new_buy"
         assert us_item.status == "next_open_buy_scheduled"
         assert paper_item.status == "next_open_buy_scheduled"
         assert legacy_item.status == "next_open_buy_scheduled"
         assert watch_item.status == "next_open_buy_scheduled"
+        assert watch_item.risk_context["core_buy_authority"]["action"] == "block_new_buy"
+    engine.dispose()
+
+
+def test_core_buy_authority_blocks_submission_without_expiring_watch_items() -> None:
+    settings = _settings()
+    engine, session_factory = _db(settings)
+    now = datetime(2026, 9, 11, 0, 1, tzinfo=UTC)
+    plan, item = _plan_item(
+        intent="intraday_watch_buy",
+        status="watch_monitoring_active",
+    )
+    with session_factory() as db:
+        db.add(plan)
+        db.commit()
+
+        ack = apply_core_buy_authority_observation(
+            settings=settings,
+            db=db,
+            command=_command(
+                action="block_new_buy",
+                source_observed_at=now,
+                evaluated_at=now,
+            ),
+            now=now,
+        )
+
+        db.refresh(item)
+        assert ack.fence_active is True
+        assert item.status == "watch_monitoring_active"
+        assert item.risk_context["core_buy_authority"]["action"] == "block_new_buy"
+        assert core_buy_authority_block_reason(
+            settings=settings,
+            db=db,
+            plan_item=item,
+            now=now,
+        ) == "core_buy_authority_blocked"
     engine.dispose()
 
 
@@ -285,7 +322,7 @@ def test_block_projection_does_not_hydrate_terminal_plan_payloads() -> None:
     assert terminal_item_id not in loaded_item_ids
 
     with session_factory() as db:
-        assert db.get(ExecutionPlanItem, active_item_id).status == "watch_expired"
+        assert db.get(ExecutionPlanItem, active_item_id).status == "watch_monitoring_active"
         assert (
             db.get(ExecutionPlanItem, terminal_item_id).status
             == "manual_review_required"
@@ -329,7 +366,7 @@ def test_projection_keeps_authority_metadata_current_on_terminal_history() -> No
 
         db.refresh(terminal_item)
         projection = terminal_item.risk_context["core_buy_authority"]
-        assert block_ack.changed_item_count == 0
+        assert block_ack.changed_item_count == 1
         assert terminal_item.status == "manual_review_required"
         assert projection["action"] == "block_new_buy"
         assert projection["observation_id"] == blocked.observation_id
@@ -653,7 +690,7 @@ def test_duplicate_retries_incomplete_two_phase_projection() -> None:
         assert retried.status == "duplicate"
         assert retried.projection_pending is False
         db.refresh(item)
-        assert item.status == "watch_expired"
+        assert item.status == "watch_monitoring_active"
     engine.dispose()
 
 
@@ -782,7 +819,7 @@ def test_distinct_fresh_observations_recover_and_restore_matching_items(
             now=reblocked_at,
         )
         db.refresh(item)
-        assert item.status == "watch_expired"
+        assert item.status == initial_status
         assert item.risk_context["core_buy_authority"]["action"] == "block_new_buy"
     engine.dispose()
 
@@ -894,7 +931,7 @@ def test_authority_recovery_preserves_watch_that_expired_during_long_fence() -> 
             now=blocked_at,
         )
         db.refresh(item)
-        assert item.status == "watch_expired"
+        assert item.status == "watch_monitoring_active"
 
         assert expire_prior_market_date_unfilled_watch_buys(
             settings=settings,
@@ -984,7 +1021,7 @@ def test_core_v4_krx_buy_requires_current_exact_scope_authority() -> None:
             db=db,
             plan_item=watch_item,
             now=now,
-        ) is None
+        ) == "core_buy_authority_missing"
 
         apply_core_buy_authority_observation(
             settings=settings,

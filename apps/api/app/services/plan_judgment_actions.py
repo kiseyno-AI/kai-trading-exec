@@ -10,7 +10,7 @@ from urllib.parse import unquote, urlparse
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select, text, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session, undefer
 
 from app.core.config import Settings
@@ -80,7 +80,7 @@ def _accepted_healthy_observation_ids(
     return accepted[-limit:]
 
 
-def _validated_healthy_observation(
+def _validated_market_observation(
     *,
     settings: Settings,
     risk_flags: int,
@@ -91,16 +91,12 @@ def _validated_healthy_observation(
     source_observed_at: datetime | None,
     now: datetime,
 ) -> dict[str, object] | None:
-    if risk_flags != 0 or (
-        observation_id is None
-        and market_date is None
-        and source_observed_at is None
-    ):
+    if observation_id is None and market_date is None and source_observed_at is None:
         return None
     if observation_id is None or market_date is None or source_observed_at is None:
         raise HourlyPlanJudgmentObservationError(
-            reason="healthy_observation_identity_missing",
-            message="healthy observation identity is incomplete",
+            reason="market_observation_identity_missing",
+            message="market observation identity is incomplete",
         )
     normalized_now = now.astimezone(UTC)
     normalized_source = source_observed_at.astimezone(UTC)
@@ -129,6 +125,25 @@ def _validated_healthy_observation(
             reason="source_observation_stale",
             message="healthy source observation is stale",
         )
+    if risk_flags != 0:
+        if observation_id == context.get("last_market_observation_id"):
+            raise HourlyPlanJudgmentObservationError(
+                reason="duplicate_observation",
+                message="market observation_id was already processed",
+            )
+        last_market_source = _utc_datetime(
+            context.get("last_market_observation_source_observed_at")
+        )
+        if last_market_source is not None and normalized_source < last_market_source:
+            raise HourlyPlanJudgmentObservationError(
+                reason="source_observation_regressed",
+                message="market source observation regressed",
+            )
+        return {
+            "observation_id": observation_id,
+            "market_date": market_date.isoformat(),
+            "source_observed_at": normalized_source.isoformat(),
+        }
     last_risk_at = _utc_datetime(context.get("last_risk_at"))
     if active and last_risk_at is not None and normalized_source <= last_risk_at:
         raise HourlyPlanJudgmentObservationError(
@@ -244,6 +259,31 @@ def _non_negative_int(value: object) -> int:
         return 0
 
 
+def _market_observation_context(
+    *,
+    risk_flags: int,
+    now: datetime,
+    market_observation: dict[str, object] | None,
+) -> dict[str, object]:
+    if market_observation is not None:
+        market_date: str | None = str(market_observation["market_date"])
+        source_observed_at: str | None = str(
+            market_observation["source_observed_at"]
+        )
+        observation_id: str | None = str(market_observation["observation_id"])
+    else:
+        market_date = None
+        source_observed_at = None
+        observation_id = None
+    return {
+        "last_market_observation_market_date": market_date,
+        "last_market_observation_received_at": now.astimezone(UTC).isoformat(),
+        "last_market_observation_source_observed_at": source_observed_at,
+        "last_market_observation_id": observation_id,
+        "last_market_observation_risk_flags": risk_flags,
+    }
+
+
 def _hourly_risk_off_fence_values(
     *,
     active: bool,
@@ -260,7 +300,7 @@ def _hourly_risk_off_fence_values(
     """Return the authoritative buy-only risk fence transition."""
 
     context = _json_object(raw_context)
-    healthy_observation = _validated_healthy_observation(
+    market_observation = _validated_market_observation(
         settings=settings,
         risk_flags=risk_flags,
         context=context,
@@ -270,6 +310,7 @@ def _hourly_risk_off_fence_values(
         source_observed_at=source_observed_at,
         now=now,
     )
+    healthy_observation = market_observation if risk_flags == 0 else None
     required = settings.hourly_plan_judgment_recovery_required_healthy_observations
     cooldown_seconds = settings.hourly_plan_judgment_recovery_cooldown_seconds
     min_interval_seconds = (
@@ -281,6 +322,11 @@ def _hourly_risk_off_fence_values(
         max(now, stored_last_risk_at)
         if active and stored_last_risk_at is not None
         else now
+    )
+    observation_context = _market_observation_context(
+        risk_flags=risk_flags,
+        now=now,
+        market_observation=market_observation,
     )
 
     if risk_flags >= 3:
@@ -317,12 +363,43 @@ def _hourly_risk_off_fence_values(
                 "projection_pending": True,
                 "projection_started_at": effective_risk_at.isoformat(),
                 "recovery_ready": False,
+                **observation_context,
             },
             "hourly_risk_off_activate",
         )
 
     if not active:
-        return False, normalized_epoch, context or None, None
+        updated = dict(context)
+        updated.update(observation_context)
+        updated.update(
+            {
+                "status": "healthy" if risk_flags == 0 else "observed_caution",
+                "epoch": normalized_epoch,
+                "last_risk_flags": risk_flags,
+                "last_risk_reasons": list(risk_reasons),
+                "required_healthy_observations": required,
+                "cooldown_seconds": cooldown_seconds,
+                "min_observation_interval_seconds": min_interval_seconds,
+                "recovery_ready": False,
+            }
+        )
+        if healthy_observation is not None:
+            updated.update(
+                {
+                    "last_healthy_observed_at": now.isoformat(),
+                    "last_healthy_observation_id": healthy_observation[
+                        "observation_id"
+                    ],
+                    "last_healthy_market_date": healthy_observation["market_date"],
+                    "last_healthy_source_observed_at": healthy_observation[
+                        "source_observed_at"
+                    ],
+                    "accepted_healthy_observation_ids": healthy_observation[
+                        "accepted_observation_ids"
+                    ],
+                }
+            )
+        return False, normalized_epoch, updated, "hourly_market_observation_recorded"
 
     if risk_flags >= 1:
         next_epoch = normalized_epoch + 1
@@ -349,6 +426,7 @@ def _hourly_risk_off_fence_values(
                 "projection_pending": True,
                 "projection_started_at": effective_risk_at.isoformat(),
                 "recovery_ready": False,
+                **observation_context,
             }
         )
         updated.pop("projection_completed_at", None)
@@ -398,6 +476,7 @@ def _hourly_risk_off_fence_values(
             "projection_pending": True,
             "projection_started_at": now.isoformat(),
             "recovery_ready": recovery_ready,
+            **observation_context,
         }
     )
     if healthy_observation is not None:
@@ -692,22 +771,6 @@ def _lock_hourly_risk_off_fence_session(db: Session) -> RuntimeControlState:
     return state
 
 
-def _lock_execution_plan_items_for_hourly_projection(db: Session) -> None:
-    """Freeze PostgreSQL plan-item DML through the final scan and fence clear.
-
-    The runtime-control row serializes broker boundaries and risk transitions,
-    but an execution-plan insert does not take that row lock.  A table-level
-    EXCLUSIVE lock makes the final mutable-buy scan a closed set: an earlier
-    writer commits before the scan, while a later writer is linearized after
-    the projection transaction clears (or keeps) the global fence. It also
-    blocks concurrent ``SELECT FOR UPDATE`` writers before they can hold an
-    item row and deadlock against this transaction's later projection update.
-    """
-
-    if db.get_bind().dialect.name == "postgresql":
-        db.execute(text("LOCK TABLE execution_plan_items IN EXCLUSIVE MODE"))
-
-
 def _complete_hourly_risk_off_projection_session(
     *,
     db: Session,
@@ -873,40 +936,6 @@ def _price_text(value: Decimal | None) -> str | None:
     return str(value.quantize(Decimal("0.0001"), rounding=ROUND_DOWN))
 
 
-def _risk_off_resume_snapshot(
-    *,
-    previous: dict[str, object],
-    prior_adjustment: object,
-) -> dict[str, object]:
-    resume = dict(previous)
-    previous_status = str(previous.get("status") or "")
-    if previous_status == "next_open_buy_dispatching":
-        # The job is put back into a schedulable state when a dispatch loses
-        # the race to risk-off. Never restore an orphaned in-flight label.
-        resume["status"] = "next_open_buy_retry_pending"
-    elif previous_status in {
-        "watch_buy_triggered",
-        "watch_buy_triggered_pending_dispatch",
-        "triggered_pending_agent",
-        "agent_delay",
-        "agent_approved_pending_submit",
-    }:
-        # Risk-off invalidates the old quote/trigger/agent decision. Recovery
-        # returns to fresh monitoring rather than replaying stale approval.
-        resume["status"] = "watch_monitoring_active"
-    if not isinstance(prior_adjustment, dict):
-        return resume
-    if prior_adjustment.get("action") != "conservative_price_adjust":
-        return resume
-    original = prior_adjustment.get("original")
-    if not isinstance(original, dict):
-        return resume
-    for key in ("trigger_price", "limit_price"):
-        if key in original:
-            resume[key] = original.get(key)
-    return resume
-
-
 def _utc_datetime(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -1047,87 +1076,6 @@ def _risk_off_recovery_transition(
             "resumed": should_resume,
         },
     )
-
-
-def _initial_risk_off_recovery(
-    *,
-    settings: Settings,
-    risk_flags: int,
-    risk_reasons: list[str],
-    now: datetime,
-) -> dict[str, object]:
-    cooldown_seconds = settings.hourly_plan_judgment_recovery_cooldown_seconds
-    return {
-        "status": "blocked",
-        "consecutive_healthy_observations": 0,
-        "required_healthy_observations": (
-            settings.hourly_plan_judgment_recovery_required_healthy_observations
-        ),
-        "cooldown_seconds": cooldown_seconds,
-        "cooldown_until": (now + timedelta(seconds=cooldown_seconds)).isoformat(),
-        "cooldown_satisfied": False,
-        "last_risk_at": now.isoformat(),
-        "last_risk_flags": risk_flags,
-        "last_risk_reasons": list(risk_reasons),
-        "last_observed_at": None,
-    }
-
-
-def _risk_off_projection_inputs(
-    *,
-    fence_context: dict[str, object] | None,
-    fallback_risk_flags: int,
-    fallback_risk_reasons: list[str],
-) -> tuple[int, list[str]]:
-    context = fence_context or {}
-    risk_flags = max(
-        3,
-        _non_negative_int(
-            context.get("activation_risk_flags")
-            or context.get("last_risk_flags")
-            or fallback_risk_flags
-        ),
-    )
-    raw_reasons = (
-        context.get("activation_risk_reasons")
-        or context.get("last_risk_reasons")
-        or fallback_risk_reasons
-    )
-    risk_reasons = (
-        [str(reason) for reason in raw_reasons]
-        if isinstance(raw_reasons, list)
-        else list(fallback_risk_reasons)
-    )
-    return risk_flags, risk_reasons
-
-
-def _seed_recovery_from_fence_context(
-    *,
-    recovery: dict[str, object],
-    fence_context: dict[str, object] | None,
-    now: datetime,
-) -> dict[str, object]:
-    if not isinstance(fence_context, dict):
-        return recovery
-    updated = dict(recovery)
-    healthy_count = _non_negative_int(
-        fence_context.get("consecutive_healthy_observations")
-    )
-    updated.update(
-        {
-            "status": "observing" if healthy_count else "blocked",
-            "consecutive_healthy_observations": healthy_count,
-            "last_risk_at": fence_context.get("last_risk_at") or now.isoformat(),
-            "last_observed_at": fence_context.get("last_healthy_observed_at"),
-            "cooldown_until": (
-                fence_context.get("cooldown_until") or recovery["cooldown_until"]
-            ),
-            "cooldown_satisfied": bool(
-                fence_context.get("cooldown_satisfied", False)
-            ),
-        }
-    )
-    return updated
 
 
 def _connect(settings: Settings) -> sqlite3.Connection:
@@ -1290,31 +1238,10 @@ def apply_hourly_plan_judgment_action(
                 fence_context = {}
                 epoch_matches = True
             projected = 0
-            if fence_active:
-                projection_risk_flags, projection_risk_reasons = (
-                    _risk_off_projection_inputs(
-                        fence_context=fence_context,
-                        fallback_risk_flags=risk_flags,
-                        fallback_risk_reasons=risk_reasons,
-                    )
-                )
-                projected = _expire_buy_watches(
-                    conn,
-                    settings,
-                    projection_risk_flags,
-                    projection_risk_reasons,
-                )
             if risk_flags >= 3:
-                if not fence_active:
-                    projected = _expire_buy_watches(
-                        conn,
-                        settings,
-                        risk_flags,
-                        risk_reasons,
-                    )
                 changed = projected
-                message = f"risk_off: 신규/추가매수 watch {changed}건 중단"
-                action = "risk_off_expire"
+                message = "risk_off: 신규/추가매수 제출 차단; watch 모니터링 유지"
+                action = "risk_off_fence"
             elif risk_flags >= 1:
                 adjusted = _adjust_buy_watch_prices(
                     conn,
@@ -1335,18 +1262,22 @@ def apply_hourly_plan_judgment_action(
                 and epoch_matches
                 and bool(fence_context.get("recovery_ready"))
             )
-            recovery_counts = _advance_risk_off_recoveries(
-                conn,
-                settings,
-                risk_flags=risk_flags,
-                risk_reasons=risk_reasons,
-                now=now,
-                resume_allowed=(
-                    recovery_ready
-                    if fence_active
-                    else not bool(risk_fence["active"])
-                ),
-                reconcile_all=fence_active,
+            recovery_counts = (
+                _advance_risk_off_recoveries(
+                    conn,
+                    settings,
+                    risk_flags=risk_flags,
+                    risk_reasons=risk_reasons,
+                    now=now,
+                    resume_allowed=(
+                        recovery_ready
+                        if fence_active
+                        else not bool(risk_fence["active"])
+                    ),
+                    reconcile_all=recovery_ready,
+                )
+                if recovery_ready or not fence_active
+                else {"observed": 0, "reset": 0, "resumed": 0}
             )
             changed += recovery_counts["resumed"]
             if recovery_counts["resumed"]:
@@ -1378,7 +1309,7 @@ def apply_hourly_plan_judgment_action(
                 return {
                     "status": "applied",
                     "action": (
-                        "risk_off_expire"
+                        "risk_off_fence"
                         if risk_flags >= 3
                         else "risk_off_reconcile"
                     ),
@@ -1587,115 +1518,6 @@ def _advance_risk_off_recoveries_session(
     return counts
 
 
-def _expire_buy_watch_item_session(
-    db: Session,
-    *,
-    item: ExecutionPlanItem,
-    risk_context: dict[str, object],
-    now: datetime,
-) -> bool:
-    result = db.execute(
-        update(ExecutionPlanItem)
-        .where(
-            ExecutionPlanItem.id == item.id,
-            ExecutionPlanItem.status == item.status,
-        )
-        .values(status="watch_expired", risk_context=risk_context, updated_at=now)
-        .execution_options(synchronize_session=False)
-    )
-    return bool(result.rowcount)
-
-
-def project_buy_plan_item_for_hourly_risk_off(
-    *,
-    db: Session,
-    settings: Settings,
-    item: ExecutionPlanItem,
-    risk_flags: int,
-    risk_reasons: list[str],
-    now: datetime,
-    resume_status: str | None = None,
-    fence_context: dict[str, object] | None = None,
-) -> bool:
-    """Persist the standard recoverable projection for one buy candidate.
-
-    Broker submission uses this when the global fence wins after an order
-    intent was committed.  That late candidate must carry the same recovery
-    contract as candidates found by the hourly projection scan.
-    """
-
-    if item.side != "buy" or item.intent not in BUY_WATCH_INTENTS:
-        return False
-    risk_context = _json_object(item.risk_context)
-    existing = risk_context.get(ADJUSTMENT_KEY)
-    if (
-        isinstance(existing, dict)
-        and existing.get("source") == SOURCE
-        and existing.get("action") == "risk_off_expire"
-    ):
-        if item.status == "watch_expired":
-            return False
-        # A stale ORM writer may have restored an in-flight status while the
-        # durable recovery marker survived. Reassert the marker's projection;
-        # never leave an executable status paired with active risk-off state.
-        return _expire_buy_watch_item_session(
-            db,
-            item=item,
-            risk_context=risk_context,
-            now=now,
-        )
-    previous = {
-        "status": resume_status or item.status,
-        "trigger_price": (
-            str(item.trigger_price) if item.trigger_price is not None else None
-        ),
-        "limit_price": str(item.limit_price) if item.limit_price is not None else None,
-    }
-    recovery = _seed_recovery_from_fence_context(
-        recovery=_initial_risk_off_recovery(
-            settings=settings,
-            risk_flags=risk_flags,
-            risk_reasons=risk_reasons,
-            now=now,
-        ),
-        fence_context=fence_context,
-        now=now,
-    )
-    risk_context[ADJUSTMENT_KEY] = {
-        "action": "risk_off_expire",
-        "source": SOURCE,
-        "risk_flags": risk_flags,
-        "risk_reasons": list(risk_reasons),
-        "previous": previous,
-        "resume": _risk_off_resume_snapshot(
-            previous=previous,
-            prior_adjustment=existing,
-        ),
-        "applied_at": now.isoformat(),
-        "recovery": recovery,
-    }
-    if not _expire_buy_watch_item_session(
-        db,
-        item=item,
-        risk_context=risk_context,
-        now=now,
-    ):
-        return False
-    _insert_audit_session(
-        db,
-        item=item,
-        event_type="hourly_plan_judgment_buy_watch_expired",
-        summary={
-            "symbol": item.symbol,
-            "action": "risk_off_expire",
-            "risk_flags": risk_flags,
-        },
-        payload={"risk_reasons": list(risk_reasons), "previous": previous},
-        now=now,
-    )
-    return True
-
-
 def _apply_hourly_plan_judgment_action_session(
     *,
     db: Session,
@@ -1727,8 +1549,6 @@ def _apply_hourly_plan_judgment_action_session(
     projection_state = _lock_hourly_risk_off_fence_session(db)
     epoch_matches = projection_state.hourly_risk_off_epoch == expected_epoch
     fence_active = bool(projection_state.hourly_risk_off_active)
-    if fence_active:
-        _lock_execution_plan_items_for_hourly_projection(db)
     fence_context = _json_object(projection_state.hourly_risk_off_context)
     risk_fence = _hourly_risk_off_fence_payload(
         available=True,
@@ -1737,35 +1557,9 @@ def _apply_hourly_plan_judgment_action_session(
         context=fence_context or None,
         event_type=transition_event if epoch_matches else None,
     )
-    if fence_active:
-        projection_risk_flags, projection_risk_reasons = _risk_off_projection_inputs(
-            fence_context=fence_context,
-            fallback_risk_flags=risk_flags,
-            fallback_risk_reasons=risk_reasons,
-        )
-        while True:
-            items = _load_mutable_buy_items_session(
-                db,
-                settings,
-                statuses=RISK_OFF_EXPIRABLE_STATUSES,
-            )
-            if not items:
-                break
-            for item in items:
-                if not project_buy_plan_item_for_hourly_risk_off(
-                    db=db,
-                    settings=settings,
-                    item=item,
-                    risk_flags=projection_risk_flags,
-                    risk_reasons=projection_risk_reasons,
-                    now=now,
-                    fence_context=fence_context,
-                ):
-                    continue
-                changed += 1
     if risk_flags >= 3:
-        action = "risk_off_expire"
-        message = f"risk_off: 신규/추가매수 watch {changed}건 중단"
+        action = "risk_off_fence"
+        message = "risk_off: 신규/추가매수 제출 차단; watch 모니터링 유지"
     elif risk_flags >= 1:
         action = "conservative_price_adjust"
         after: tuple[str, datetime, str] | None = None
@@ -1875,14 +1669,18 @@ def _apply_hourly_plan_judgment_action_session(
         and epoch_matches
         and bool(fence_context.get("recovery_ready"))
     )
-    recovery_counts = _advance_risk_off_recoveries_session(
-        db,
-        settings,
-        risk_flags=risk_flags,
-        risk_reasons=risk_reasons,
-        now=now,
-        resume_allowed=recovery_ready if fence_active else True,
-        reconcile_all=fence_active,
+    recovery_counts = (
+        _advance_risk_off_recoveries_session(
+            db,
+            settings,
+            risk_flags=risk_flags,
+            risk_reasons=risk_reasons,
+            now=now,
+            resume_allowed=recovery_ready if fence_active else True,
+            reconcile_all=recovery_ready,
+        )
+        if recovery_ready or not fence_active
+        else {"observed": 0, "reset": 0, "resumed": 0}
     )
     changed += recovery_counts["resumed"]
     if recovery_counts["resumed"]:
@@ -1905,81 +1703,6 @@ def _apply_hourly_plan_judgment_action_session(
         "recovery_resumed_count": recovery_counts["resumed"],
         "hourly_risk_off": risk_fence,
     }
-
-
-def _expire_buy_watches(
-    conn: sqlite3.Connection,
-    settings: Settings,
-    risk_flags: int,
-    risk_reasons: list[str],
-) -> int:
-    changed = 0
-    now = datetime.now(UTC).isoformat()
-    fence_context: dict[str, object] | None = None
-    if _sqlite_has_hourly_risk_off_fence(conn):
-        row = conn.execute(
-            "select hourly_risk_off_context from runtime_control_state where id = ?",
-            (RUNTIME_CONTROL_ID,),
-        ).fetchone()
-        if row is not None:
-            fence_context = _json_object(row[0])
-    while True:
-        items = _load_mutable_buy_items(
-            conn,
-            settings,
-            statuses=RISK_OFF_EXPIRABLE_STATUSES,
-        )
-        if not items:
-            break
-        for item in items:
-            previous = {
-                "status": item["status"],
-                "trigger_price": str(item["trigger_price"]) if item["trigger_price"] is not None else None,
-                "limit_price": str(item["limit_price"]) if item["limit_price"] is not None else None,
-            }
-            risk_context = _json_object(item["risk_context"])
-            prior_adjustment = risk_context.get(ADJUSTMENT_KEY)
-            risk_context[ADJUSTMENT_KEY] = {
-                "action": "risk_off_expire",
-                "source": SOURCE,
-                "risk_flags": risk_flags,
-                "risk_reasons": risk_reasons,
-                "previous": previous,
-                "resume": _risk_off_resume_snapshot(
-                    previous=previous,
-                    prior_adjustment=prior_adjustment,
-                ),
-                "applied_at": now,
-                "recovery": _seed_recovery_from_fence_context(
-                    recovery=_initial_risk_off_recovery(
-                        settings=settings,
-                        risk_flags=risk_flags,
-                        risk_reasons=risk_reasons,
-                        now=datetime.fromisoformat(now),
-                    ),
-                    fence_context=fence_context,
-                    now=datetime.fromisoformat(now),
-                ),
-            }
-            cursor = conn.execute(
-                """
-                update execution_plan_items
-                set status = 'watch_expired', risk_context = ?, updated_at = ?
-                where id = ? and status = ?
-                """,
-                (json.dumps(risk_context, ensure_ascii=False), now, item["id"], item["status"]),
-            )
-            if cursor.rowcount > 0:
-                _insert_audit(
-                    conn,
-                    item_id=item["id"],
-                    event_type="hourly_plan_judgment_buy_watch_expired",
-                    summary={"symbol": item["symbol"], "action": "risk_off_expire", "risk_flags": risk_flags},
-                    payload={"risk_reasons": risk_reasons, "previous": previous},
-                    now=now,
-                )
-                changed += 1
-    return changed
 
 
 def _adjust_buy_watch_prices(

@@ -144,7 +144,6 @@ from app.services.plan_item_identity import (
     plan_item_inventory_scope_key,
     select_plan_item_family_members,
 )
-from app.services.plan_judgment_actions import project_buy_plan_item_for_hourly_risk_off
 from app.services.position_identity import (
     EXECUTION_SCOPE_POLICY_VERSION,
     KIS_US_POSITION_QUARANTINE_EXCHANGES,
@@ -160,14 +159,17 @@ from app.services.position_identity import (
 from app.services.risk_sizing import effective_stop_price
 from app.services.runtime_controls import (
     RUNTIME_CONTROL_ID,
-    automated_buy_submission_block_reason,
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
     ensure_runtime_control_state,
     hourly_risk_off_retry_after_at,
+    is_transient_market_buy_filter_reason,
+    market_scoped_automated_buy_submission_block_reason,
     runtime_safety_payload,
 )
 from app.services.runtime_transitions import (
+    ACTIVE_WATCH_MONITORING_STATUSES,
+    WATCH_SIZING_PENDING_STATUS,
     apply_broker_order_status,
     plan_item_status_for_broker_order_status,
     set_plan_item_status,
@@ -175,6 +177,23 @@ from app.services.runtime_transitions import (
 
 UPBIT_PAPER_ALLOWED_SYMBOLS = frozenset({"KRW-BTC", "KRW-ETH"})
 RUNTIME_SAFETY_CONTROL_CLASSIFICATION = "runtime_safety_control"
+TRANSIENT_MARKET_FENCE_STATUS_FALLBACKS = {
+    "watch_buy_dispatching": "watch_buy_triggered_blocked",
+    "next_open_buy_dispatching": "next_open_buy_retry_pending",
+    "new_buy_dispatching": "new_buy_retry_pending",
+}
+TRANSIENT_MARKET_FENCE_RESTORABLE_STATUSES = (
+    ACTIVE_WATCH_MONITORING_STATUSES
+    | {WATCH_SIZING_PENDING_STATUS}
+    | frozenset(
+        {
+            "next_open_buy_scheduled",
+            "next_open_buy_retry_pending",
+            "new_buy_scheduled",
+            "new_buy_retry_pending",
+        }
+    )
+)
 ACCOUNT_DRAWDOWN_RECOVERY_INELIGIBLE_PLAN_STATUSES = frozenset(
     {
         "broker_order_submission_pending",
@@ -1014,7 +1033,16 @@ def _place_broker_order_serialized(
         and command.side == "buy"
         and _is_new_buy_order(command=command, plan_item=None)
     ):
-        submission_block_reason = automated_buy_submission_block_reason(control_state)
+        submission_block_reason = market_scoped_automated_buy_submission_block_reason(
+            control_state,
+            settings=settings,
+            provider=command.provider,
+            asset_class=command.asset_class,
+            exchange=command.exchange,
+            symbol=command.symbol,
+            venue=command.venue,
+            now=observed_at,
+        )
     if submission_block_reason is not None:
         block_reason = submission_block_reason
         retry_after_at = (
@@ -1038,7 +1066,7 @@ def _place_broker_order_serialized(
                     "retry_after_at": (
                         retry_after_at.isoformat() if retry_after_at is not None else None
                     ),
-                    "safety": runtime_safety_payload(control_state),
+                    "safety": runtime_safety_payload(control_state, settings=settings),
                     "order": serialize_broker_order(
                         retryable_safety_fenced_order,
                         include_events=True,
@@ -1056,7 +1084,7 @@ def _place_broker_order_serialized(
                 "retry_after_at": (
                     retry_after_at.isoformat() if retry_after_at is not None else None
                 ),
-                "safety": runtime_safety_payload(control_state),
+                "safety": runtime_safety_payload(control_state, settings=settings),
             },
         )
 
@@ -1328,49 +1356,6 @@ def _place_broker_order_serialized(
             source_order=drawdown_recovery_source_order,
             block_reason="account_drawdown_recovery_disabled",
             message="account drawdown recovery is disabled by configuration",
-        )
-
-    if (
-        command.side == "buy"
-        and _is_new_buy_order(command=command, plan_item=plan_item)
-        and control_state.hourly_risk_off_active
-    ):
-        recovery_candidate_state_error = _account_recovery_candidate_state_error(
-            db=db,
-            plan_item=plan_item,
-            source_order=drawdown_recovery_source_order,
-            request_source=request_source,
-            retryable_safety_fenced_order=retryable_safety_fenced_order,
-            lock=True,
-        )
-        if recovery_candidate_state_error is not None:
-            return recovery_candidate_state_error
-        retry_after_at = hourly_risk_off_retry_after_at(
-            settings=settings,
-            state=control_state,
-            now=observed_at,
-        )
-        return PlaceBrokerOrderResult(
-            status_code=409,
-            payload={
-                "duplicate": retryable_safety_fenced_order is not None,
-                "message": "new buy submission is blocked by the active hourly risk-off fence",
-                "block_reason": "hourly_plan_risk_off",
-                "retry_after_at": (
-                    retry_after_at.isoformat() if retry_after_at is not None else None
-                ),
-                "safety": runtime_safety_payload(control_state),
-                **(
-                    {
-                        "order": serialize_broker_order(
-                            retryable_safety_fenced_order,
-                            include_events=True,
-                        )
-                    }
-                    if retryable_safety_fenced_order is not None
-                    else {}
-                ),
-            },
         )
 
     recovery_generation: int | None = None
@@ -2887,8 +2872,22 @@ def _place_broker_order_serialized(
                     retryable_override=False,
                     permanent_rejection=True,
                 )
+        boundary_checked_at = _final_buy_boundary_checked_at(
+            settings=settings,
+            requested_at=observed_at,
+        )
         boundary_block_reason = (
-            automated_buy_submission_block_reason(control_state)
+            market_scoped_automated_buy_submission_block_reason(
+                control_state,
+                settings=settings,
+                provider=routed_command.provider,
+                asset_class=routed_command.asset_class,
+                exchange=routed_command.exchange,
+                symbol=routed_command.symbol,
+                venue=routed_command.venue,
+                risk_context=(plan_item.risk_context if plan_item is not None else None),
+                now=boundary_checked_at,
+            )
             if routed_command.side == "buy"
             and _is_new_buy_order(command=routed_command, plan_item=plan_item)
             else automated_order_submission_block_reason(control_state)
@@ -2917,9 +2916,7 @@ def _place_broker_order_serialized(
                 command=routed_command,
                 mismatch=account_route_mismatch,
             )
-        authority_checked_at = _normalize_utc_datetime(
-            now or datetime.now(UTC)
-        )
+        authority_checked_at = boundary_checked_at
         scoped_authority_reason = (
             core_buy_authority_block_reason(
                 settings=settings,
@@ -3485,8 +3482,22 @@ def _place_broker_order_serialized(
                 )
             order = locked_order
 
+            boundary_checked_at = _final_buy_boundary_checked_at(
+                settings=settings,
+                requested_at=_normalize_utc_datetime(now or datetime.now(UTC)),
+            )
             boundary_block_reason = (
-                automated_buy_submission_block_reason(control_state)
+                market_scoped_automated_buy_submission_block_reason(
+                    control_state,
+                    settings=settings,
+                    provider=routed_command.provider,
+                    asset_class=routed_command.asset_class,
+                    exchange=routed_command.exchange,
+                    symbol=routed_command.symbol,
+                    venue=routed_command.venue,
+                    risk_context=(plan_item.risk_context if plan_item is not None else None),
+                    now=boundary_checked_at,
+                )
                 if routed_command.side == "buy"
                 and _is_new_buy_order(command=routed_command, plan_item=plan_item)
                 else automated_order_submission_block_reason(control_state)
@@ -3515,9 +3526,7 @@ def _place_broker_order_serialized(
                     command=routed_command,
                     mismatch=account_route_mismatch,
                 )
-            authority_checked_at = _normalize_utc_datetime(
-                now or datetime.now(UTC)
-            )
+            authority_checked_at = boundary_checked_at
             scoped_authority_reason = (
                 core_buy_authority_block_reason(
                     settings=settings,
@@ -4708,6 +4717,27 @@ def _persist_execution_account_scope_fence(
     )
 
 
+def _transient_market_fence_restore_status(
+    *,
+    order: BrokerOrder,
+    plan_item: ExecutionPlanItem,
+) -> str:
+    request_metadata = _json_dict(order.request_metadata)
+    recorded = request_metadata.get("plan_item_status_before_submission")
+    recorded_status = str(recorded or "").strip()
+    normalized = TRANSIENT_MARKET_FENCE_STATUS_FALLBACKS.get(
+        recorded_status,
+        recorded_status,
+    )
+    if normalized in TRANSIENT_MARKET_FENCE_RESTORABLE_STATUSES:
+        return normalized
+    if plan_item.intent == "intraday_watch_buy":
+        return "watch_buy_triggered_blocked"
+    if plan_item.intent == "next_open_buy":
+        return "next_open_buy_retry_pending"
+    return "new_buy_retry_pending"
+
+
 def _persist_runtime_safety_fence(
     *,
     settings: Settings,
@@ -4731,12 +4761,13 @@ def _persist_runtime_safety_fence(
         or automated_order_submission_block_reason(control_state)
         or "runtime_control"
     )
+    transient_market_fence = is_transient_market_buy_filter_reason(block_reason)
     message = message_override or (
         "broker submission was fenced before the broker call because runtime safety controls "
         f"changed to {block_reason}"
     )
     retry_after_at = retry_after_at_override
-    if retry_after_at is None and risk_off_fence:
+    if retry_after_at is None and block_reason == "hourly_plan_risk_off":
         retry_after_at = hourly_risk_off_retry_after_at(
             settings=settings,
             state=control_state,
@@ -4750,7 +4781,9 @@ def _persist_runtime_safety_fence(
     order.last_error_code = block_reason
     order.last_error_message = message
     order.last_error_retryable = retryable_override
-    order.response_metadata = {"runtime_safety_fence": runtime_safety_payload(control_state)}
+    order.response_metadata = {
+        "runtime_safety_fence": runtime_safety_payload(control_state, settings=settings)
+    }
     order.raw_broker_payload = None
     request_metadata = dict(order.request_metadata or {})
     request_metadata["runtime_safety_fence"] = {
@@ -4773,67 +4806,33 @@ def _persist_runtime_safety_fence(
             payload={
                 "block_reason": block_reason,
                 "broker_call_started": False,
-                "safety": runtime_safety_payload(control_state),
+                "safety": runtime_safety_payload(control_state, settings=settings),
             },
             observed_at=observed_at,
         )
     )
-    if plan_item is not None and not preserve_plan_item_status:
-        if risk_off_fence:
-            db.refresh(plan_item, attribute_names=["status", "risk_context"])
-            fence_context = (
-                control_state.hourly_risk_off_context
-                if isinstance(control_state.hourly_risk_off_context, dict)
-                else {}
+    if plan_item is not None:
+        if transient_market_fence:
+            restored_status = _transient_market_fence_restore_status(
+                order=order,
+                plan_item=plan_item,
             )
-            original_status = request_metadata.get(
-                "plan_item_status_before_submission"
-            )
-            if not isinstance(original_status, str) or not original_status:
-                original_status = (
-                    "next_open_buy_retry_pending"
-                    if plan_item.intent == "next_open_buy"
-                    else "watch_monitoring_active"
-                )
-            projected = project_buy_plan_item_for_hourly_risk_off(
+            set_plan_item_status(
                 db=db,
-                settings=settings,
-                item=plan_item,
-                risk_flags=int(
-                    fence_context.get("activation_risk_flags")
-                    or fence_context.get("last_risk_flags")
-                    or 3
-                ),
-                risk_reasons=[
-                    str(reason)
-                    for reason in (
-                        fence_context.get("activation_risk_reasons")
-                        or fence_context.get("last_risk_reasons")
-                        or ["active hourly risk-off fence"]
-                    )
-                ],
-                now=observed_at,
-                resume_status=original_status,
-                fence_context=fence_context,
+                plan_item=plan_item,
+                status=restored_status,
+                source="broker_order_service",
+                reason=message,
+                payload={
+                    "broker_order_pk": order.id,
+                    "idempotency_key": order.idempotency_key,
+                    "block_reason": block_reason,
+                    "broker_call_started": False,
+                    "transient_market_filter_fence": True,
+                    "restored_status": restored_status,
+                },
             )
-            if (
-                not projected
-                and not _plan_item_has_active_hourly_risk_off(plan_item)
-            ):
-                set_plan_item_status(
-                    db=db,
-                    plan_item=plan_item,
-                    status="broker_order_rejected",
-                    source="broker_order_service",
-                    reason=message,
-                    payload={
-                        "broker_order_pk": order.id,
-                        "idempotency_key": order.idempotency_key,
-                        "block_reason": block_reason,
-                        "broker_call_started": False,
-                    },
-                )
-        else:
+        elif not preserve_plan_item_status:
             set_plan_item_status(
                 db=db,
                 plan_item=plan_item,
@@ -4861,11 +4860,12 @@ def _persist_runtime_safety_fence(
             "blocked": True,
             "message": message,
             "block_reason": block_reason,
+            "preserve_plan_item_status": transient_market_fence,
             "permanent_rejection": permanent_rejection,
             "retry_after_at": (
                 retry_after_at.isoformat() if retry_after_at is not None else None
             ),
-            "safety": runtime_safety_payload(control_state),
+            "safety": runtime_safety_payload(control_state, settings=settings),
             "order": serialize_broker_order(persisted or order, include_events=True),
         },
     )
@@ -12914,6 +12914,16 @@ def _route_now(metadata: dict[str, object]) -> datetime:
             return parsed.replace(tzinfo=UTC)
         return parsed
     return datetime.now(UTC)
+
+
+def _final_buy_boundary_checked_at(
+    *,
+    settings: Settings,
+    requested_at: datetime,
+) -> datetime:
+    if settings.runtime_mode == "live":
+        return datetime.now(UTC)
+    return _normalize_utc_datetime(requested_at)
 
 
 def _normalize_utc_datetime(value: datetime) -> datetime:

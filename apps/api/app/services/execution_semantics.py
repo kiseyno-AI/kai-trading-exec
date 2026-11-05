@@ -34,6 +34,10 @@ WATCH_BUY_AT_OR_BELOW_ALIASES = frozenset(
     {"down", "below", "pullback", "dip", "<=", "at_or_below"}
 )
 KRX_SHORT_CODE_PATTERN = re.compile(r"[0-9]{4}[0-9A-Z]{2}\Z")
+KNOWN_EXECUTION_EXCHANGES = frozenset(
+    set(KRX_EXCHANGES)
+    | {"NASD", "NYSE", "AMEX", "US", "UPBIT", "CRYPTO", "ALPACA"}
+)
 
 
 def is_canonical_krx_short_code(value: object) -> bool:
@@ -156,3 +160,57 @@ def canonical_execution_asset_class(
             )
         return canonical
     return normalized_asset_class
+
+
+def resolve_execution_market_scope(
+    *,
+    provider: object,
+    asset_class: object,
+    symbol: object,
+    exchange: object = None,
+    venue: object = None,
+    risk_context: object = None,
+) -> tuple[str, str, str]:
+    """Resolve a plan item's execution scope without treating a broker venue as an exchange."""
+
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_asset_class = str(asset_class or "").strip().lower()
+    risk = risk_context if isinstance(risk_context, dict) else {}
+    candidates = (
+        risk.get("exchange"),
+        exchange,
+        risk.get("market"),
+        venue,
+    )
+    normalized_exchange = next(
+        (
+            candidate
+            for raw in candidates
+            if (candidate := str(raw or "").strip().upper())
+            in KNOWN_EXECUTION_EXCHANGES
+        ),
+        "",
+    )
+    if (
+        normalized_provider == "kis"
+        and normalized_asset_class not in {"us_equity", "us_stock"}
+        and normalized_exchange not in {"NASD", "NYSE", "AMEX", "US"}
+        and is_canonical_krx_short_code(symbol)
+    ):
+        return normalized_provider, "stock", (
+            normalized_exchange if normalized_exchange in KRX_EXCHANGES else "KRX"
+        )
+    if (
+        normalized_provider == "kis"
+        and canonical_krx_asset_class(normalized_asset_class) is not None
+        and (
+            normalized_exchange in KRX_EXCHANGES
+            or (not normalized_exchange and is_canonical_krx_short_code(symbol))
+        )
+    ):
+        return normalized_provider, "stock", (
+            normalized_exchange if normalized_exchange in KRX_EXCHANGES else "KRX"
+        )
+    if normalized_asset_class in {"us_equity", "us_stock"}:
+        return normalized_provider, normalized_asset_class, normalized_exchange or "US"
+    return normalized_provider, normalized_asset_class, normalized_exchange

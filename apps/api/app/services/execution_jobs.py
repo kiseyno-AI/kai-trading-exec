@@ -29,15 +29,15 @@ from app.models.runtime import (
 from app.services.broker_orders import place_broker_order
 from app.services.exec_agent_approval import is_legacy_unverified_exec_agent_sizing
 from app.services.broker_auth import build_broker_adapter, ensure_authenticated_broker_session
-from app.services.execution_semantics import is_delegated_exec_agent_sizing_policy
+from app.services.execution_semantics import (
+    is_delegated_exec_agent_sizing_policy,
+    resolve_execution_market_scope,
+)
 from app.services.json_compaction import compact_json_object
 from app.services.monitoring_price_source import (
     _is_trusted_exchange_freshness_source,
     is_us_regular_session,
     next_us_regular_open,
-)
-from app.services.plan_judgment_actions import (
-    project_buy_plan_item_for_hourly_risk_off,
 )
 from app.services.rejected_order_retries import (
     BROKER_ORDER_RETRY_JOB_TYPE,
@@ -47,11 +47,12 @@ from app.services.rejected_order_retries import (
 )
 from app.services.runtime_controls import (
     RUNTIME_CONTROL_ID,
-    automated_buy_submission_block_reason,
     automated_order_submission_allowed,
     automated_order_submission_block_reason,
     ensure_runtime_control_state,
     hourly_risk_off_retry_after_at,
+    is_transient_market_buy_filter_reason,
+    market_scoped_automated_buy_submission_block_reason,
     runtime_safety_payload,
 )
 from app.services.runtime_transitions import set_execution_job_status, set_plan_item_status
@@ -269,7 +270,7 @@ def dispatch_due_execution_jobs(
         db=db,
         triggered_at=triggered_at,
     )
-    safety = runtime_safety_payload(control_state)
+    safety = runtime_safety_payload(control_state, settings=settings, now=triggered_at)
     if not automated_order_submission_allowed(control_state):
         return DispatchExecutionJobsResult(
             status_code=200,
@@ -316,13 +317,28 @@ def dispatch_due_execution_jobs(
     retrying = 0
     failed = 0
     blocked_buy_job_count = 0
+    blocked_buy_reasons: set[str] = set()
     serialized_jobs: list[dict[str, object]] = []
     krx_calendar_state_by_date: dict[date, bool | None] = {}
-    buy_block_reason = automated_buy_submission_block_reason(control_state)
-
+    # Pause and kill-switch are operational controls that apply to every BUY
+    # route.  KRX market observations are deliberately evaluated per job so a
+    # KRX-only fence cannot hide a due/future KIS-US or crypto job.
+    global_buy_block_reason = "paused" if control_state.paused else None
     for job in due_jobs:
-        if buy_block_reason is not None and job.plan_item.side == "buy":
+        job_buy_block_reason = market_scoped_automated_buy_submission_block_reason(
+            control_state,
+            settings=settings,
+            provider=job.plan_item.provider,
+            asset_class=job.plan_item.asset_class,
+            exchange=_plan_item_exchange(job.plan_item),
+            symbol=job.plan_item.symbol,
+            venue=job.plan_item.venue,
+            risk_context=job.plan_item.risk_context,
+            now=triggered_at,
+        )
+        if job_buy_block_reason is not None and job.plan_item.side == "buy":
             blocked_buy_job_count += 1
+            blocked_buy_reasons.add(job_buy_block_reason)
             serialized_jobs.append(serialize_execution_job(job))
             continue
         initial_next_open_guard = _guard_initial_next_open_submission(
@@ -374,9 +390,10 @@ def dispatch_due_execution_jobs(
         settings=settings,
         db=db,
         triggered_at=triggered_at,
-        include_buys=buy_block_reason is None,
+        include_buys=global_buy_block_reason is None,
+        control_state=control_state,
     )
-    if buy_block_reason == "hourly_plan_risk_off":
+    if "hourly_plan_risk_off" in blocked_buy_reasons:
         buy_retry_after_at = hourly_risk_off_retry_after_at(
             settings=settings,
             state=control_state,
@@ -388,14 +405,36 @@ def dispatch_due_execution_jobs(
                 if next_dispatch_at is not None
                 else buy_retry_after_at
             )
+    elif blocked_buy_reasons & {
+        "hourly_market_observation_missing",
+        "hourly_market_observation_stale",
+    }:
+        market_retry_at = triggered_at + timedelta(
+            seconds=settings.dispatch_loop_interval_seconds
+        )
+        next_dispatch_at = (
+            min(next_dispatch_at, market_retry_at)
+            if next_dispatch_at is not None
+            else market_retry_at
+        )
     all_due_jobs_buy_blocked = bool(
         due_jobs and blocked_buy_job_count == len(due_jobs)
+    )
+    aggregate_buy_block_reason = (
+        next(iter(blocked_buy_reasons))
+        if len(blocked_buy_reasons) == 1
+        else "multiple_buy_submission_fences"
+        if blocked_buy_reasons
+        else None
     )
     return DispatchExecutionJobsResult(
         status_code=200,
         payload={
             "blocked": all_due_jobs_buy_blocked,
-            "block_reason": buy_block_reason if all_due_jobs_buy_blocked else None,
+            "block_reason": (
+                aggregate_buy_block_reason if all_due_jobs_buy_blocked else None
+            ),
+            "blocked_buy_reasons": sorted(blocked_buy_reasons),
             "triggered_at": triggered_at.isoformat(),
             "due_job_count": len(due_jobs),
             "blocked_buy_job_count": blocked_buy_job_count,
@@ -690,27 +729,7 @@ def _recover_stale_running_jobs(
                 occurred_at=triggered_at,
             )
             continue
-        preserve_risk_off_projection = False
-        if control_state.hourly_risk_off_active:
-            risk_flags, risk_reasons, fence_context = (
-                _active_hourly_risk_off_projection_inputs(control_state)
-            )
-            project_buy_plan_item_for_hourly_risk_off(
-                db=db,
-                settings=settings,
-                item=plan_item,
-                risk_flags=risk_flags,
-                risk_reasons=risk_reasons,
-                now=triggered_at,
-                resume_status=_retrying_plan_item_status(job.job_type),
-                fence_context=fence_context,
-            )
-            db.refresh(plan_item, attribute_names=["status", "risk_context"])
-            preserve_risk_off_projection = _plan_item_has_active_hourly_risk_off(
-                plan_item
-            )
-        elif _plan_item_has_active_hourly_risk_off(plan_item):
-            preserve_risk_off_projection = True
+        preserve_risk_off_projection = _plan_item_has_active_hourly_risk_off(plan_item)
         set_execution_job_status(
             db=db,
             job=job,
@@ -809,36 +828,6 @@ def _lock_hourly_risk_off_fence(*, db: Session) -> RuntimeControlState:
         ],
     )
     return state
-
-
-def _active_hourly_risk_off_projection_inputs(
-    state: RuntimeControlState,
-) -> tuple[int, list[str], dict[str, object]]:
-    context = (
-        state.hourly_risk_off_context
-        if isinstance(state.hourly_risk_off_context, dict)
-        else {}
-    )
-    raw_flags = context.get(
-        "activation_risk_flags",
-        context.get("last_risk_flags", 3),
-    )
-    try:
-        risk_flags = max(3, int(raw_flags))
-    except (TypeError, ValueError):
-        risk_flags = 3
-    raw_reasons = context.get(
-        "activation_risk_reasons",
-        context.get("last_risk_reasons", []),
-    )
-    risk_reasons = (
-        [reason for reason in raw_reasons if isinstance(reason, str) and reason]
-        if isinstance(raw_reasons, list)
-        else []
-    )
-    if not risk_reasons:
-        risk_reasons = ["active hourly buy risk-off fence"]
-    return risk_flags, risk_reasons, context
 
 
 def _plan_item_has_active_hourly_risk_off(item: ExecutionPlanItem) -> bool:
@@ -1040,21 +1029,18 @@ def _dispatch_job(
             _is_account_drawdown_recovery_block(result.payload)
             and block_reason not in RETRYABLE_ACCOUNT_DRAWDOWN_BLOCK_REASONS
         )
-        if block_reason == "hourly_plan_risk_off":
-            db.refresh(job.plan_item, attribute_names=["status", "risk_context"])
-            plan_item_status = (
-                None
-                if _plan_item_has_active_hourly_risk_off(job.plan_item)
-                else _retrying_plan_item_status(job.job_type)
-            )
+        if is_transient_market_buy_filter_reason(block_reason):
+            plan_item_status = _retrying_plan_item_status(job.job_type)
+            if retry_after_at is None:
+                retry_after_at = dispatch_reference_at + timedelta(
+                    seconds=settings.dispatch_loop_interval_seconds
+                )
         elif block_reason in RETRYABLE_ACCOUNT_DRAWDOWN_BLOCK_REASONS:
             plan_item_status = (
                 "new_buy_blocked"
                 if job.job_type == NEXT_OPEN_BUY_JOB_TYPE
                 else _retrying_plan_item_status(job.job_type)
             )
-        elif block_reason in {"paused", "kill_switch"}:
-            plan_item_status = _retrying_plan_item_status(job.job_type)
         else:
             plan_item_status = None
         return _finish_job(
@@ -1784,14 +1770,14 @@ def _next_market_open_utc(
 
 
 def _plan_item_exchange(plan_item: ExecutionPlanItem) -> str:
-    risk_context = plan_item.risk_context
-    if not isinstance(risk_context, dict):
-        return "KRX"
-    value = risk_context.get("exchange")
-    if not isinstance(value, str):
-        return "KRX"
-    normalized = value.strip().upper()
-    return normalized or "KRX"
+    _, _, exchange = resolve_execution_market_scope(
+        provider=plan_item.provider,
+        asset_class=plan_item.asset_class,
+        symbol=plan_item.symbol,
+        venue=plan_item.venue,
+        risk_context=plan_item.risk_context,
+    )
+    return exchange
 
 
 def _is_due(job: ExecutionJob, triggered_at: datetime) -> bool:
@@ -1807,9 +1793,10 @@ def _next_dispatchable_job_at(
     db: Session,
     triggered_at: datetime,
     include_buys: bool = True,
+    control_state: RuntimeControlState | None = None,
 ) -> datetime | None:
     query = (
-        select(ExecutionJob.id, ExecutionJob.scheduled_for)
+        select(ExecutionJob)
         .join(ExecutionJob.plan_item)
         .join(ExecutionPlanItem.plan)
         .where(
@@ -1820,21 +1807,37 @@ def _next_dispatchable_job_at(
     )
     if not include_buys:
         query = query.where(ExecutionPlanItem.side != "buy")
-    query = (
-        query.order_by(
+    jobs = db.scalars(
+        query.options(selectinload(ExecutionJob.plan_item)).order_by(
             ExecutionJob.scheduled_for.is_not(None).asc(),
             ExecutionJob.scheduled_for.asc(),
             ExecutionJob.created_at.asc(),
             ExecutionJob.id.asc(),
         )
-        .limit(1)
-    )
-    row = db.execute(query).first()
-    if row is None:
-        return None
-    if row.scheduled_for is None:
-        return triggered_at
-    return _normalize_utc(row.scheduled_for)
+    ).all()
+    for job in jobs:
+        item = job.plan_item
+        if (
+            control_state is not None
+            and item.side == "buy"
+            and market_scoped_automated_buy_submission_block_reason(
+                control_state,
+                settings=settings,
+                provider=item.provider,
+                asset_class=item.asset_class,
+                exchange=_plan_item_exchange(item),
+                symbol=item.symbol,
+                venue=item.venue,
+                risk_context=item.risk_context,
+                now=triggered_at,
+            )
+            is not None
+        ):
+            continue
+        if job.scheduled_for is None:
+            return triggered_at
+        return _normalize_utc(job.scheduled_for)
+    return None
 
 
 def _guard_initial_next_open_submission(
