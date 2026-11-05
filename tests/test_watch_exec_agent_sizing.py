@@ -59,6 +59,7 @@ from app.services.exec_agent_approval import (
     configured_execution_cost_evidence,
     delegated_buy_gate_rejections,
     maximum_entry_price_for_buy_economics,
+    persisted_verified_watch_sizing_provenance,
 )
 from app.services.json_compaction import json_payload_hash
 from app.services.execution_account_route import bind_kis_account_route
@@ -394,7 +395,7 @@ def test_full_cost_max_entry_is_the_exact_assess_buy_economics_boundary(
     assert above.net_reward_risk == Decimal("1.7999")
 
 
-def test_freeform_reward_risk_reason_uses_deterministic_defer_disposition() -> None:
+def test_freeform_reward_risk_agent_veto_becomes_quantity_only_monitoring() -> None:
     settings = Settings(runtime_mode="live", exec_agent_min_reward_risk=Decimal("1.8"))
     plan = ExecutionPlan(
         id="plan-1",
@@ -448,16 +449,16 @@ def test_freeform_reward_risk_reason_uses_deterministic_defer_disposition() -> N
         },
         now=datetime(2026, 6, 4, 0, 0, tzinfo=UTC),
     )
-    assert summary["deferred"] == 1
+    assert summary["approved"] == 1
+    assert summary["deferred"] == 0
     assert summary["rejected"] == 0
-    assert plan.items[0].status == watch_sizing.WATCH_SIZING_PENDING_STATUS
-    deferred = plan.items[0].risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
-    assert deferred["disposition"] == "defer"
-    assert deferred["reason_family"] == "reward_risk"
-    assert deferred["expires_at"] == "2026-06-04T06:30:00+00:00"
+    assert plan.items[0].status == "watch_monitoring_active"
+    assert plan.items[0].quantity_policy["reason_code"] == (
+        "server_quantity_only_after_agent_reject"
+    )
 
 
-def test_price_dependent_reward_risk_defer_remains_monitored_after_attempt_cap() -> None:
+def test_price_dependent_reward_risk_veto_clears_prior_defer_and_monitors() -> None:
     settings = Settings(
         runtime_mode="live",
         exec_agent_min_reward_risk=Decimal("1.8"),
@@ -519,18 +520,11 @@ def test_price_dependent_reward_risk_defer_remains_monitored_after_attempt_cap()
         now=datetime(2026, 6, 4, 0, 5, tzinfo=UTC),
     )
 
-    assert summary["deferred"] == 1
+    assert summary["approved"] == 1
+    assert summary["deferred"] == 0
     assert summary["rejected"] == 0
-    assert item.status == watch_sizing.WATCH_SIZING_PENDING_STATUS
-    deferred = item.risk_context[watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY]
-    assert deferred["disposition"] == "defer"
-    assert deferred["reason_family"] == "reward_risk"
-    assert deferred["attempt_count"] == 2
-    assert deferred["max_attempts"] == 2
-    assert deferred["price_watch_only"] is True
-    assert deferred["retry_after"] == "2026-06-04T00:05:30+00:00"
-    assert deferred["expires_at"] == "2026-06-04T06:30:00+00:00"
-    assert item.risk_context["reward_risk_max_entry_price"] == "6515.5805"
+    assert item.status == "watch_monitoring_active"
+    assert watch_sizing.WATCH_EXEC_AGENT_DEFER_KEY not in item.risk_context
 
 
 @pytest.mark.parametrize(
@@ -891,6 +885,107 @@ def test_reopens_pre_policy_reward_risk_reject_once_for_effective_stop_reassessm
         assert audit.summary["effective_stop_policy_version"] == (
             "server_effective_stop_v1"
         )
+
+    engine.dispose()
+
+
+def test_reopens_same_day_subjective_reject_once_but_keeps_structural_reject() -> None:
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        runtime_mode="live",
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+
+    with session_factory() as session:
+        subjective = _watch_item(
+            item_id="subjective-reject-recovery",
+            symbol="005930",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "78000",
+                "stop_loss_price": "69000",
+            },
+        )
+        subjective.provider = "kis"
+        subjective.venue = "KRX"
+        subjective.asset_class = "stock"
+        original_policy = dict(subjective.quantity_policy)
+        subjective.status = "exec_agent_rejected"
+        subjective.quantity_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": "subjective continuation veto",
+            "reason_code": "continuation_quality_below_threshold",
+            "reason_family": "agent_rejection",
+            "rejection_disposition": "terminal",
+            "effective_stop_policy_version": "server_effective_stop_v1",
+            "previous_policy": original_policy,
+        }
+
+        structural = _watch_item(
+            item_id="structural-reject-preserved",
+            symbol="000660",
+            risk_context={
+                "exchange": "KRX",
+                "target_price": "130000",
+                "stop_loss_price": "110000",
+            },
+        )
+        structural.provider = "kis"
+        structural.venue = "KRX"
+        structural.asset_class = "stock"
+        structural.status = "exec_agent_rejected"
+        structural.quantity_policy = {
+            "kind": "exec_agent_rejected",
+            "source": "exec_agent_watch_sizing",
+            "reason": "same-lane holding exists",
+            "reason_code": "allowed_action_envelope_blocked",
+            "reason_family": "account_state",
+            "rejection_disposition": "terminal",
+            "previous_policy": dict(structural.quantity_policy),
+        }
+
+        session.add(
+            ExecutionPlan(
+                external_plan_id="subjective-reject-recovery-plan",
+                source="core-signal-decider",
+                market_date=date(2026, 10, 14),
+                mode="live",
+                status="accepted",
+                items=[subjective, structural],
+            )
+        )
+        session.commit()
+
+        first = watch_sizing._reopen_price_watch_terminal_rejections(
+            db=session,
+            settings=settings,
+            market_date=date(2026, 10, 14),
+            now=datetime(2026, 10, 14, 1, 0, tzinfo=UTC),
+        )
+        session.commit()
+        second = watch_sizing._reopen_price_watch_terminal_rejections(
+            db=session,
+            settings=settings,
+            market_date=date(2026, 10, 14),
+            now=datetime(2026, 10, 14, 1, 1, tzinfo=UTC),
+        )
+
+        assert first == [subjective.id]
+        assert second == []
+        assert subjective.status == watch_sizing.WATCH_SIZING_PENDING_STATUS
+        assert subjective.quantity_policy == original_policy
+        assert structural.status == "exec_agent_rejected"
+        audits = session.scalars(
+            select(ExecutionPlanItemAudit).where(
+                ExecutionPlanItemAudit.execution_plan_item_id == subjective.id,
+                ExecutionPlanItemAudit.event_type
+                == "watch_exec_agent_subjective_rejection_reopened_v1",
+            )
+        ).all()
+        assert len(audits) == 1
 
     engine.dispose()
 
@@ -4093,6 +4188,105 @@ def test_paper_intraday_approval_without_contract_proof_is_rejected() -> None:
     )
 
 
+def test_verified_intraday_agent_reject_cannot_veto_core_wait_authority() -> None:
+    settings = Settings(
+        runtime_mode="paper",
+        exec_agent_watch_sizing_min_notional_krw=Decimal("150000"),
+        exec_agent_watch_sizing_high_conviction_min_notional_krw=Decimal("150000"),
+    )
+    item = _watch_item(
+        item_id="quantity-only-reject",
+        symbol="005930",
+        risk_context={"target_price": "78000", "stop_price": "69000"},
+    )
+    plan = ExecutionPlan(
+        id="plan-quantity-only-reject",
+        external_plan_id="plan-quantity-only-reject",
+        strategy_run_id="strategy-quantity-only-reject",
+        source="core-signal-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[item],
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        account_context=_fresh_account_context(),
+        expected_item_ids={item.id},
+        request_payload=_DIRECT_APPLY_REQUEST_PAYLOAD,
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "_runtime_provenance": _verified_sizing_runtime(settings),
+            "decisions": [
+                {
+                    "execution_plan_item_id": item.id,
+                    "symbol": item.symbol,
+                    "action": "reject",
+                    "quantity": 0,
+                    "approved_notional_krw": 0,
+                    "sizing_price": "71500",
+                    "confidence": 0.25,
+                    "target_profile": "short_swing",
+                    "reason_code": "liquidity_not_confirmed",
+                    "reason": "subjective liquidity veto must remain advisory",
+                }
+            ],
+        },
+    )
+
+    assert summary["approved"] == 1
+    assert summary["rejected"] == 0
+    assert item.status == "watch_monitoring_active"
+    assert item.quantity_policy["kind"] == "shares"
+    assert item.quantity_policy["quantity"] > 0
+    assert item.quantity_policy["reason_code"] == (
+        "server_quantity_only_after_agent_reject"
+    )
+    assert persisted_verified_watch_sizing_provenance(item.quantity_policy)
+
+
+def test_unverified_intraday_agent_reject_remains_fail_closed() -> None:
+    settings = Settings(runtime_mode="paper")
+    item = _watch_item(
+        item_id="quantity-only-unverified-reject",
+        risk_context={"target_price": "78000", "stop_price": "69000"},
+    )
+    plan = ExecutionPlan(
+        external_plan_id="plan-quantity-only-unverified-reject",
+        source="core-signal-decider",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[item],
+    )
+
+    summary = _apply_decisions(
+        db=None,  # type: ignore[arg-type]
+        settings=settings,
+        plan=plan,
+        account_context=_fresh_account_context(),
+        expected_item_ids={item.id},
+        decision_payload={
+            "version": "manual-exec-agent-watch-sizing-v1",
+            "decisions": [
+                {
+                    "execution_plan_item_id": item.id,
+                    "symbol": item.symbol,
+                    "action": "reject",
+                    "quantity": 0,
+                    "reason_code": "subjective_reject",
+                    "reason": "unverified response cannot activate monitoring",
+                }
+            ],
+        },
+    )
+
+    assert summary["approved"] == 0
+    assert summary["rejected"] == 1
+    assert item.status == "exec_agent_rejected"
+
+
 def test_apply_decisions_allows_small_agent_probe_below_min_notional() -> None:
     settings = Settings(runtime_mode="live")
     plan = ExecutionPlan(
@@ -5006,8 +5200,10 @@ def test_concurrent_watch_sizing_cycles_with_large_risk_contexts_do_not_lock(tmp
     assert len(results) == 2
     assert monitoring_symbols
     with session_factory() as session:
-        rejected_count = session.query(ExecutionPlanItem).filter(ExecutionPlanItem.status == "exec_agent_rejected").count()
-        assert rejected_count == 12
+        active_count = session.query(ExecutionPlanItem).filter(
+            ExecutionPlanItem.status == "watch_monitoring_active"
+        ).count()
+        assert active_count == 12
         audit_count = session.query(watch_sizing.ExecutionPlanItemAudit).count()
         assert audit_count == 12
 
@@ -6101,7 +6297,7 @@ def test_sizing_request_payload_hard_rejects_incomplete_or_unprofitable_geometry
     assert expected_reason not in envelope["soft_warnings"]
 
 
-def test_sizing_envelope_rejects_reward_risk_below_deterministic_floor() -> None:
+def test_sizing_envelope_reports_reward_risk_below_floor_as_advisory() -> None:
     item = _watch_item(
         risk_context={
             "target_price": "72700",
@@ -6123,8 +6319,34 @@ def test_sizing_envelope_rejects_reward_risk_below_deterministic_floor() -> None
         },
     )
 
-    assert "reward_risk_below_minimum" in envelope["hard_reject_reasons"]
-    assert envelope["allowed_actions"] == ["hold", "reject"]
+    assert "reward_risk_below_minimum" not in envelope["hard_reject_reasons"]
+    assert "reward_risk_below_minimum" in envelope["soft_warnings"]
+    assert "buy" in envelope["allowed_actions"]
+
+
+def test_intraday_watch_envelope_keeps_subjective_economics_advisory() -> None:
+    risk_context = {
+        **_delegated_gate_context(),
+        "target_price": "72700",
+        "stop_price": "70500",
+    }
+    candidate = _candidate_payload(_watch_item(risk_context=risk_context))
+
+    envelope = watch_sizing._allowed_action_envelope_for_candidate(
+        settings=Settings(runtime_mode="paper"),
+        candidate=candidate,
+        account_context={
+            "available": True,
+            "orderable_cash_krw": "10000000",
+            "buying_power_krw": "10000000",
+            "holdings": [],
+            "open_orders": [],
+        },
+    )
+
+    assert "reward_risk_below_minimum" not in envelope["hard_reject_reasons"]
+    assert "reward_risk_below_minimum" in envelope["soft_warnings"]
+    assert "buy" in envelope["allowed_actions"]
 
 
 def test_sizing_envelope_allows_other_lane_but_keeps_aggregate_symbol_cap() -> None:
@@ -6962,7 +7184,7 @@ def test_final_watch_quantity_uses_the_same_effective_stop_as_the_envelope() -> 
     assert sizing["approved_notional"] == Decimal("3000000")
 
 
-def test_live_sizing_envelope_requires_configured_transaction_cost_policy() -> None:
+def test_live_sizing_envelope_reports_missing_cost_policy_without_vetoing_monitoring() -> None:
     item = _watch_item(
         risk_context={"target_price": "76000", "stop_price": "69000"}
     )
@@ -6982,8 +7204,9 @@ def test_live_sizing_envelope_requires_configured_transaction_cost_policy() -> N
         },
     )
 
-    assert "transaction_cost_evidence_missing" in envelope["hard_reject_reasons"]
-    assert envelope["allowed_actions"] == ["hold", "reject"]
+    assert "transaction_cost_evidence_missing" not in envelope["hard_reject_reasons"]
+    assert "transaction_cost_evidence_missing" in envelope["soft_warnings"]
+    assert "buy" in envelope["allowed_actions"]
 
 
 def test_live_sizing_uses_risk_exchange_when_kis_is_the_broker_venue() -> None:
@@ -7139,7 +7362,8 @@ def test_sizing_envelope_uses_configured_cost_floor_over_candidate_claim() -> No
         },
     )
 
-    assert "net_reward_risk_below_minimum" in envelope["hard_reject_reasons"]
+    assert "net_reward_risk_below_minimum" not in envelope["hard_reject_reasons"]
+    assert "net_reward_risk_below_minimum" in envelope["soft_warnings"]
     assert Decimal(envelope["gross_reward_risk"]) >= Decimal("1.30")
     assert Decimal(envelope["net_reward_risk"]) < Decimal("1.30")
     assert envelope["estimated_round_trip_cost_bps"] == "50.0000"
