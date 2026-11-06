@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, DecimalException, ROUND_DOWN
 from hashlib import sha256
 import hmac
+import logging
 from time import monotonic
 from typing import Iterator
 from zoneinfo import ZoneInfo
@@ -380,6 +381,8 @@ class RejectedOrderRetryLineageProof:
     automated_monitoring_family_identity: dict[str, object] | None = None
     automated_monitoring_family_error: str | None = None
 
+
+LOGGER = logging.getLogger(__name__)
 
 def _normalized_strategy_lane(value: object) -> str | None:
     if not isinstance(value, str):
@@ -4769,118 +4772,134 @@ def _place_broker_order_serialized(
             },
         )
 
-    order.broker_order_id = placement.broker_order_id
-    apply_broker_order_status(order=order, status=placement.normalized_status.value)
-    order.submitted_at = placement.submitted_at
-    order.last_broker_sync_at = placement.observed_at
-    pre_ack_request_metadata = (
-        dict(order.request_metadata)
-        if isinstance(order.request_metadata, dict)
-        else {}
-    )
-    placement_request_metadata = (
-        dict(placement.request_metadata)
-        if isinstance(placement.request_metadata, dict)
-        else {}
-    )
-    order_request_metadata = _merge_order_request_metadata(
-        base={**pre_ack_request_metadata, **placement_request_metadata},
-        command=routed_command,
-        request_source=request_source,
-        route_decision=route_decision,
-        canonical_execution_scope=(
-            pre_ack_request_metadata.get("execution_scope")
-            if isinstance(pre_ack_request_metadata.get("execution_scope"), dict)
-            else None
-        ),
-    )
-    order_request_metadata = _preserve_decision_lineage(
-        request_metadata=order_request_metadata,
-        existing_order=order,
-    )
-    stable_account_scope = pre_ack_request_metadata.get("broker_account_scope")
-    if isinstance(stable_account_scope, dict):
-        # Broker acknowledgements may omit or echo arbitrary request metadata.
-        # The account scope was derived locally before submission and is an
-        # immutable attribution boundary for fills, PnL, and feedback.
-        order_request_metadata["broker_account_scope"] = stable_account_scope
-    stable_symbol_exposure_reservation = pre_ack_request_metadata.get(
-        SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY
-    )
-    if isinstance(stable_symbol_exposure_reservation, dict):
-        # This locally-derived valuation is part of the durable pre-submit
-        # reservation. A broker echo must not replace it after acknowledgement.
-        order_request_metadata[SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY] = (
-            stable_symbol_exposure_reservation
+    plan_item_id_for_recovery = plan_item.id if plan_item is not None else None
+    try:
+        order.broker_order_id = placement.broker_order_id
+        apply_broker_order_status(order=order, status=placement.normalized_status.value)
+        order.submitted_at = placement.submitted_at
+        order.last_broker_sync_at = placement.observed_at
+        pre_ack_request_metadata = (
+            dict(order.request_metadata)
+            if isinstance(order.request_metadata, dict)
+            else {}
         )
-    if account_gate_decision is not None:
-        order_request_metadata["account_drawdown_recovery_policy"] = {
-            "policy_version": 1,
-            "recovery_scope": _account_drawdown_recovery_scope(
-                settings=settings,
-                provider=adapter.provider,
-                asset_class=logical_command.asset_class,
-                exchange=logical_command.exchange,
+        placement_request_metadata = (
+            dict(placement.request_metadata)
+            if isinstance(placement.request_metadata, dict)
+            else {}
+        )
+        order_request_metadata = _merge_order_request_metadata(
+            base={**pre_ack_request_metadata, **placement_request_metadata},
+            command=routed_command,
+            request_source=request_source,
+            route_decision=route_decision,
+            canonical_execution_scope=(
+                pre_ack_request_metadata.get("execution_scope")
+                if isinstance(pre_ack_request_metadata.get("execution_scope"), dict)
+                else None
             ),
-            "policy_fingerprint": recovery_policy_fingerprint(settings),
-        }
-    order.request_metadata = _redacted_payload(order_request_metadata) or {}
-    response_metadata = _redacted_payload(placement.response_metadata) or {}
-    if account_gate_decision is not None:
-        response_metadata["account_drawdown_gate"] = account_gate_decision.summary
-    order.response_metadata = _redacted_payload(response_metadata) or {}
-    order.last_error_classification = None
-    order.last_error_code = None
-    order.last_error_message = None
-    order.last_error_retryable = None
-    order.raw_broker_payload = _redacted_payload(placement.response_payload)
-    event_observed_at = _response_event_observed_at(
-        observed_at=placement.observed_at,
-        request_observed_at=request_observed_at,
-    )
-    db.add(
-        BrokerOrderEvent(
-            broker_order_pk=order.id,
-            event_type="submit_acknowledged",
-            event_source=BrokerEventSource.SUBMISSION.value,
-            normalized_status=order.status,
-            broker_status=placement.broker_status,
-            message=placement.message,
-            request_payload=_redacted_payload(placement.request_payload),
-            response_payload=_redacted_payload(placement.response_payload),
-            payload=_redacted_payload({"provider": adapter.provider}),
-            observed_at=event_observed_at,
         )
-    )
-    if plan_item is not None:
-        set_plan_item_status(
+        order_request_metadata = _preserve_decision_lineage(
+            request_metadata=order_request_metadata,
+            existing_order=order,
+        )
+        stable_account_scope = pre_ack_request_metadata.get("broker_account_scope")
+        if isinstance(stable_account_scope, dict):
+            # Broker acknowledgements may omit or echo arbitrary request metadata.
+            # The account scope was derived locally before submission and is an
+            # immutable attribution boundary for fills, PnL, and feedback.
+            order_request_metadata["broker_account_scope"] = stable_account_scope
+        stable_symbol_exposure_reservation = pre_ack_request_metadata.get(
+            SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY
+        )
+        if isinstance(stable_symbol_exposure_reservation, dict):
+            # This locally-derived valuation is part of the durable pre-submit
+            # reservation. A broker echo must not replace it after acknowledgement.
+            order_request_metadata[SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY] = (
+                stable_symbol_exposure_reservation
+            )
+        if account_gate_decision is not None:
+            order_request_metadata["account_drawdown_recovery_policy"] = {
+                "policy_version": 1,
+                "recovery_scope": _account_drawdown_recovery_scope(
+                    settings=settings,
+                    provider=adapter.provider,
+                    asset_class=logical_command.asset_class,
+                    exchange=logical_command.exchange,
+                ),
+                "policy_fingerprint": recovery_policy_fingerprint(settings),
+            }
+        order.request_metadata = _redacted_payload(order_request_metadata) or {}
+        response_metadata = _redacted_payload(placement.response_metadata) or {}
+        if account_gate_decision is not None:
+            response_metadata["account_drawdown_gate"] = account_gate_decision.summary
+        order.response_metadata = _redacted_payload(response_metadata) or {}
+        order.last_error_classification = None
+        order.last_error_code = None
+        order.last_error_message = None
+        order.last_error_retryable = None
+        order.raw_broker_payload = _redacted_payload(placement.response_payload)
+        event_observed_at = _response_event_observed_at(
+            observed_at=placement.observed_at,
+            request_observed_at=request_observed_at,
+        )
+        db.add(
+            BrokerOrderEvent(
+                broker_order_pk=order.id,
+                event_type="submit_acknowledged",
+                event_source=BrokerEventSource.SUBMISSION.value,
+                normalized_status=order.status,
+                broker_status=placement.broker_status,
+                message=placement.message,
+                request_payload=_redacted_payload(placement.request_payload),
+                response_payload=_redacted_payload(placement.response_payload),
+                payload=_redacted_payload({"provider": adapter.provider}),
+                observed_at=event_observed_at,
+            )
+        )
+        if plan_item is not None:
+            set_plan_item_status(
+                db=db,
+                plan_item=plan_item,
+                status=_plan_item_status_for_order_status(order.status),
+                source="broker_order_service",
+                reason=placement.message,
+                payload={
+                    "broker_order_pk": order.id,
+                    "broker_order_id": placement.broker_order_id,
+                    "idempotency_key": order.idempotency_key,
+                    "event_type": "submit_acknowledged",
+                },
+            )
+
+        _record_upbit_paper_simulated_fill(
+            settings=settings,
             db=db,
+            order=order,
+            command=routed_command,
             plan_item=plan_item,
-            status=_plan_item_status_for_order_status(order.status),
-            source="broker_order_service",
-            reason=placement.message,
-            payload={
-                "broker_order_pk": order.id,
-                "broker_order_id": placement.broker_order_id,
-                "idempotency_key": order.idempotency_key,
-                "event_type": "submit_acknowledged",
-            },
+            observed_at=event_observed_at + timedelta(microseconds=1),
         )
 
-    _record_upbit_paper_simulated_fill(
-        settings=settings,
-        db=db,
-        order=order,
-        command=routed_command,
-        plan_item=plan_item,
-        observed_at=event_observed_at + timedelta(microseconds=1),
-    )
-
-    # Persist the broker acknowledgement before optional post-submit bookkeeping.
-    # That bookkeeping can be retried or repaired, while a lost broker order id
-    # can otherwise turn a harmless retry into a duplicate external order.
-    db.commit()
-    db.refresh(order)
+        # Persist the broker acknowledgement before optional post-submit bookkeeping.
+        # That bookkeeping can be retried or repaired, while a lost broker order id
+        # can otherwise turn a harmless retry into a duplicate external order.
+        db.commit()
+        db.refresh(order)
+    except Exception as ack_persistence_failure:
+        # The broker has already accepted the order. Losing its id here would
+        # leave an accepted order looking like an unsent request until a later
+        # reconciliation finds it, so persist the minimum durable acknowledgement
+        # instead of surfacing a 500. A replay of this idempotency key then
+        # returns the stored order and never resubmits.
+        order = _persist_degraded_broker_acknowledgement(
+            settings=settings,
+            db=db,
+            idempotency_key=command.idempotency_key,
+            plan_item_id=plan_item_id_for_recovery,
+            placement=placement,
+            failure=ack_persistence_failure,
+        )
 
     if before_success_commit is not None:
         before_success_commit()
@@ -4898,6 +4917,113 @@ def _place_broker_order_serialized(
             "order": serialize_broker_order(persisted or order, include_events=True),
         },
     )
+
+
+def _persist_degraded_broker_acknowledgement(
+    *,
+    settings: Settings,
+    db: Session,
+    idempotency_key: str,
+    plan_item_id: str | None,
+    placement: object,
+    failure: Exception,
+) -> BrokerOrder:
+    """Record the minimum durable broker acknowledgement after bookkeeping failed.
+
+    Called when the broker accepted an order (``adapter.place_order`` returned)
+    but persisting the full acknowledgement raised. Only the facts proven by the
+    broker response are stored: the broker order id, normalized status and
+    timestamps, plus an explicit ``submit_acknowledged_degraded`` event so the
+    degraded record is auditable. If even this fails the error propagates; the
+    log line below carries the idempotency key and broker order id an operator
+    needs to reconcile by hand.
+    """
+
+    broker_order_id = getattr(placement, "broker_order_id", None)
+    LOGGER.critical(
+        "broker_acknowledgement_persistence_failed",
+        extra={
+            "idempotency_key": idempotency_key,
+            "broker_order_id": broker_order_id,
+            "exception_type": type(failure).__name__,
+        },
+        exc_info=failure,
+    )
+    db.rollback()
+    try:
+        order = _load_order_by_idempotency_key(
+            settings=settings,
+            db=db,
+            idempotency_key=idempotency_key,
+        )
+        if order is None:
+            raise failure
+        observed_at = getattr(placement, "observed_at", None) or datetime.now(UTC)
+        order.broker_order_id = broker_order_id
+        apply_broker_order_status(
+            order=order, status=placement.normalized_status.value  # type: ignore[attr-defined]
+        )
+        order.submitted_at = getattr(placement, "submitted_at", None)
+        order.last_broker_sync_at = observed_at
+        db.add(
+            BrokerOrderEvent(
+                broker_order_pk=order.id,
+                event_type="submit_acknowledged_degraded",
+                event_source=BrokerEventSource.SUBMISSION.value,
+                normalized_status=order.status,
+                broker_status=getattr(placement, "broker_status", None),
+                message=(
+                    "broker accepted the order but full acknowledgement bookkeeping "
+                    "failed; minimal acknowledgement recorded"
+                ),
+                payload=_redacted_payload(
+                    {
+                        "broker_order_id": broker_order_id,
+                        "bookkeeping_exception_type": type(failure).__name__,
+                    }
+                ),
+                observed_at=observed_at,
+            )
+        )
+        db.commit()
+        db.refresh(order)
+    except Exception:
+        db.rollback()
+        LOGGER.critical(
+            "broker_acknowledgement_degraded_persistence_failed",
+            extra={
+                "idempotency_key": idempotency_key,
+                "broker_order_id": broker_order_id,
+            },
+            exc_info=True,
+        )
+        raise
+    if plan_item_id is not None:
+        # Best effort: the order acknowledgement above is already durable.
+        try:
+            plan_item = db.get(ExecutionPlanItem, plan_item_id)
+            if plan_item is not None:
+                set_plan_item_status(
+                    db=db,
+                    plan_item=plan_item,
+                    status=_plan_item_status_for_order_status(order.status),
+                    source="broker_order_service",
+                    reason="broker acknowledgement recorded in degraded mode",
+                    payload={
+                        "broker_order_pk": order.id,
+                        "broker_order_id": broker_order_id,
+                        "idempotency_key": idempotency_key,
+                        "event_type": "submit_acknowledged_degraded",
+                    },
+                )
+                db.commit()
+        except Exception:
+            db.rollback()
+            LOGGER.exception(
+                "broker_acknowledgement_plan_item_status_failed",
+                extra={"idempotency_key": idempotency_key},
+            )
+    return order
 
 
 def _broker_error_has_rejection_acknowledgement(exc: BrokerAdapterError) -> bool:
