@@ -15,9 +15,9 @@ from sqlalchemy.schema import CreateSchema, DropSchema
 from app.core.config import Settings
 from app.db.base import Base
 from app.db.session import create_db_engine, create_session_factory
-from app.models.runtime import BrokerOrder, ExecutionFill
+from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionFill
 from app.services import reconciliation
-from test_reconciliation import OBSERVED_AT, ReconciliationStubBroker, _order
+from test_reconciliation import OBSERVED_AT, ReconciliationStubBroker, _order, _plan_backed_order, _utc
 
 
 @pytest.fixture(params=["sqlite", "postgresql"])
@@ -121,3 +121,66 @@ def test_overlapping_broker_reads_serialize_cumulative_fill_writes(reconciliatio
     with session_factory() as verify:
         assert verify.scalar(select(func.sum(ExecutionFill.quantity))) == 2
         assert verify.scalar(select(func.count()).select_from(ExecutionFill)) == 1
+
+
+@pytest.mark.parametrize("stale_status", ["partially_filled", "unknown"])
+def test_delayed_reconciliation_cannot_regress_newer_broker_truth(
+    reconciliation_database, stale_status: str
+):
+    settings, engine = reconciliation_database
+    session_factory = create_session_factory(engine)
+    with session_factory() as db:
+        plan, item, order = _plan_backed_order(
+            settings=settings, plan_id="stale-reply", side="buy", intent="next_open_buy",
+            broker_order_id="stale-reply",
+        )
+        db.add(plan)
+        db.commit()
+        newer = {**_cumulative_payload(order, 2), "response_metadata": {"marker": "newer"}}
+        older = {
+            **_cumulative_payload(order, 1), "status": stale_status,
+            "filled_quantity": 1, "response_metadata": {"marker": "older"},
+        }
+        broker = ReconciliationStubBroker(reconcile_payloads=[newer, older])
+        reconciliation.reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+        result = reconciliation.reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+        db.refresh(order)
+        db.refresh(item)
+        assert result["status"] == "filled"
+        assert result["status_changed"] is False
+        assert result["fills_added"] == 0
+        assert order.status == item.status == "filled"
+        assert order.response_metadata == {"marker": "newer"}
+        assert _utc(order.last_broker_sync_at) == OBSERVED_AT + timedelta(seconds=2)
+        assert db.scalar(select(func.sum(ExecutionFill.quantity))) == 2
+        assert db.scalar(select(func.count()).select_from(BrokerOrderEvent).where(
+            BrokerOrderEvent.event_type == "reconcile_result_stale",
+        )) == 1
+
+
+@pytest.mark.parametrize(
+    "prior_event", ["submit_acknowledged", "reconcile_failed", "reconcile_result_unrecognized_status"]
+)
+def test_ack_and_error_timestamps_do_not_block_successful_reconciliation(
+    reconciliation_database, prior_event: str
+):
+    settings, engine = reconciliation_database
+    with create_session_factory(engine)() as db:
+        order = _order(settings=settings, broker_order_id="non-truth-timestamp")
+        order.last_broker_sync_at = OBSERVED_AT + timedelta(seconds=3)
+        db.add(order)
+        db.flush()
+        db.add(BrokerOrderEvent(
+            broker_order_pk=order.id, event_type=prior_event,
+            event_source="reconciliation", normalized_status="submitted",
+            observed_at=order.last_broker_sync_at,
+        ))
+        db.commit()
+        broker = ReconciliationStubBroker(reconcile_payloads=[_cumulative_payload(order, 2)])
+
+        result = reconciliation.reconcile_broker_order(settings=settings, db=db, adapter=broker, order=order)
+
+        assert result["status"] == "filled"
+        assert result["fills_added"] == 1
+        assert db.scalar(select(func.sum(ExecutionFill.quantity))) == 2

@@ -269,6 +269,44 @@ def reconcile_broker_order(
     order_status_before = order.status
 
     event_time = _parse_timestamp(payload.get("observed_at"), fallback=event_time)
+    # ACK and error receipt times do not prove newer broker order truth.
+    latest_reconciled_at = db.scalar(
+        select(func.max(BrokerOrderEvent.observed_at)).where(
+            BrokerOrderEvent.broker_order_pk == order.id,
+            BrokerOrderEvent.event_type == "reconcile_result",
+        )
+    )
+    if (
+        latest_reconciled_at is not None
+        and _utc_naive(event_time) < _utc_naive(latest_reconciled_at)
+    ):
+        db.add(
+            BrokerOrderEvent(
+                broker_order_pk=order.id,
+                event_type="reconcile_result_stale",
+                event_source=BrokerEventSource.RECONCILIATION.value,
+                normalized_status=order.status,
+                broker_status=_optional_str(payload.get("broker_status")),
+                message="older broker reconciliation did not replace newer accepted truth",
+                response_payload=_safe_payload(payload),
+                payload={
+                    "provider": adapter.provider,
+                    "latest_reconciled_at": latest_reconciled_at.isoformat(),
+                },
+                observed_at=event_time,
+            )
+        )
+        db.commit()
+        return {
+            "status_code": 200,
+            "broker_order_id": order.broker_order_id,
+            "status": order.status,
+            "status_before": order_status_before,
+            "status_changed": False,
+            "fills_added": 0,
+            "filled_delta": 0,
+            "message": "older broker reconciliation ignored",
+        }
     normalized_status = _normalize_status(payload.get("status"))
     fills, fill_delta_anomalies = _parse_fills_from_payload(
         payload=payload,
