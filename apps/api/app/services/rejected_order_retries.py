@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, DecimalException
+import re
 from typing import Any
 
 from pydantic import ValidationError
@@ -151,7 +152,6 @@ TEMPORARY_REJECT_MARKERS = (
     "session",
     "volatility interruption",
     "single price",
-    "vi",
     "서킷브레이커",
     "사이드카",
     "매매거래정지",
@@ -1752,7 +1752,9 @@ def _temporary_reason_from_text(value: str) -> str | None:
         return "volatility_interruption"
     if "single price" in normalized or "단일가" in normalized:
         return "single_price"
-    if any(marker.lower() in normalized for marker in TEMPORARY_REJECT_MARKERS):
+    if any(marker.lower() in normalized for marker in TEMPORARY_REJECT_MARKERS) or re.search(
+        r"(?<![a-z0-9])vi(?![a-z0-9])", normalized
+    ):
         return "orderability_window"
     return None
 
@@ -2084,6 +2086,8 @@ def _account_identifier(*, settings: Settings, order: BrokerOrder) -> str | None
     masked = request_metadata.get("account_number_masked")
     if isinstance(masked, str) and masked:
         return masked
+    if str(order.broker_name or "").strip().lower() != "kis":
+        return None
     account = settings.kis_account_number
     if not account:
         return None

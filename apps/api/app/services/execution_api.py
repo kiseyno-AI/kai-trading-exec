@@ -1734,17 +1734,21 @@ def _parse_positive_int(value: object) -> int | None:
         return None
     if isinstance(value, int) and value > 0:
         return value
-    if isinstance(value, Decimal) and value == value.to_integral_value() and value > 0:
+    if isinstance(value, Decimal) and value.is_finite() and value == value.to_integral_value() and value > 0:
         return int(value)
     if isinstance(value, str):
         normalized = value.strip()
-        if normalized.isdigit() and int(normalized) > 0:
-            return int(normalized)
+        if normalized.isdecimal():
+            try:
+                parsed_integer = int(normalized)
+            except ValueError:
+                return None
+            return parsed_integer if parsed_integer > 0 else None
         try:
             parsed = Decimal(normalized)
         except (InvalidOperation, ValueError):
             return None
-        if parsed == parsed.to_integral_value() and parsed > 0:
+        if parsed.is_finite() and parsed == parsed.to_integral_value() and parsed > 0:
             return int(parsed)
     return None
 

@@ -2376,6 +2376,13 @@ def _trigger_time_full_cost_economics_provenance_is_valid(
         "binding",
     }:
         return False
+    if any(
+        not str(provenance.get(field) or "").isascii()
+        for field in (
+            "route_fingerprint", "liquidity_evidence_hash", "material_hash", "binding"
+        )
+    ):
+        return False
     if (
         provenance.get("version")
         != TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION
@@ -5145,8 +5152,8 @@ def _claim_trigger_time_agent_action(
         return _trigger_time_agent_claim_lost_result(item=item, action=action)
 
     durable_risk_context = dict(_loaded_risk_context(item))
-    durable_risk_context.update(local_risk_context)
     durable_events = durable_risk_context.get("monitoring_events")
+    durable_risk_context.update(local_risk_context)
     local_events = local_risk_context.get("monitoring_events")
     combined_events: list[object] = []
     for event in (
@@ -6153,7 +6160,11 @@ def _trigger_time_agent_preflight_failure(
     item = action.item
     if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
         return _trigger_time_agent_claim_lost_result(item=item, action=action)
-    item.status = "watch_buy_triggered_blocked"
+    item.status = (
+        "watch_buy_triggered_blocked"
+        if _is_watch_buy_item(item)
+        else f"{item.intent}_triggered_blocked"
+    )
     retry_after_at = recorded_at + timedelta(
         seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
     )
@@ -13013,7 +13024,11 @@ def _derived_source_plan_item_id(entry_item: ExecutionPlanItem, suffix: str) -> 
     source = entry_item.source_plan_item_id
     if not source:
         return None
-    return f"{source}:{suffix}"
+    derived = f"{source}:{suffix}"
+    if len(derived) <= 128:
+        return derived
+    digest = json_payload_hash({"source": source, "suffix": suffix})
+    return f"post-entry-monitor:{digest}"
 
 
 def _post_entry_review_state(
@@ -16566,6 +16581,12 @@ def _parse_positive_int(value: object) -> int | None:
         return None
     if isinstance(value, int) and value > 0:
         return value
+    if isinstance(value, str) and value.strip().isdecimal():
+        try:
+            quantity = int(value)
+        except ValueError:
+            return None
+        return quantity if quantity > 0 else None
     try:
         parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):

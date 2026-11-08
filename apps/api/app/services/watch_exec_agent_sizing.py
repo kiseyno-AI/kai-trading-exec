@@ -1174,6 +1174,14 @@ def _sizing_request_payload(
         _next_open_deadline(plan=plan, item=item)
         for item in plan.items
         if item.id in candidate_ids and _is_untriggered_next_open_sizing_item(item)
+        # Same-day KRX handoffs remain eligible after the open. Their fresh
+        # snapshot and request SLA still bound the approval lifetime.
+        and not (
+            _is_krx_next_open_item(item)
+            and plan.market_date
+            == request_at.astimezone(ZoneInfo(settings.market_timezone)).date()
+            and request_at >= _next_open_deadline(plan=plan, item=item)
+        )
     ]
     valid_until = account_snapshot_authority_deadline(
         observed_at=snapshot_observed_at,
@@ -4054,7 +4062,6 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> None:
         pass
     try:
         process.wait(timeout=0.5)
-        return
     except subprocess.TimeoutExpired:
         pass
     try:
@@ -6298,8 +6305,11 @@ def _open_order_remaining_quantity(order: dict[str, object]) -> int | None:
         return None
     if isinstance(raw_quantity, int):
         return raw_quantity if raw_quantity >= 0 else None
-    if isinstance(raw_quantity, str) and raw_quantity.isdigit():
-        return int(raw_quantity)
+    if isinstance(raw_quantity, str) and raw_quantity.isdecimal():
+        try:
+            return int(raw_quantity)
+        except ValueError:
+            return None
     return None
 
 

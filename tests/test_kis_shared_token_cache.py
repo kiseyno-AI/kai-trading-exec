@@ -171,6 +171,36 @@ def test_shared_cache_public_writes_reject_naive_datetimes(
         operation()
 
 
+@pytest.mark.parametrize("error_kind", [[], {}])
+def test_shared_cache_rejects_malformed_failure_kind_without_issuing_token(
+    tmp_path: Path,
+    error_kind: object,
+) -> None:
+    settings = _settings(tmp_path)
+    store = build_kis_token_cache_store(settings)
+    now = datetime.now(UTC)
+    store.save_failure(
+        error_kind="transport",
+        status_code=503,
+        retryable=True,
+        failed_at=now,
+        cooldown_until=now + timedelta(seconds=60),
+    )
+    payload = json.loads(store.failure_path.read_text())
+    payload["error_kind"] = error_kind
+    store.failure_path.write_text(json.dumps(payload))
+    issued = []
+
+    def issue_token():
+        issued.append(True)
+        raise AssertionError("corrupt shared state must not issue a token")
+
+    with pytest.raises(BrokerAdapterError, match="cache is not safe to use"):
+        issue_shared_kis_token(settings=settings, issue_token=issue_token)
+    assert issued == []
+    assert json.loads(store.failure_path.read_text()) == payload
+
+
 @pytest.mark.parametrize(
     "record_type",
     (

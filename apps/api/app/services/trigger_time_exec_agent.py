@@ -10,7 +10,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -2090,7 +2090,6 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> None:
         pass
     try:
         process.wait(timeout=0.5)
-        return
     except subprocess.TimeoutExpired:
         pass
     try:

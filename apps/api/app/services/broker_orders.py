@@ -1061,7 +1061,7 @@ def _place_broker_order_serialized(
                 ),
             )
         _recover_degraded_replay(
-            settings=settings, db=db, order=existing, command=logical_command
+            settings=settings, db=db, order=existing
         )
         return PlaceBrokerOrderResult(
             status_code=200,
@@ -3529,6 +3529,7 @@ def _place_broker_order_serialized(
                 )
                 .options(selectinload(BrokerOrder.events))
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
             locked_metadata = (
                 locked_order.request_metadata
@@ -5064,7 +5065,7 @@ def _persist_degraded_broker_acknowledgement(
             exc_info=True,
         )
         raise
-    plan_item_updated = False
+    plan_item_state_for_fill = None
     if plan_item_id is not None:
         # Best effort: the order acknowledgement above is already durable.
         try:
@@ -5088,8 +5089,8 @@ def _persist_degraded_broker_acknowledgement(
                         "event_type": DEGRADED_ACK_EVENT_TYPE,
                     },
                 )
+                plan_item_state_for_fill = _plan_item_cas_state(plan_item)
                 db.commit()
-                plan_item_updated = True
             else:
                 db.rollback()
                 LOGGER.warning(
@@ -5098,6 +5099,7 @@ def _persist_degraded_broker_acknowledgement(
                 )
         except Exception:
             db.rollback()
+            plan_item_state_for_fill = None
             LOGGER.exception(
                 "broker_acknowledgement_plan_item_status_failed",
                 extra={"idempotency_key": idempotency_key},
@@ -5107,7 +5109,7 @@ def _persist_degraded_broker_acknowledgement(
         db=db,
         order=order,
         command=command,
-        update_plan_item=plan_item_updated,
+        expected_plan_item_state=plan_item_state_for_fill,
     )
     return order
 
@@ -5118,7 +5120,7 @@ def _retry_paper_simulated_fill(
     db: Session,
     order: BrokerOrder,
     command: PlaceOrderRequest,
-    update_plan_item: bool,
+    expected_plan_item_state: tuple[str, str] | None,
 ) -> None:
     """Best effort: complete an Upbit paper order's local fill if it is missing.
 
@@ -5130,6 +5132,20 @@ def _retry_paper_simulated_fill(
     if command.provider != "upbit" or settings.runtime_mode != "paper":
         return
     try:
+        # Legacy Core fencing locks the plan item before its linked orders.
+        plan_item = (
+            db.get(
+                ExecutionPlanItem,
+                order.execution_plan_item_id,
+                with_for_update=True,
+                populate_existing=True,
+                options=[undefer(ExecutionPlanItem.risk_context)],
+            )
+            if expected_plan_item_state is not None and order.execution_plan_item_id
+            else None
+        )
+        if _plan_item_cas_state(plan_item) != expected_plan_item_state:
+            plan_item = None
         db.refresh(order, with_for_update=True)
         open_statuses = {
             NormalizedBrokerOrderStatus.SUBMITTED.value,
@@ -5144,11 +5160,6 @@ def _retry_paper_simulated_fill(
         if order.status not in open_statuses or already_filled is not None:
             db.rollback()
             return
-        plan_item = (
-            db.get(ExecutionPlanItem, order.execution_plan_item_id, with_for_update=True)
-            if update_plan_item and order.execution_plan_item_id
-            else None
-        )
         _record_upbit_paper_simulated_fill(
             settings=settings,
             db=db,
@@ -5172,11 +5183,10 @@ def _recover_degraded_replay(
     settings: Settings,
     db: Session,
     order: BrokerOrder,
-    command: PlaceOrderRequest,
 ) -> None:
     """On a replay of a degraded acknowledgement, retry what the degraded path could not."""
 
-    if command.provider != "upbit" or settings.runtime_mode != "paper":
+    if order.broker_name != "upbit" or settings.runtime_mode != "paper":
         return
     degraded = db.scalar(
         select(BrokerOrderEvent.id).where(
@@ -5185,6 +5195,10 @@ def _recover_degraded_replay(
         )
     )
     if degraded is None:
+        return
+    # A duplicate request cannot replace the command already sent to the broker.
+    command = _runtime_safety_replay_command(order)
+    if command is None or command.provider != order.broker_name:
         return
     plan_item = (
         db.get(ExecutionPlanItem, order.execution_plan_item_id)
@@ -5196,8 +5210,10 @@ def _recover_degraded_replay(
         db=db,
         order=order,
         command=command,
-        update_plan_item=(
-            plan_item is not None and plan_item.status in _ORDER_MIRROR_PLAN_ITEM_STATUSES
+        expected_plan_item_state=(
+            _plan_item_cas_state(plan_item)
+            if plan_item is not None and plan_item.status in _ORDER_MIRROR_PLAN_ITEM_STATUSES
+            else None
         ),
     )
 
@@ -7527,6 +7543,7 @@ def _final_target_sell_stop_integrity_failure(
         )
         .options(undefer(ExecutionPlanItem.risk_context))
         .with_for_update()
+        .execution_options(populate_existing=True)
     ).all()
     sibling_stops = select_plan_item_family_members(
         anchor=plan_item,
@@ -14533,6 +14550,8 @@ def _apply_upbit_paper_position(
             ExecutionPosition.exchange == position_identity.exchange,
             ExecutionPosition.symbol == symbol,
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if position is None:
         position = ExecutionPosition(

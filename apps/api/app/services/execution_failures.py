@@ -361,6 +361,8 @@ def _account_identifier(*, settings: Settings, order: BrokerOrder) -> str | None
     masked = request_metadata.get("account_number_masked")
     if isinstance(masked, str) and masked:
         return masked
+    if str(order.broker_name or "").strip().lower() != "kis":
+        return None
     account = settings.kis_account_number
     if not account:
         return None

@@ -499,6 +499,49 @@ def _add_closed_trade(
     )
 
 
+def test_feedback_as_of_excludes_later_fills_from_both_outcome_ledgers(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="as-of-plan",
+        external_plan_id="as-of-plan",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="as-of-closed",
+        symbol="005930",
+        buy_price="100",
+        sell_price="110",
+        filled_day=10,
+    )
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="as-of-still-open",
+        symbol="000660",
+        buy_price="100",
+        sell_price="90",
+        filled_day=12,
+    )
+    session.commit()
+    cutoff = datetime(2026, 6, 12, 1, 0, tzinfo=UTC)
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=cutoff)
+
+    assert report["closed_trade_count"] == 1
+    assert report["strategy_closed_trade_count"] == 1
+    for key in ("closed_trades", "strategy_closed_trades"):
+        assert [trade["symbol"] for trade in report[key]] == ["005930"]
+        assert datetime.fromisoformat(report[key][0]["sell"]["filled_at"]) <= cutoff
+    assert session.query(ExecutionFill).count() == 4
+    session.close()
+    engine.dispose()
+
+
 def _bind_closed_trade_to_execution_scope(
     session,
     *,
@@ -3061,6 +3104,57 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
     engine.dispose()
 
 
+def test_feedback_sector_weights_remain_unknown_for_incomplete_currency_values(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="incomplete-sector-plan",
+        external_plan_id="incomplete-sector-plan",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    for index, (symbol, average_price) in enumerate(
+        [("005930", Decimal("100")), ("000660", None)]
+    ):
+        session.add_all(
+            [
+                ExecutionPlanItem(
+                    plan=plan,
+                    plan_item_index=index,
+                    symbol=symbol,
+                    side="buy",
+                    intent="next_open_buy",
+                    status="filled",
+                    risk_context={"sector": "Semiconductors"},
+                ),
+                ExecutionPosition(
+                    mode="paper",
+                    symbol=symbol,
+                    quantity=1,
+                    average_price=average_price,
+                    updated_from="broker_reconciliation",
+                ),
+            ]
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC)
+    )
+
+    risk = report["portfolio_risk"]
+    assert risk["positions_missing_market_value_count"] == 1
+    assert risk["total_market_value"] is None
+    assert len(risk["sector_concentration"]) == 1
+    sector = risk["sector_concentration"][0]
+    assert sector["market_value"] == "100.0000"
+    assert sector["currency_weight_pct"] is None
+    assert sector["portfolio_weight_pct"] is None
+    session.close()
+    engine.dispose()
+
+
 def test_trade_outcome_feedback_sector_lookup_caps_each_symbol(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(
@@ -3856,6 +3950,75 @@ def test_candidate_rule_replay_uses_stored_tradable_price_below_tightened_stop(t
     assert tightened["net_pnl_delta_krw"] == "-20.0000"
     assert tightened["recommendation"] == "needs_more_data"
 
+    session.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "eligible"),
+    [
+        (None, False),
+        ("2026-06-12T05:00:00+00:00", False),
+        ("2026-06-10T04:30:00+00:00", False),
+        ("2026-06-10T05:05:00+00:00", True),
+    ],
+)
+def test_tightened_exit_ohlc_replay_requires_timely_observation(
+    tmp_path, observed_at, eligible
+) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="ohlc-observation-plan",
+        external_plan_id="ohlc-observation-plan",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="ohlc-observation",
+        symbol="005930",
+        buy_price="100",
+        sell_price="97",
+        filled_day=10,
+        risk_context={
+            "post_entry_review": {
+                "reasons": [
+                    "gap_down_breached_risk_threshold",
+                    "next_day_no_progress",
+                    "max_holding_without_progress",
+                ],
+                "tightened_stop_price": "99",
+                "recorded_at": "2026-06-10T04:00:00+00:00",
+                "exit_execution_evidence": {
+                    "low": "95",
+                    "interval_started_at": "2026-06-10T05:00:00+00:00",
+                    "observed_at": observed_at,
+                },
+            }
+        },
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC)
+    )
+
+    tightened = next(
+        row for row in report["candidate_rule_replay"]["rules"]
+        if row["rule_id"] == "post_entry_no_progress_exit_tighten"
+    )
+    evidence = tightened["top_matched_examples"][0]["evidence"]
+    assert evidence["replay_eligible"] is eligible
+    if eligible:
+        assert evidence["execution_evidence_source"] == "stored_ohlc_low"
+        assert evidence["execution_evidence_observed_at"] == observed_at
+        assert tightened["net_pnl_delta_krw"] == "-20.0000"
+    else:
+        assert evidence["replay_status"] == "missing_post_tighten_execution_evidence"
+        assert tightened["net_pnl_delta_krw"] == "0.0000"
     session.close()
     engine.dispose()
 
@@ -5172,15 +5335,18 @@ def test_latest_trade_outcome_feedback_requires_exact_account_scope(tmp_path) ->
     assert load_latest_trade_outcome_feedback_snippet(settings)["status"] == "unavailable"
 
 
-def test_latest_trade_outcome_feedback_rejects_tampered_checksum(tmp_path) -> None:
+@pytest.mark.parametrize("tamper", ("body", "non_ascii_checksum"))
+def test_latest_trade_outcome_feedback_rejects_tampered_checksum(tmp_path, tamper) -> None:
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
     latest_path = tmp_path / "latest.json"
     _write_quality_gated_feedback_artifact(latest_path)
     payload = json.loads(latest_path.read_text(encoding="utf-8"))
-    payload["summary"]["realized_pnl_krw"] = "999999.0000"
+    if tamper == "body":
+        payload["summary"]["realized_pnl_krw"] = "999999.0000"
+    else:
+        payload["integrity"]["payload_sha256"] = "한" * 64
     latest_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    assert artifact_integrity_is_valid(payload) is False
     feedback = load_latest_trade_outcome_feedback_snippet(
         settings,
         provider="kis",
@@ -5191,6 +5357,7 @@ def test_latest_trade_outcome_feedback_rejects_tampered_checksum(tmp_path) -> No
     assert feedback["snippet"]["quality_gate"]["instruction"] == (
         "do_not_apply_learning_lessons"
     )
+    assert artifact_integrity_is_valid(payload) is False
 
 
 @pytest.mark.parametrize(

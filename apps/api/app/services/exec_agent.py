@@ -1382,8 +1382,12 @@ def _parse_positive_int(value: object) -> int | None:
         return None
     if isinstance(value, int) and value > 0:
         return value
-    if isinstance(value, str) and value.isdigit() and int(value) > 0:
-        return int(value)
+    if isinstance(value, str) and value.isdecimal():
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
     return None
 
 
@@ -3614,7 +3618,11 @@ def _new_monitoring_item(
 
 def _monitoring_source_plan_item_id(item: ExecutionPlanItem, intent: str) -> str | None:
     if item.source_plan_item_id:
-        return f"{item.source_plan_item_id}:{intent}"
+        derived = f"{item.source_plan_item_id}:{intent}"
+        if len(derived) <= 128:
+            return derived
+        digest = json_payload_hash({"source": item.source_plan_item_id, "intent": intent})
+        return f"exec-agent-monitor:{digest}"
     return None
 
 
@@ -3778,7 +3786,11 @@ def _candidate_idempotency_key(
     item: ExecutionPlanItem,
 ) -> str:
     source = item.source_plan_item_id or str(item.plan_item_index)
-    return f"short-term-exec-agent:{plan.external_plan_id}:{source}"
+    key = f"short-term-exec-agent:{plan.external_plan_id}:{source}"
+    if len(key) <= 128:
+        return key
+    digest = json_payload_hash({"plan_id": plan.external_plan_id, "source": source})
+    return f"short-term-exec-agent:{digest}"
 
 
 def _next_plan_item_index(plan: ExecutionPlan) -> int:

@@ -913,8 +913,12 @@ def _parse_positive_int(value: object) -> int | None:
         return None
     if isinstance(value, int) and value > 0:
         return value
-    if isinstance(value, str) and value.isdigit() and int(value) > 0:
-        return int(value)
+    if isinstance(value, str) and value.isdecimal():
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
     return None
 
 

@@ -285,10 +285,10 @@ def _has_quarantine_marker(sync_context: object) -> bool:
         sync_context.get("route_disposition")
         == REVIEWED_CORPORATE_ACTION_ROUTE_DISPOSITION
         or sync_context.get("manual_review_reason")
-        in {
+        in (
             REVIEWED_CORPORATE_ACTION_REASON,
             REVIEWED_CORPORATE_ACTION_INVALID_REASON,
-        }
+        )
         or any(key in sync_context for key in _QUARANTINE_MARKER_KEYS)
     )
 
@@ -312,12 +312,20 @@ def _validated_reviewed_at(evidence: object) -> datetime | None:
     if reviewed_at is None or effective_date > reviewed_at.date():
         return None
     refs = evidence.get("evidence_refs")
-    if not isinstance(refs, list) or len(refs) < 2 or refs != sorted(refs):
+    if (
+        not isinstance(refs, list)
+        or len(refs) < 2
+        or not all(isinstance(ref, str) for ref in refs)
+        or refs != sorted(refs)
+    ):
         return None
     normalized_refs: list[str] = []
     for value in refs:
         ref = str(value or "").strip()
-        parsed = urlparse(ref)
+        try:
+            parsed = urlparse(ref)
+        except ValueError:
+            return None
         if (
             parsed.scheme != "https"
             or (parsed.hostname or "").lower() not in {"sec.gov", "www.sec.gov"}

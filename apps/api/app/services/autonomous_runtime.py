@@ -3252,7 +3252,7 @@ def _load_filled_today_symbols(
 def _current_krx_day_utc_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
     current_krx = (now or datetime.now(KRX_TIMEZONE)).astimezone(KRX_TIMEZONE)
     start_krx = datetime.combine(current_krx.date(), time.min, tzinfo=KRX_TIMEZONE)
-    end_krx = datetime.combine(current_krx.date(), time.max, tzinfo=KRX_TIMEZONE)
+    end_krx = start_krx + timedelta(days=1)
     return start_krx.astimezone(UTC), end_krx.astimezone(UTC)
 
 

@@ -1710,7 +1710,9 @@ def _legacy_drawdown_block_is_current(
         summary.get("gate_name") if isinstance(summary, dict) else ""
     )
     timezone = ZoneInfo(settings.market_timezone)
-    observed = occurred_at.astimezone(timezone)
+    observed = (
+        occurred_at.replace(tzinfo=UTC) if occurred_at.tzinfo is None else occurred_at
+    ).astimezone(timezone)
     current = (now or datetime.now(UTC)).astimezone(timezone)
     if gate_name.startswith("daily_"):
         return observed.date() == current.date()

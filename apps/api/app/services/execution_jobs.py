@@ -1849,8 +1849,12 @@ def _parse_positive_int(value: object) -> int | None:
         return int(value)
     if isinstance(value, str):
         normalized = value.strip()
-        if normalized.isdigit() and int(normalized) > 0:
-            return int(normalized)
+        if normalized.isdecimal():
+            try:
+                parsed = int(normalized)
+            except ValueError:
+                return None
+            return parsed if parsed > 0 else None
     return None
 
 

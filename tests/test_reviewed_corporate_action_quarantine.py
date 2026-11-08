@@ -680,6 +680,50 @@ def test_quarantine_contract_requires_exact_audit_event() -> None:
 
 
 @pytest.mark.parametrize(
+    ("field", "malformed"),
+    [
+        ("manual_review_reason", []),
+        ("manual_review_reason", {}),
+        ("evidence_refs", [None, SEC_REFS[0]]),
+        ("evidence_refs", [{}, {}]),
+        ("evidence_refs", ["https://[invalid/archive", SEC_REFS[0]]),
+    ],
+)
+def test_quarantine_contract_rejects_malformed_persisted_evidence(
+    field: str,
+    malformed: object,
+) -> None:
+    settings, engine, _, db = _session()
+    position = _add_position(db, settings)
+    _apply_quarantine(settings, db, position)
+    if field == "manual_review_reason":
+        payload = deepcopy(position.raw_payload)
+        payload["_position_sync"]["route_disposition"] = None
+        payload["_position_sync"][field] = malformed
+        position.raw_payload = payload
+    else:
+        event = db.scalar(select(RuntimeRemediationEvent))
+        assert event is not None
+        summary = deepcopy(event.evidence_summary)
+        summary["review_evidence"][field] = malformed
+        event.evidence_summary = summary
+    db.commit()
+
+    assert _quarantine_state(
+        db=db,
+        position=position,
+    ) is ReviewedCorporateActionQuarantineState.INVALID_MARKED
+    alerts = _runtime_alerts(settings=settings, db=db)
+    assert any(
+        alert["kind"] == "position_monitoring_manual_review_required"
+        and alert["symbols"] == ["WWBLCM"]
+        for alert in alerts["alerts"]
+    )
+    db.close()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
     ("field", "drifted_value"),
     [
         ("position_id", "other-position"),

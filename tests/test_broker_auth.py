@@ -23693,8 +23693,9 @@ def test_live_automated_krx_buy_uses_the_route_recomputed_at_the_final_boundary(
     engine.dispose()
 
 
+@pytest.mark.parametrize("intent_drift", [None, "status", "request_metadata", "broker_order_id", "submitted_at"])
 def test_final_broker_command_is_durable_before_process_loss_at_broker_boundary(
-    monkeypatch,
+    monkeypatch, tmp_path, intent_drift,
 ) -> None:
     final_reference_at = datetime(2026, 9, 9, 0, 0, tzinfo=UTC)
     monkeypatch.setattr(
@@ -23750,7 +23751,7 @@ def test_final_broker_command_is_durable_before_process_loss_at_broker_boundary(
         krx_market_open=True,
     )
     settings = Settings(
-        database_url="sqlite:///:memory:",
+        database_url=f"sqlite:///{tmp_path / 'final-command.db'}",
         runtime_mode="live",
         automation_enabled=False,
         domestic_order_session_routing_enabled=True,
@@ -23771,6 +23772,24 @@ def test_final_broker_command_is_durable_before_process_loss_at_broker_boundary(
         advisory_lock_calls.append(
             dict(execution_scope) if isinstance(execution_scope, dict) else None
         )
+        if len(advisory_lock_calls) == 3 and intent_drift is not None:
+            with app.state.db_session_factory() as concurrent:
+                persisted = concurrent.scalar(select(BrokerOrder))
+                assert persisted is not None
+                if intent_drift == "request_metadata":
+                    persisted.request_metadata = {
+                        **persisted.request_metadata,
+                        "final_broker_command": {
+                            **persisted.request_metadata["final_broker_command"],
+                            "limit_price": "71020",
+                        },
+                    }
+                else:
+                    setattr(persisted, intent_drift, {
+                        "status": "canceled", "broker_order_id": "concurrent-ack",
+                        "submitted_at": final_reference_at,
+                    }[intent_drift])
+                concurrent.commit()
         original_acquire(**kwargs)
 
     monkeypatch.setattr(
@@ -23848,11 +23867,8 @@ def test_final_broker_command_is_durable_before_process_loss_at_broker_boundary(
             exchange="KRX",
             metadata={"route_now": "2026-09-09T08:55:00+09:00"},
         )
-        with pytest.raises(
-            BaseException,
-            match="simulated process loss after broker acceptance",
-        ):
-            broker_orders_service.place_broker_order(
+        def submit():
+            return broker_orders_service.place_broker_order(
                 settings=settings,
                 db=db,
                 adapter=adapter,
@@ -23861,6 +23877,28 @@ def test_final_broker_command_is_durable_before_process_loss_at_broker_boundary(
                 now=final_reference_at,
                 freshness_reference_at=final_reference_at,
             )
+        if intent_drift is not None:
+            result = submit()
+            assert result.status_code == 409, result.payload
+            assert result.payload["block_reason"] == "broker_order_intent_state_changed"
+        else:
+            with pytest.raises(BaseException, match="simulated process loss after broker acceptance"):
+                submit()
+
+    if intent_drift is not None:
+        assert adapter.order_calls == []
+        with app.state.db_session_factory() as db:
+            persisted = db.scalar(select(BrokerOrder))
+            if intent_drift == "request_metadata":
+                assert persisted.request_metadata["final_broker_command"]["limit_price"] == "71020"
+            elif intent_drift == "submitted_at":
+                assert persisted.submitted_at is not None
+            else:
+                assert getattr(persisted, intent_drift) == {
+                    "status": "canceled", "broker_order_id": "concurrent-ack",
+                }[intent_drift]
+        engine.dispose()
+        return
 
     with app.state.db_session_factory() as db:
         order = db.scalar(
@@ -25037,7 +25075,8 @@ def test_live_kis_us_held_stop_ignores_buy_only_otc_quarantine() -> None:
     engine.dispose()
 
 
-def test_final_target_sell_boundary_rejects_agent_stop_relaxation() -> None:
+@pytest.mark.parametrize("cached_stop", [False, True])
+def test_final_target_sell_boundary_rejects_agent_stop_relaxation(tmp_path, cached_stop) -> None:
     observed_at = datetime.now(UTC)
     adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -25065,7 +25104,7 @@ def test_final_target_sell_boundary_rejects_agent_stop_relaxation() -> None:
         ),
     )
     settings = Settings(
-        database_url="sqlite:///:memory:",
+        database_url=f"sqlite:///{tmp_path / 'final-stop.db'}",
         runtime_mode="paper",
         kis_app_key="paper-key",
         kis_app_secret="paper-secret",
@@ -25124,7 +25163,7 @@ def test_final_target_sell_boundary_rejects_agent_stop_relaxation() -> None:
             provider="kis",
             venue="kis",
             asset_class="stock",
-            trigger_price=Decimal("70000"),
+            trigger_price=Decimal("55000") if cached_stop else Decimal("70000"),
             quantity_policy=stop_policy,
             risk_context=stop_risk,
         )
@@ -25147,6 +25186,12 @@ def test_final_target_sell_boundary_rejects_agent_stop_relaxation() -> None:
             entry_price=Decimal("65000"),
         )
         db.commit()
+        if cached_stop:
+            with app.state.db_session_factory() as concurrent:
+                current_stop = concurrent.get(ExecutionPlanItem, stop.id)
+                current_stop.trigger_price = Decimal("70000")
+                concurrent.commit()
+            assert stop.trigger_price == Decimal("55000")
         result = monitoring_service._place_monitoring_order(
             settings=settings,
             db=db,

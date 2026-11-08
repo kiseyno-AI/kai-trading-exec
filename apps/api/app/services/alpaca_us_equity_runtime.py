@@ -378,7 +378,7 @@ class AlpacaUsEquityRuntimeCoordinator:
             self._last_reconciled_at = observed_at
 
         clock = adapter.get_market_clock(token)
-        market_open = bool(clock.get("is_open"))
+        market_open = clock.get("is_open") is True
         clock_payload = {
             key: clock.get(key)
             for key in ("is_open", "timestamp", "next_open", "next_close")

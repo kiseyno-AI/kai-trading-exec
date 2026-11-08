@@ -37,6 +37,7 @@ from app.models.runtime import (
     ExecutionFailure,
     ExecutionFill,
     ExecutionJob,
+    ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPosition,
     RuntimeRemediationEvent,
@@ -248,7 +249,65 @@ def reconcile_broker_order(
             operator_reason=operator_reason,
         )
 
+    # Serialize durable deltas after the broker read, using current fill history.
+    if db.get_bind().dialect.name == "sqlite":
+        table = BrokerOrder.__table__
+        db.execute(
+            update(table)
+            .where(table.c.id == order.id)
+            .values(status=table.c.status, updated_at=table.c.updated_at)
+        )
+    if order.execution_plan_item_id is not None:
+        # Core revocation takes the plan-item lock before the order lock too.
+        db.get(
+            ExecutionPlanItem,
+            order.execution_plan_item_id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+    db.refresh(order, with_for_update=True)
+    db.expire(order, ["fills"])
+    order_status_before = order.status
+
     event_time = _parse_timestamp(payload.get("observed_at"), fallback=event_time)
+    # ACK and error receipt times do not prove newer broker order truth.
+    latest_reconciled_at = db.scalar(
+        select(func.max(BrokerOrderEvent.observed_at)).where(
+            BrokerOrderEvent.broker_order_pk == order.id,
+            BrokerOrderEvent.event_type == "reconcile_result",
+        )
+    )
+    if (
+        latest_reconciled_at is not None
+        and _utc_naive(event_time) < _utc_naive(latest_reconciled_at)
+    ):
+        db.add(
+            BrokerOrderEvent(
+                broker_order_pk=order.id,
+                event_type="reconcile_result_stale",
+                event_source=BrokerEventSource.RECONCILIATION.value,
+                normalized_status=order.status,
+                broker_status=_optional_str(payload.get("broker_status")),
+                message="older broker reconciliation did not replace newer accepted truth",
+                response_payload=_safe_payload(payload),
+                payload={
+                    "provider": adapter.provider,
+                    "latest_reconciled_at": latest_reconciled_at.isoformat(),
+                },
+                observed_at=event_time,
+            )
+        )
+        db.commit()
+        return {
+            "status_code": 200,
+            "broker_order_id": order.broker_order_id,
+            "status": order.status,
+            "status_before": order_status_before,
+            "status_changed": False,
+            "fills_added": 0,
+            "filled_delta": 0,
+            "message": "older broker reconciliation ignored",
+        }
     normalized_status = _normalize_status(payload.get("status"))
     fills, fill_delta_anomalies = _parse_fills_from_payload(
         payload=payload,
@@ -1748,10 +1807,39 @@ def _load_legacy_manual_review_orders(
         .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
     )
     if for_update:
-        statement = statement.with_for_update().execution_options(
+        candidate_links = dict(db.execute(
+            select(BrokerOrder.id, BrokerOrder.execution_plan_item_id).where(*where)
+        ).all())
+        item_ids = {item_id for item_id in candidate_links.values() if item_id is not None}
+        if item_ids:
+            # Match Core fencing's plan -> item -> order lock order. Keep this
+            # candidate set fixed so a new row cannot bypass its parent locks.
+            db.scalars(
+                select(ExecutionPlan.id)
+                .where(ExecutionPlan.id.in_(
+                    select(ExecutionPlanItem.execution_plan_id)
+                    .where(ExecutionPlanItem.id.in_(item_ids))
+                ))
+                .order_by(ExecutionPlan.id.asc())
+                .with_for_update()
+            ).all()
+            db.scalars(
+                select(ExecutionPlanItem.id)
+                .where(ExecutionPlanItem.id.in_(item_ids))
+                .order_by(ExecutionPlanItem.execution_plan_id.asc(), ExecutionPlanItem.plan_item_index.asc())
+                .with_for_update()
+            ).all()
+        statement = statement.where(BrokerOrder.id.in_(candidate_links)).with_for_update().execution_options(
             populate_existing=True
         )
-    return db.scalars(statement).all()
+    orders = db.scalars(statement).all()
+    if for_update and any(
+        order.execution_plan_item_id != candidate_links[order.id] for order in orders
+    ):
+        raise LegacyManualReviewApprovalConflictError(
+            "legacy manual-review plan linkage changed during row locking"
+        )
+    return orders
 
 
 def _legacy_manual_review_order_conditions(
@@ -2649,6 +2737,10 @@ def _stale_order_repair_decision(
 ) -> dict[str, str] | None:
     if status_before not in _reconcilable_order_statuses():
         return None
+    if result is not None and int(result.get("status_code") or 200) < 400:
+        # A successful inquiry may have cleared these old failures deliberately.
+        error_code_before = None
+        error_classification_before = None
     observed_broker_code = order.last_error_code or error_code_before
     observed_classification = order.last_error_classification or error_classification_before
     if not order.broker_order_id:

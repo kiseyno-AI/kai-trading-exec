@@ -287,6 +287,37 @@ def test_runtime_alpaca_scope_uses_authenticated_account_despite_operator_label(
     assert len(http_client.calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("filled_at", "included"),
+    [
+        (datetime(2026, 9, 9, 14, 59, 59, 999999, tzinfo=UTC), False),
+        (datetime(2026, 9, 9, 15, 0, tzinfo=UTC), True),
+        (datetime(2026, 9, 10, 14, 59, 59, 999998, tzinfo=UTC), True),
+        (datetime(2026, 9, 10, 14, 59, 59, 999999, tzinfo=UTC), True),
+        (datetime(2026, 9, 10, 15, 0, tzinfo=UTC), False),
+    ],
+)
+def test_autonomous_fill_cache_covers_the_entire_krx_day(filled_at, included) -> None:
+    settings = _settings()
+    engine, _factory, db = _session(settings)
+    try:
+        order = _canonical_order(
+            settings, key="day-boundary", symbol="AAPL", side="buy",
+            status="filled", exchange="NASD", observed_at=filled_at,
+        )
+        db.add(order)
+        db.flush()
+        db.add(_fill(order, key="day-boundary-fill", quantity=1, filled_at=filled_at))
+        db.commit()
+
+        assert _load_filled_today_symbols(
+            settings=settings, db=db, now=datetime(2026, 9, 10, 3, 0, tzinfo=UTC),
+        ) == (["AAPL"] if included else [])
+    finally:
+        db.close()
+        engine.dispose()
+
+
 def test_runtime_freshness_and_autonomous_fill_cache_use_exact_active_scope() -> None:
     settings = _settings().model_copy(
         update={"stale_broker_order_reconciliation_threshold_seconds": 60}

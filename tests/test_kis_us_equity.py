@@ -190,6 +190,33 @@ def test_kis_us_equity_order_uses_official_paper_contract(side: str, tr_id: str)
     assert placement.broker_order_id == "1234567890"
 
 
+@pytest.mark.parametrize(("primary", "fallback", "blocked"), [
+    ("0", "10", True), (0, "10", True), ("0.0", "10", True),
+    ("2", "10", False), (None, "10", False), (None, "0", True),
+])
+def test_kis_us_buy_preflight_preserves_zero_buyable_quantity(primary, fallback, blocked):
+    http = QueueHttpClient(
+        get_payloads=[{"rt_cd": "0", "output": {
+            "max_ord_psbl_qty": primary,
+            "ovrs_max_ord_psbl_qty": fallback,
+        }}],
+        post_payload={
+            "rt_cd": "0", "output": {"ODNO": "local-test-ack", "ORD_TMD": "093001"},
+        },
+    )
+    adapter = KisBrokerAdapter(settings=_settings(), http_client=http)
+
+    if blocked:
+        with pytest.raises(BrokerAdapterError, match="exceeds broker-reported buying power") as error:
+            adapter.place_order("local-test-token", _placement_request())
+        assert error.value.classification == BrokerErrorClassification.BROKER_REJECTED
+        assert http.post_calls == []
+    else:
+        placement = adapter.place_order("local-test-token", _placement_request())
+        assert placement.broker_order_id == "local-test-ack"
+        assert len(http.post_calls) == 1
+
+
 def test_kis_us_equity_quote_maps_order_exchange_to_quote_exchange() -> None:
     http = QueueHttpClient(
         get_payloads=[

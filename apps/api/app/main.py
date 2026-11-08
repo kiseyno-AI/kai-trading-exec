@@ -225,7 +225,9 @@ def create_app(
             authorized = (
                 scheme.lower() == "bearer"
                 and bool(credentials)
-                and compare_digest(credentials, configured_token)
+                and compare_digest(
+                    credentials.encode("utf-8"), configured_token.encode("utf-8")
+                )
             )
         else:
             # Uvicorn CLI flags can bind more broadly than Settings.api_host.
@@ -428,6 +430,8 @@ async def _complete_shutdown_step(
         except asyncio.CancelledError as exc:
             if cancellation is None:
                 cancellation = exc
+        except Exception:
+            break
     try:
         task.result()
     except asyncio.CancelledError as exc:
