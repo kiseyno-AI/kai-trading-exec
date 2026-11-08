@@ -499,6 +499,49 @@ def _add_closed_trade(
     )
 
 
+def test_feedback_as_of_excludes_later_fills_from_both_outcome_ledgers(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="as-of-plan",
+        external_plan_id="as-of-plan",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="as-of-closed",
+        symbol="005930",
+        buy_price="100",
+        sell_price="110",
+        filled_day=10,
+    )
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="as-of-still-open",
+        symbol="000660",
+        buy_price="100",
+        sell_price="90",
+        filled_day=12,
+    )
+    session.commit()
+    cutoff = datetime(2026, 6, 12, 1, 0, tzinfo=UTC)
+
+    report = generate_trade_outcome_feedback(settings=settings, db=session, as_of=cutoff)
+
+    assert report["closed_trade_count"] == 1
+    assert report["strategy_closed_trade_count"] == 1
+    for key in ("closed_trades", "strategy_closed_trades"):
+        assert [trade["symbol"] for trade in report[key]] == ["005930"]
+        assert datetime.fromisoformat(report[key][0]["sell"]["filled_at"]) <= cutoff
+    assert session.query(ExecutionFill).count() == 4
+    session.close()
+    engine.dispose()
+
+
 def _bind_closed_trade_to_execution_scope(
     session,
     *,

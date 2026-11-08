@@ -771,6 +771,7 @@ def _load_fills(
             .join(ExecutionFill.broker_order)
             .where(
                 BrokerOrder.mode == settings.runtime_mode,
+                ExecutionFill.filled_at <= review_end,
             )
             .options(
                 load_only(
