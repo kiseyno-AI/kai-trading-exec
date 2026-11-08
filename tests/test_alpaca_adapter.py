@@ -1660,8 +1660,10 @@ def test_24h_runtime_reconciles_and_checkpoints_without_market_hours_gate(
         ]
 
 
+@pytest.mark.parametrize("clock_is_open", [False, None, "false", "true", 1, [False], {"open": False}])
 def test_us_equity_runtime_monitors_while_market_closed_without_trading(
     monkeypatch: pytest.MonkeyPatch,
+    clock_is_open: object,
 ) -> None:
     settings = _settings(
         database_url="sqlite:///:memory:",
@@ -1684,7 +1686,7 @@ def test_us_equity_runtime_monitors_while_market_closed_without_trading(
         AlpacaHttpResponse(200, {}, []),
         AlpacaHttpResponse(200, {}, []),
         AlpacaHttpResponse(200, {}, {
-            "is_open": False, "timestamp": "2026-08-16T12:00:00Z",
+            "is_open": clock_is_open, "timestamp": "2026-08-16T12:00:00Z",
             "next_open": "2026-08-17T09:30:00-04:00", "next_close": "2026-08-17T16:00:00-04:00",
         }),
         AlpacaHttpResponse(200, {}, {"quotes": {"QQQ": {"bp": "570", "ap": "571", "t": "2026-08-15T19:59:59Z"}}}),
@@ -1714,7 +1716,7 @@ def test_us_equity_runtime_monitors_while_market_closed_without_trading(
     result = runtime.run_cycle()
 
     assert result["status"] == "healthy"
-    assert result["market_clock"]["is_open"] is False  # type: ignore[index]
+    assert result["market_clock"]["is_open"] == clock_is_open  # type: ignore[index]
     assert result["strategy"]["status"] == "market_closed"  # type: ignore[index]
     assert set(result["prices"]) == {"SPY", "QQQ"}
     assert runtime.snapshot()["strategy_live_order_submission_enabled"] is False
