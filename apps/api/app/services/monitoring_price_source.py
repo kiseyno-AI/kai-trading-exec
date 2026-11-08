@@ -316,9 +316,9 @@ class KisCurrentQuoteMonitoringPriceSource:
             }
             return []
 
-        broker_adapter = self.broker_adapter_factory(settings)
         release_quote_batch_lock = True
         try:
+            broker_adapter = self.broker_adapter_factory(settings)
             requested_symbol_set = set(unique_symbols)
             for symbol in list(self._empty_quote_counts):
                 if symbol not in requested_symbol_set:
