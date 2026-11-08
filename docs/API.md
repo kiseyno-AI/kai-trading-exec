@@ -1449,3 +1449,43 @@ Current response includes:
 CAS-tombstone the authoritative shared KIS access token first, then request
 remote revocation and clear the local broker-session mirror. A remote failure
 does not restore the locally revoked token.
+
+## Additional runtime, intake, and watcher APIs
+
+These routes are implemented and used by Core or operators but were missing from this draft. Request and response schemas are defined in `apps/api/app/api/schemas/` and are the source of truth; OpenAPI at `/docs` lists them in full.
+
+### `GET /runtime/monitored-symbol-membership`
+
+Read-only KRX monitored-symbol membership snapshot consumed by Core. Consumers may remove a previously observed symbol only when `membership_complete` is `true`; partial or unavailable snapshots are additive evidence only.
+
+### `GET /runtime/alpaca-us-equity`
+
+Snapshot of the Alpaca US-equity monitoring coordinator state. It mirrors `GET /runtime/alpaca-crypto` for the US-equity worker.
+
+### `POST /runtime/core-buy-authority/observations`
+
+Core's scoped OPEN buy-authority observation (`CoreBuyAuthorityObservationV1`, answered with `CoreBuyAuthorityAckV1`). Exec commits the scoped observation ledger and fence first, then projects it onto eligible Core-v4 KRX items. A new OPEN v4 buy may be dispatched only after an ACK that reports both `fence_active=false` and `projection_pending=false`.
+
+Status codes:
+
+- `200` with an ACK whose `status` is `applied`, `duplicate`, or `rejected_stale`. A stale `allow` observation (too old for the configured window, a source time earlier than the latest block, or a regressed source watermark) is **not** an HTTP error: it returns `200` with `status: "rejected_stale"`, `fence_active: true` and `projection_pending: true`, and new OPEN v4 buys stay blocked until a fresh healthy observation clears the fence. Consumers must read `status` and the fence fields, not only the HTTP code.
+- `409` only when the scope does not match this runtime (runtime mode, KIS/KRX/KRW route, or account reference) or the ledger already binds this `observation_id` to different material; a material conflict also fences the scope before the error is returned.
+- `422` when the request fails validation, including an `observation_id` or `material_fingerprint` that does not bind the canonical material.
+
+A duplicate healthy observation never advances the recovery streak.
+
+### `POST /v4/execution-plans/activations`
+
+Core's confirmation that a held, previously ACKed v4 buy may become actionable (`CoreExecutionActivationRequestV4`: `plan_id`, `execution_plan_id`, `dispatch_material_fingerprint`, `authority_generation_fingerprint`, timezone-aware `requested_at`, and one binding per item). Item bindings must be one-to-one (`core_item_key` and `execution_plan_item_id` are each unique within the request).
+
+### `POST /short-term-watcher/decisions`
+
+Evaluates a short-term watcher decision for one plan item (`ShortTermWatcherDecisionRequest`: `execution_plan_item_id`, `dry_run` defaulting to `true`, `agent_output`, `account_context`). The broker account snapshot must have complete holdings and open-order truth. With `dry_run=false` an accepted decision can reach the normal order boundary, which re-applies every runtime, account, quote, and exposure gate.
+
+### `GET /execution-failures`
+
+Lists persisted actionable execution failures. Optional filters: `classification`, `status`.
+
+### `PATCH /execution-failures/{failure_id}`
+
+Updates a failure's operator status (`ExecutionFailureStatusUpdateRequest`: `status`, `actor`, `source`, `reason`).

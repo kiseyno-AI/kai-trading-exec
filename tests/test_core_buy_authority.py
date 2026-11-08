@@ -1054,3 +1054,43 @@ def test_core_v4_krx_buy_requires_current_exact_scope_authority() -> None:
             now=now + timedelta(days=1),
         ) is None
     engine.dispose()
+
+
+def test_http_contract_stale_is_200_rejected_stale_and_only_conflicts_are_409() -> None:
+    """docs/API.md: a stale observation is not an HTTP error; read `status`."""
+
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    settings = _settings(core_buy_authority_max_observation_age_seconds=60)
+    engine, session_factory = _db(settings)
+    client = TestClient(create_app(settings=settings, engine=engine, session_factory=session_factory))
+    now = datetime.now(UTC)
+    stale = _command(
+        action="allow",
+        source_observed_at=now - timedelta(seconds=600),
+        evaluated_at=now,
+        market_date=now.astimezone(ZoneInfo("Asia/Seoul")).date(),
+    )
+
+    response = client.post("/runtime/core-buy-authority/observations", json=stale.model_dump(mode="json"))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "rejected_stale"
+    assert body["fence_active"] is True
+
+    tampered = stale.model_dump(mode="json")
+    tampered["material_fingerprint"] = "f" * 64
+    response = client.post("/runtime/core-buy-authority/observations", json=tampered)
+    assert response.status_code == 422
+    engine.dispose()
+
+    other_settings = _settings(core_buy_authority_max_observation_age_seconds=60).model_copy(
+        update={"kis_account_number": "87654321"}
+    )
+    other_engine, other_factory = _db(other_settings)
+    other = TestClient(create_app(settings=other_settings, engine=other_engine, session_factory=other_factory))
+    response = other.post("/runtime/core-buy-authority/observations", json=stale.model_dump(mode="json"))
+    assert response.status_code == 409  # scope (account) does not match this runtime
+    other_engine.dispose()

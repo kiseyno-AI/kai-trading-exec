@@ -238,6 +238,16 @@ def create_app(
                 content={"detail": "Unauthorized"},
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        # Without a bearer token the only boundary is "loopback", which a web
+        # page open in a browser on this host also satisfies. Browsers attach
+        # Origin / Sec-Fetch-Site to cross-site writes (including body-less
+        # "simple" POSTs that skip CORS preflight), so refuse those. A valid
+        # bearer token proves a non-browser caller and is not affected.
+        if not (configured_token and authorized) and _is_cross_origin_write(request):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Cross-origin write requests are not allowed"},
+            )
         return await call_next(request)
 
     app.include_router(health_router)
@@ -436,6 +446,26 @@ def _is_loopback_host(host: str) -> bool:
         return ip_address(normalized).is_loopback
     except ValueError:
         return False
+
+
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _is_cross_origin_write(request: Request) -> bool:
+    """Return whether a state-changing request was initiated by another origin.
+
+    Non-browser callers (Core's HTTP client, curl, operator scripts) send
+    neither ``Origin`` nor ``Sec-Fetch-Site`` and are never matched.
+    """
+    if request.method.upper() not in _UNSAFE_METHODS:
+        return False
+    if request.headers.get("sec-fetch-site", "").strip().lower() == "cross-site":
+        return True
+    origin = request.headers.get("origin")
+    if origin is None:
+        return False
+    host = request.headers.get("host", "").strip().lower()
+    return origin.strip().lower() not in {f"http://{host}", f"https://{host}"}
 
 
 def _request_is_loopback(request: Request) -> bool:
