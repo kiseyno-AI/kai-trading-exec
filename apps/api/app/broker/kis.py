@@ -3688,9 +3688,9 @@ def _parse_overseas_buying_power(
         "ovrs_ord_psbl_amt",
     )
     buying_power = _first_decimal(output, "ovrs_ord_psbl_amt", "ord_psbl_frcr_amt")
-    buyable_quantity = _parse_int(output.get("max_ord_psbl_qty")) or _parse_int(
-        output.get("ovrs_max_ord_psbl_qty")
-    )
+    buyable_quantity = _parse_int(output.get("max_ord_psbl_qty"))
+    if buyable_quantity is None:
+        buyable_quantity = _parse_int(output.get("ovrs_max_ord_psbl_qty"))
     return BrokerSymbolBuyingPower(
         symbol=symbol,
         available_cash=available_cash,
