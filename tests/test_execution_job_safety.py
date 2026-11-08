@@ -237,7 +237,10 @@ def test_plan_ingress_and_sync_agent_numeric_parsers_reject_nonfinite_values() -
         assert exec_agent._parse_positive_decimal(value) is None
 
 
-@pytest.mark.parametrize("quantity", ["NaN", "sNaN", "Infinity", "-Infinity", "not-a-number", "²", "①"])
+@pytest.mark.parametrize("quantity", [
+    "NaN", "sNaN", "Infinity", "-Infinity", "not-a-number", "²", "①",
+    pytest.param("9" * 5000, id="integer-conversion-limit"),
+])
 def test_plan_ingress_keeps_invalid_share_quantities_unfulfilled(quantity: str) -> None:
     app, engine = build_test_app(
         settings=Settings(database_url="sqlite:///:memory:", runtime_mode="mock"),

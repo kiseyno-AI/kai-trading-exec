@@ -16566,6 +16566,12 @@ def _parse_positive_int(value: object) -> int | None:
         return None
     if isinstance(value, int) and value > 0:
         return value
+    if isinstance(value, str) and value.strip().isdecimal():
+        try:
+            quantity = int(value)
+        except ValueError:
+            return None
+        return quantity if quantity > 0 else None
     try:
         parsed = Decimal(str(value))
     except (InvalidOperation, ValueError):

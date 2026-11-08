@@ -6299,7 +6299,10 @@ def _open_order_remaining_quantity(order: dict[str, object]) -> int | None:
     if isinstance(raw_quantity, int):
         return raw_quantity if raw_quantity >= 0 else None
     if isinstance(raw_quantity, str) and raw_quantity.isdecimal():
-        return int(raw_quantity)
+        try:
+            return int(raw_quantity)
+        except ValueError:
+            return None
     return None
 
 
