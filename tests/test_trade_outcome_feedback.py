@@ -5172,15 +5172,18 @@ def test_latest_trade_outcome_feedback_requires_exact_account_scope(tmp_path) ->
     assert load_latest_trade_outcome_feedback_snippet(settings)["status"] == "unavailable"
 
 
-def test_latest_trade_outcome_feedback_rejects_tampered_checksum(tmp_path) -> None:
+@pytest.mark.parametrize("tamper", ("body", "non_ascii_checksum"))
+def test_latest_trade_outcome_feedback_rejects_tampered_checksum(tmp_path, tamper) -> None:
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
     latest_path = tmp_path / "latest.json"
     _write_quality_gated_feedback_artifact(latest_path)
     payload = json.loads(latest_path.read_text(encoding="utf-8"))
-    payload["summary"]["realized_pnl_krw"] = "999999.0000"
+    if tamper == "body":
+        payload["summary"]["realized_pnl_krw"] = "999999.0000"
+    else:
+        payload["integrity"]["payload_sha256"] = "한" * 64
     latest_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    assert artifact_integrity_is_valid(payload) is False
     feedback = load_latest_trade_outcome_feedback_snippet(
         settings,
         provider="kis",
@@ -5191,6 +5194,7 @@ def test_latest_trade_outcome_feedback_rejects_tampered_checksum(tmp_path) -> No
     assert feedback["snippet"]["quality_gate"]["instruction"] == (
         "do_not_apply_learning_lessons"
     )
+    assert artifact_integrity_is_valid(payload) is False
 
 
 @pytest.mark.parametrize(

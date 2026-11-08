@@ -62,7 +62,7 @@ def artifact_integrity_is_valid(payload: Mapping[str, Any]) -> bool:
     if integrity.get("canonicalization") != ARTIFACT_CANONICALIZATION:
         return False
     expected = integrity.get("payload_sha256")
-    if not isinstance(expected, str) or len(expected) != 64:
+    if not isinstance(expected, str) or len(expected) != 64 or not expected.isascii():
         return False
     body = dict(payload)
     body.pop("integrity", None)
