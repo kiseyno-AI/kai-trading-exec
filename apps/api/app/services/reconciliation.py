@@ -37,6 +37,7 @@ from app.models.runtime import (
     ExecutionFailure,
     ExecutionFill,
     ExecutionJob,
+    ExecutionPlan,
     ExecutionPlanItem,
     ExecutionPosition,
     RuntimeRemediationEvent,
@@ -1806,10 +1807,39 @@ def _load_legacy_manual_review_orders(
         .order_by(BrokerOrder.created_at.asc(), BrokerOrder.id.asc())
     )
     if for_update:
-        statement = statement.with_for_update().execution_options(
+        candidate_links = dict(db.execute(
+            select(BrokerOrder.id, BrokerOrder.execution_plan_item_id).where(*where)
+        ).all())
+        item_ids = {item_id for item_id in candidate_links.values() if item_id is not None}
+        if item_ids:
+            # Match Core fencing's plan -> item -> order lock order. Keep this
+            # candidate set fixed so a new row cannot bypass its parent locks.
+            db.scalars(
+                select(ExecutionPlan.id)
+                .where(ExecutionPlan.id.in_(
+                    select(ExecutionPlanItem.execution_plan_id)
+                    .where(ExecutionPlanItem.id.in_(item_ids))
+                ))
+                .order_by(ExecutionPlan.id.asc())
+                .with_for_update()
+            ).all()
+            db.scalars(
+                select(ExecutionPlanItem.id)
+                .where(ExecutionPlanItem.id.in_(item_ids))
+                .order_by(ExecutionPlanItem.execution_plan_id.asc(), ExecutionPlanItem.plan_item_index.asc())
+                .with_for_update()
+            ).all()
+        statement = statement.where(BrokerOrder.id.in_(candidate_links)).with_for_update().execution_options(
             populate_existing=True
         )
-    return db.scalars(statement).all()
+    orders = db.scalars(statement).all()
+    if for_update and any(
+        order.execution_plan_item_id != candidate_links[order.id] for order in orders
+    ):
+        raise LegacyManualReviewApprovalConflictError(
+            "legacy manual-review plan linkage changed during row locking"
+        )
+    return orders
 
 
 def _legacy_manual_review_order_conditions(
