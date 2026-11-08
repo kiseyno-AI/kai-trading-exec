@@ -35,10 +35,15 @@ def main() -> int:
     con = sqlite3.connect(args.database)
     con.row_factory = sqlite3.Row
     try:
+        columns = {row["name"] for row in con.execute("PRAGMA table_info(execution_fills)")}
+        crypto_columns = ", ".join(
+            name if name in columns else f"NULL AS {name}"
+            for name in ("base_quantity", "quote_notional")
+        )
         rows = con.execute(
-            """
+            f"""
             select id, broker_order_pk, broker_fill_id, symbol, side, filled_at, price,
-                   quantity, payload, created_at, updated_at
+                   quantity, {crypto_columns}, payload, created_at, updated_at
             from execution_fills
             order by broker_order_pk, filled_at, id
             """
@@ -95,6 +100,8 @@ def _idempotency_key(row: sqlite3.Row) -> str:
             _timestamp_key(str(row["filled_at"])),
             _decimal_key(row["price"]),
             str(int(row["quantity"])),
+            _optional_decimal_key(row["base_quantity"]),
+            _optional_decimal_key(row["quote_notional"]),
         )
     digest = sha256("|".join(parts).encode("utf-8")).hexdigest()
     return f"execution_fill:{digest}"
@@ -117,6 +124,10 @@ def _timestamp_key(value: str) -> str:
 
 def _decimal_key(value: object) -> str:
     return format(Decimal(str(value)).normalize(), "f")
+
+
+def _optional_decimal_key(value: object) -> str:
+    return "" if value is None else _decimal_key(value)
 
 
 if __name__ == "__main__":
