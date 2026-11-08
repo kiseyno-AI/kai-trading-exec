@@ -4718,6 +4718,64 @@ def test_trigger_agent_claim_identity_ignores_only_runtime_event_churn() -> None
     ) == original
 
 
+@pytest.mark.parametrize("concurrent_event", (False, True))
+def test_trigger_agent_claim_merges_current_and_local_monitoring_events(
+    tmp_path,
+    concurrent_event: bool,
+) -> None:
+    settings = Settings(database_url=f"sqlite:///{tmp_path / 'claim-events.db'}")
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    triggered_at = datetime(2026, 9, 8, 1, tzinfo=UTC)
+    try:
+        with session_factory() as db:
+            item = ExecutionPlanItem(
+                symbol="005930", side="sell", intent="target_sell",
+                status="target_sell_monitoring", provider="kis", venue="KRX",
+                asset_class="stock", quantity_policy={"kind": "shares", "quantity": 1},
+                risk_context={"exchange": "KRX"},
+            )
+            monitoring_service._record_monitoring_event(item=item, event={"event": "initial"})
+            db.add(ExecutionPlan(
+                external_plan_id="claim-events", source="test", mode="paper",
+                market_date=triggered_at.date(), items=[item],
+            ))
+            db.commit()
+            item_id = item.id
+
+        with session_factory() as db:
+            item = db.get(ExecutionPlanItem, item_id)
+            assert item.risk_context["monitoring_events"] == [{"event": "initial"}]
+            monitoring_service._record_monitoring_event(item=item, event={"event": "local"})
+            if concurrent_event:
+                with session_factory() as writer:
+                    current = writer.get(ExecutionPlanItem, item_id)
+                    assert current.risk_context["monitoring_events"] == [{"event": "initial"}]
+                    monitoring_service._record_monitoring_event(
+                        item=current, event={"event": "concurrent"},
+                    )
+                    writer.commit()
+            claim = monitoring_service._claim_trigger_time_agent_action(
+                db=db,
+                action=monitoring_service.PendingMonitoringAction(
+                    item=item, observed_price=Decimal("71000"),
+                ),
+                triggered_at=triggered_at,
+            )
+            assert isinstance(claim, monitoring_service.TriggerTimeAgentClaim)
+
+        with session_factory() as db:
+            persisted = db.get(ExecutionPlanItem, item_id)
+            assert persisted.status == monitoring_service.AGENT_PENDING_STATUS
+            assert [event["event"] for event in persisted.risk_context["monitoring_events"]] == [
+                "initial", *(["concurrent"] if concurrent_event else []), "local",
+                "trigger_time_exec_agent_pending",
+            ]
+    finally:
+        engine.dispose()
+
+
 def test_compaction_accepts_caller_priority_keys_without_growing_the_bound() -> None:
     payload = {f"field_{index:03d}": index for index in range(10)}
     payload["domain_checkpoint"] = {"status": "retrying"}

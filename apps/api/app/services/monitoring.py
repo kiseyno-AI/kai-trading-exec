@@ -5152,8 +5152,8 @@ def _claim_trigger_time_agent_action(
         return _trigger_time_agent_claim_lost_result(item=item, action=action)
 
     durable_risk_context = dict(_loaded_risk_context(item))
-    durable_risk_context.update(local_risk_context)
     durable_events = durable_risk_context.get("monitoring_events")
+    durable_risk_context.update(local_risk_context)
     local_events = local_risk_context.get("monitoring_events")
     combined_events: list[object] = []
     for event in (
