@@ -1466,7 +1466,13 @@ Snapshot of the Alpaca US-equity monitoring coordinator state. It mirrors `GET /
 
 Core's scoped OPEN buy-authority observation (`CoreBuyAuthorityObservationV1`, answered with `CoreBuyAuthorityAckV1`). Exec commits the scoped observation ledger and fence first, then projects it onto eligible Core-v4 KRX items. A new OPEN v4 buy may be dispatched only after an ACK that reports both `fence_active=false` and `projection_pending=false`.
 
-Status codes: `200` with an ACK; `409` when the observation conflicts with the persisted ledger or its scope does not match this runtime (stale observation, regressed source watermark, or a reused observation ID with different material). A duplicate healthy observation never advances the recovery streak.
+Status codes:
+
+- `200` with an ACK whose `status` is `applied`, `duplicate`, or `rejected_stale`. A stale `allow` observation (too old for the configured window, a source time earlier than the latest block, or a regressed source watermark) is **not** an HTTP error: it returns `200` with `status: "rejected_stale"`, `fence_active: true` and `projection_pending: true`, and new OPEN v4 buys stay blocked until a fresh healthy observation clears the fence. Consumers must read `status` and the fence fields, not only the HTTP code.
+- `409` only when the scope does not match this runtime (runtime mode, KIS/KRX/KRW route, or account reference) or the ledger already binds this `observation_id` to different material; a material conflict also fences the scope before the error is returned.
+- `422` when the request fails validation, including an `observation_id` or `material_fingerprint` that does not bind the canonical material.
+
+A duplicate healthy observation never advances the recovery streak.
 
 ### `POST /v4/execution-plans/activations`
 
