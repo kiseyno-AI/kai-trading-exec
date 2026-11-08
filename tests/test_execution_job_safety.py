@@ -237,6 +237,32 @@ def test_plan_ingress_and_sync_agent_numeric_parsers_reject_nonfinite_values() -
         assert exec_agent._parse_positive_decimal(value) is None
 
 
+@pytest.mark.parametrize("quantity", ["NaN", "sNaN", "Infinity", "-Infinity", "not-a-number"])
+def test_plan_ingress_keeps_invalid_share_quantities_unfulfilled(quantity: str) -> None:
+    app, engine = build_test_app(
+        settings=Settings(database_url="sqlite:///:memory:", runtime_mode="mock"),
+    )
+    try:
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post("/execution-plans", json={
+            "plan_id": "invalid-share-quantity", "source": "operator-import",
+            "market_date": "2026-11-09",
+            "items": [{
+                "symbol": "005930", "side": "buy", "intent": "next_open_buy",
+                "quantity_policy": {"kind": "shares", "quantity": quantity},
+                "limit_price": "71000",
+            }],
+        })
+
+        assert response.status_code == 201, response.text
+        item_id = response.json()["persisted_execution_item_ids"][0]
+        with app.state.db_session_factory() as db:
+            assert db.get(ExecutionPlanItem, item_id).status == "watch_monitoring_pending"
+            assert db.scalar(select(ExecutionJob.id)) is None
+    finally:
+        engine.dispose()
+
+
 def test_risk_off_blocks_scheduled_next_open_dispatch_until_confirmed_recovery(
     monkeypatch,
     tmp_path,
