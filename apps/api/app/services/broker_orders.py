@@ -1061,7 +1061,7 @@ def _place_broker_order_serialized(
                 ),
             )
         _recover_degraded_replay(
-            settings=settings, db=db, order=existing, command=logical_command
+            settings=settings, db=db, order=existing
         )
         return PlaceBrokerOrderResult(
             status_code=200,
@@ -5172,11 +5172,10 @@ def _recover_degraded_replay(
     settings: Settings,
     db: Session,
     order: BrokerOrder,
-    command: PlaceOrderRequest,
 ) -> None:
     """On a replay of a degraded acknowledgement, retry what the degraded path could not."""
 
-    if command.provider != "upbit" or settings.runtime_mode != "paper":
+    if order.broker_name != "upbit" or settings.runtime_mode != "paper":
         return
     degraded = db.scalar(
         select(BrokerOrderEvent.id).where(
@@ -5185,6 +5184,10 @@ def _recover_degraded_replay(
         )
     )
     if degraded is None:
+        return
+    # A duplicate request cannot replace the command already sent to the broker.
+    command = _runtime_safety_replay_command(order)
+    if command is None or command.provider != order.broker_name:
         return
     plan_item = (
         db.get(ExecutionPlanItem, order.execution_plan_item_id)

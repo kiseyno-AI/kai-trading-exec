@@ -1,6 +1,9 @@
 """A broker acknowledgement must survive a failure in the local bookkeeping that follows it."""
 
+from decimal import Decimal
+
 from fastapi.testclient import TestClient
+import pytest
 
 from app.core.config import Settings
 from app.db.base import Base
@@ -239,6 +242,74 @@ def test_a_replay_recovers_a_paper_fill_the_degraded_path_could_not_write(monkey
     assert _fills(engine, "ack-paper-2") == 1  # idempotent across replays
     with create_session_factory(engine)() as session:
         assert session.query(BrokerOrder).filter_by(idempotency_key="ack-paper-2").count() == 1
+
+
+@pytest.mark.parametrize("stored_command", ["valid", "missing", "invalid"])
+def test_degraded_replay_never_uses_replacement_order_economics(
+    monkeypatch, stored_command: str
+) -> None:
+    _enable_paper_fills(monkeypatch)
+    client, engine = _build_client()
+    real = broker_orders_service._record_upbit_paper_simulated_fill
+
+    def unavailable(**_kwargs):
+        raise RuntimeError("simulator unavailable")
+
+    monkeypatch.setattr(broker_orders_service, "_record_upbit_paper_simulated_fill", unavailable)
+    key = "ack-original-economics"
+    first = client.post("/orders", json=_filled_payload(key))
+    assert first.status_code == 201, first.text
+    assert _fills(engine, key) == 0
+    if stored_command != "valid":
+        with create_session_factory(engine)() as session:
+            order = session.query(BrokerOrder).filter_by(idempotency_key=key).one()
+            metadata = dict(order.request_metadata)
+            metadata["original_command"] = None if stored_command == "missing" else {}
+            order.request_metadata = metadata
+            session.commit()
+    monkeypatch.setattr(broker_orders_service, "_record_upbit_paper_simulated_fill", real)
+
+    replacement = {**_filled_payload(key), "quote_notional": "500000"}
+    replay = client.post("/orders", json=replacement)
+
+    assert replay.status_code == 200 and replay.json()["duplicate"] is True
+    with create_session_factory(engine)() as session:
+        order = session.query(BrokerOrder).filter_by(idempotency_key=key).one()
+        fills = session.query(ExecutionFill).filter_by(broker_order_pk=order.id).all()
+        assert order.quote_notional == Decimal("50000")
+        if stored_command == "valid":
+            assert len(fills) == 1
+            assert fills[0].quote_notional == Decimal("50000")
+        else:
+            assert fills == []
+            assert order.status == "submitted"
+
+
+def test_degraded_replay_cannot_simulate_a_fill_for_another_provider(monkeypatch) -> None:
+    _enable_paper_fills(monkeypatch)
+    client, engine = _build_client()
+    key = "ack-alpaca-replayed-as-upbit"
+    with create_session_factory(engine)() as session:
+        order = BrokerOrder(
+            broker_name="alpaca", mode="paper", idempotency_key=key,
+            symbol="BTC/USD", side="buy", status="submitted",
+            broker_order_id="alpaca-ack", asset_class="crypto", venue="alpaca",
+            quote_notional=Decimal("100"),
+        )
+        session.add(order)
+        session.flush()
+        session.add(BrokerOrderEvent(
+            broker_order_pk=order.id,
+            event_type=broker_orders_service.DEGRADED_ACK_EVENT_TYPE,
+            event_source="submission", normalized_status="submitted",
+        ))
+        session.commit()
+
+    replay = client.post("/orders", json=_filled_payload(key))
+
+    assert replay.status_code == 200 and replay.json()["duplicate"] is True
+    assert _status(engine, key) == "submitted"
+    assert _fills(engine, key) == 0
 
 
 def _degraded_setup(*, change_plan_item):
