@@ -899,7 +899,7 @@ def persisted_verified_watch_sizing_provenance(
             verified_agent_id == configured_agent_id
             and runtime.get("agent_identity_source")
             == "signed_runtime_contract"
-            and runtime.get("agent_id") in {None, ""}
+            and runtime.get("agent_id") in (None, "")
         ):
             return False
     configured_model = _persisted_nonempty_text(

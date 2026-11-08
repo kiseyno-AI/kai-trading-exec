@@ -4567,7 +4567,10 @@ def test_paper_intraday_approval_without_contract_proof_is_rejected() -> None:
     )
 
 
-def test_verified_intraday_agent_reject_cannot_veto_core_wait_authority() -> None:
+@pytest.mark.parametrize("persisted_agent_id", (None, "", [], {}))
+def test_verified_intraday_agent_reject_cannot_veto_core_wait_authority(
+    persisted_agent_id,
+) -> None:
     settings = Settings(
         runtime_mode="paper",
         exec_agent_watch_sizing_min_notional_krw=Decimal("150000"),
@@ -4624,6 +4627,24 @@ def test_verified_intraday_agent_reject_cannot_veto_core_wait_authority() -> Non
         "server_quantity_only_after_agent_reject"
     )
     assert persisted_verified_watch_sizing_provenance(item.quantity_policy)
+
+    # Reloaded approvals may use the verified contract identity when the agent
+    # omits its ID, but malformed JSON identity values must invalidate the proof.
+    policy = deepcopy(item.quantity_policy)
+    for runtime in (
+        policy["approval_provenance"]["runtime"],
+        policy["exec_agent_decision"]["runtime_provenance"],
+        policy["short_term_exec_agent_decision"]["runtime_provenance"],
+    ):
+        runtime.update(
+            actual_agent_id=None,
+            agent_id=persisted_agent_id,
+            verified_agent_id=settings.exec_agent_id,
+            agent_identity_source="signed_runtime_contract",
+        )
+    assert persisted_verified_watch_sizing_provenance(policy) is (
+        persisted_agent_id is None or persisted_agent_id == ""
+    )
 
 
 def test_quantity_only_override_keeps_repairable_canonical_audit_and_raw_reject(
