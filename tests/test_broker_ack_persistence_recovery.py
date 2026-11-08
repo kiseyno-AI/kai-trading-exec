@@ -312,6 +312,78 @@ def test_degraded_replay_cannot_simulate_a_fill_for_another_provider(monkeypatch
     assert _fills(engine, key) == 0
 
 
+@pytest.mark.parametrize("changed_field", ["status", "risk_context"])
+def test_paper_fill_replay_preserves_authority_changed_before_the_fill_lock(
+    monkeypatch, tmp_path, changed_field: str
+) -> None:
+    _enable_paper_fills(monkeypatch)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'ack-replay.db'}", runtime_mode="paper"
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    with session_factory() as db:
+        plan = ExecutionPlan(
+            external_plan_id="replay-authority", source="test",
+            market_date=date(2026, 11, 9), mode="paper", status="accepted",
+        )
+        item = ExecutionPlanItem(
+            plan=plan, symbol="KRW-BTC", side="buy", intent="next_open_buy",
+            status="broker_order_submitted", provider="upbit", venue="upbit",
+            asset_class="crypto", risk_context={"exchange": "UPBIT"},
+        )
+        db.add(item)
+        db.flush()
+        item_id = item.id
+        command = PlaceOrderRequest.model_validate({
+            **_order_payload("ack-replay-authority"),
+            "execution_plan_item_id": item_id,
+        })
+        order = BrokerOrder(
+            broker_name="upbit", mode="paper", idempotency_key=command.idempotency_key,
+            symbol=command.symbol, side=command.side, status="submitted",
+            execution_plan_item_id=item_id, broker_order_id="paper-ack",
+            asset_class="crypto", venue="upbit", quote_notional=command.quote_notional,
+            request_metadata={"original_command": command.model_dump(mode="json")},
+        )
+        db.add(order)
+        db.flush()
+        order_id = order.id
+        db.add(BrokerOrderEvent(
+            broker_order_pk=order_id,
+            event_type=broker_orders_service.DEGRADED_ACK_EVENT_TYPE,
+            event_source="submission", normalized_status="submitted",
+        ))
+        db.commit()
+
+    real_retry = broker_orders_service._retry_paper_simulated_fill
+
+    def change_authority_then_retry(**kwargs):
+        # A different transaction commits after replay admission, before its fill lock.
+        with session_factory() as writer:
+            item = writer.get(ExecutionPlanItem, item_id)
+            if changed_field == "status":
+                item.status = "cancelled"
+            item.risk_context = {**item.risk_context, "core_revocation": {"revoked": True}}
+            writer.commit()
+        return real_retry(**kwargs)
+
+    monkeypatch.setattr(broker_orders_service, "_retry_paper_simulated_fill", change_authority_then_retry)
+    with session_factory() as db:
+        broker_orders_service._recover_degraded_replay(
+            settings=settings, db=db, order=db.get(BrokerOrder, order_id)
+        )
+
+    with session_factory() as db:
+        item = db.get(ExecutionPlanItem, item_id)
+        expected_status = "cancelled" if changed_field == "status" else "broker_order_submitted"
+        assert item.status == expected_status
+        assert item.risk_context["core_revocation"] == {"revoked": True}
+        assert db.get(BrokerOrder, order_id).status == "filled"
+        assert db.query(ExecutionFill).filter_by(broker_order_pk=order_id).count() == 1
+
+
 def _degraded_setup(*, change_plan_item):
     settings = Settings(database_url="sqlite:///:memory:", runtime_mode="live")
     engine = create_db_engine(settings)

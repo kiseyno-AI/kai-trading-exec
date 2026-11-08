@@ -5064,7 +5064,7 @@ def _persist_degraded_broker_acknowledgement(
             exc_info=True,
         )
         raise
-    plan_item_updated = False
+    plan_item_state_for_fill = None
     if plan_item_id is not None:
         # Best effort: the order acknowledgement above is already durable.
         try:
@@ -5088,8 +5088,8 @@ def _persist_degraded_broker_acknowledgement(
                         "event_type": DEGRADED_ACK_EVENT_TYPE,
                     },
                 )
+                plan_item_state_for_fill = _plan_item_cas_state(plan_item)
                 db.commit()
-                plan_item_updated = True
             else:
                 db.rollback()
                 LOGGER.warning(
@@ -5098,6 +5098,7 @@ def _persist_degraded_broker_acknowledgement(
                 )
         except Exception:
             db.rollback()
+            plan_item_state_for_fill = None
             LOGGER.exception(
                 "broker_acknowledgement_plan_item_status_failed",
                 extra={"idempotency_key": idempotency_key},
@@ -5107,7 +5108,7 @@ def _persist_degraded_broker_acknowledgement(
         db=db,
         order=order,
         command=command,
-        update_plan_item=plan_item_updated,
+        expected_plan_item_state=plan_item_state_for_fill,
     )
     return order
 
@@ -5118,7 +5119,7 @@ def _retry_paper_simulated_fill(
     db: Session,
     order: BrokerOrder,
     command: PlaceOrderRequest,
-    update_plan_item: bool,
+    expected_plan_item_state: tuple[str, str] | None,
 ) -> None:
     """Best effort: complete an Upbit paper order's local fill if it is missing.
 
@@ -5145,10 +5146,18 @@ def _retry_paper_simulated_fill(
             db.rollback()
             return
         plan_item = (
-            db.get(ExecutionPlanItem, order.execution_plan_item_id, with_for_update=True)
-            if update_plan_item and order.execution_plan_item_id
+            db.get(
+                ExecutionPlanItem,
+                order.execution_plan_item_id,
+                with_for_update=True,
+                populate_existing=True,
+                options=[undefer(ExecutionPlanItem.risk_context)],
+            )
+            if expected_plan_item_state is not None and order.execution_plan_item_id
             else None
         )
+        if _plan_item_cas_state(plan_item) != expected_plan_item_state:
+            plan_item = None
         _record_upbit_paper_simulated_fill(
             settings=settings,
             db=db,
@@ -5199,8 +5208,10 @@ def _recover_degraded_replay(
         db=db,
         order=order,
         command=command,
-        update_plan_item=(
-            plan_item is not None and plan_item.status in _ORDER_MIRROR_PLAN_ITEM_STATUSES
+        expected_plan_item_state=(
+            _plan_item_cas_state(plan_item)
+            if plan_item is not None and plan_item.status in _ORDER_MIRROR_PLAN_ITEM_STATUSES
+            else None
         ),
     )
 
