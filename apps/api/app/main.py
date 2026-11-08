@@ -430,6 +430,8 @@ async def _complete_shutdown_step(
         except asyncio.CancelledError as exc:
             if cancellation is None:
                 cancellation = exc
+        except Exception:
+            break
     try:
         task.result()
     except asyncio.CancelledError as exc:

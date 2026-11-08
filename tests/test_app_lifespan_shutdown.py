@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from app.main import _stop_runtime_coordinators
+from app.main import _shutdown_runtime_coordinators, _stop_runtime_coordinators
 
 
 class _RecordingCoordinator:
@@ -89,3 +89,29 @@ def test_stop_runtime_coordinators_drains_after_cancellation_and_re_raises_it() 
     assert isinstance(exc_info.value.__cause__, ExceptionGroup)
     assert len(exc_info.value.__cause__.exceptions) == 1
     assert isinstance(exc_info.value.__cause__.exceptions[0], TimeoutError)
+
+
+def test_shutdown_preserves_admission_and_drain_failures() -> None:
+    calls: list[str] = []
+    admission_error = RuntimeError("admission fence failed")
+    drain_error = TimeoutError("worker did not drain")
+
+    class FailingCoordinator(_RecordingCoordinator):
+        def begin_shutdown(self) -> None:
+            calls.append("fence")
+            raise admission_error
+
+    coordinators = (
+        ("failing", FailingCoordinator(name="failing", calls=calls, error=drain_error)),
+        ("healthy", _RecordingCoordinator(name="healthy", calls=calls)),
+    )
+    with pytest.raises(ExceptionGroup) as exc_info:
+        asyncio.run(_shutdown_runtime_coordinators(coordinators=coordinators))
+
+    def leaf_failures(error: BaseException) -> list[BaseException]:
+        if isinstance(error, BaseExceptionGroup):
+            return [leaf for nested in error.exceptions for leaf in leaf_failures(nested)]
+        return [error]
+
+    assert calls == ["fence", "failing", "healthy"]
+    assert leaf_failures(exc_info.value) == [admission_error, drain_error]
