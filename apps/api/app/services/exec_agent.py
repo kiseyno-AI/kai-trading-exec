@@ -3786,7 +3786,11 @@ def _candidate_idempotency_key(
     item: ExecutionPlanItem,
 ) -> str:
     source = item.source_plan_item_id or str(item.plan_item_index)
-    return f"short-term-exec-agent:{plan.external_plan_id}:{source}"
+    key = f"short-term-exec-agent:{plan.external_plan_id}:{source}"
+    if len(key) <= 128:
+        return key
+    digest = json_payload_hash({"plan_id": plan.external_plan_id, "source": source})
+    return f"short-term-exec-agent:{digest}"
 
 
 def _next_plan_item_index(plan: ExecutionPlan) -> int:
