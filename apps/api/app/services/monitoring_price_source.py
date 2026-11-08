@@ -554,15 +554,21 @@ class KisCurrentQuoteMonitoringPriceSource:
         self,
         futures: set[Future[tuple[str, BrokerCurrentPrice | None, Exception | None]]],
     ) -> None:
+        released = False
+
         def release_if_complete(
             _future: Future[
                 tuple[str, BrokerCurrentPrice | None, Exception | None]
             ] | None = None,
         ) -> None:
+            nonlocal released
             del _future
             if any(not future.done() for future in futures):
                 return
             with self._quote_batch_state_lock:
+                if released:
+                    return
+                released = True
                 self._quote_batch_futures.difference_update(futures)
             try:
                 self._quote_batch_lock.release()
