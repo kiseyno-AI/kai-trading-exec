@@ -129,7 +129,7 @@ def _load_state(
         .options(undefer(CoreBuyAuthorityState.context))
     )
     if lock:
-        query = query.with_for_update()
+        query = query.with_for_update().execution_options(populate_existing=True)
     return db.scalar(query)
 
 
