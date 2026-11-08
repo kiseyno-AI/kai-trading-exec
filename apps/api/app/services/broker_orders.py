@@ -3529,6 +3529,7 @@ def _place_broker_order_serialized(
                 )
                 .options(selectinload(BrokerOrder.events))
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
             locked_metadata = (
                 locked_order.request_metadata
