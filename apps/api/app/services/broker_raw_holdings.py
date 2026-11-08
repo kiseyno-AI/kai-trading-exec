@@ -241,9 +241,10 @@ def _decimal_value(value: object) -> Decimal | None:
     if isinstance(value, bool) or value is None:
         return None
     try:
-        return Decimal(str(value).replace(",", "").strip())
+        parsed = Decimal(str(value).replace(",", "").strip())
     except (InvalidOperation, ValueError):
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _optional_text(value: object) -> str | None:
