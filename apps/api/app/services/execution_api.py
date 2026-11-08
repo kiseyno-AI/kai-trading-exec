@@ -1738,7 +1738,7 @@ def _parse_positive_int(value: object) -> int | None:
         return int(value)
     if isinstance(value, str):
         normalized = value.strip()
-        if normalized.isdigit() and int(normalized) > 0:
+        if normalized.isdecimal() and int(normalized) > 0:
             return int(normalized)
         try:
             parsed = Decimal(normalized)
