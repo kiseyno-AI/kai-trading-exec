@@ -9102,10 +9102,26 @@ def test_next_open_approval_materializes_one_limit_job_with_agent_provenance() -
     assert len(item.jobs) == 1
 
 
+@pytest.mark.parametrize(
+    "cycle_at",
+    [
+        pytest.param(datetime(2026, 6, 3, 23, 30, tzinfo=UTC), id="preopen"),
+        pytest.param(datetime(2026, 6, 3, 23, 59, 30, tzinfo=UTC), id="preopen-boundary"),
+        pytest.param(datetime(2026, 6, 4, 0, 0, tzinfo=UTC), id="at-open"),
+        pytest.param(datetime(2026, 6, 4, 0, 30, tzinfo=UTC), id="delayed-handoff"),
+    ],
+)
 def test_signal_next_open_ingress_persists_then_async_sizes_exactly_one_job(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    cycle_at: datetime,
 ) -> None:
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cycle_at.astimezone(tz) if tz is not None else cycle_at.replace(tzinfo=None)
+
+    monkeypatch.setattr(watch_sizing, "datetime", Clock)
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'signal-next-open-async.db'}",
         runtime_mode="paper",
@@ -9167,7 +9183,7 @@ def test_signal_next_open_ingress_persists_then_async_sizes_exactly_one_job(
         candidates = payload["candidates"]
         assert isinstance(candidates, list) and isinstance(candidates[0], dict)
         observed_candidates.extend(candidates)
-        return {
+        response = {
             "version": "manual-exec-agent-watch-sizing-v1",
             "plan_id": "signal-next-open-async",
             "_runtime_provenance": _verified_sizing_runtime(
@@ -9179,6 +9195,7 @@ def test_signal_next_open_ingress_persists_then_async_sizes_exactly_one_job(
                 {
                     "execution_plan_item_id": item_id,
                     "symbol": "005930",
+                    "binding": candidates[0]["binding"],
                     "action": "approve",
                     "quantity": 2,
                     "approved_notional_krw": "143000",
@@ -9190,6 +9207,11 @@ def test_signal_next_open_ingress_persists_then_async_sizes_exactly_one_job(
                 }
             ],
         }
+        watch_sizing._validate_watch_response_bindings(
+            request_payload=payload,
+            decision_payload=response,
+        )
+        return response
 
     monkeypatch.setattr(watch_sizing, "_request_exec_agent_decisions", approve)
     result = run_due_watch_exec_agent_sizing(
@@ -9200,18 +9222,25 @@ def test_signal_next_open_ingress_persists_then_async_sizes_exactly_one_job(
             snapshot=BrokerAccountSnapshot(
                 available_cash=Decimal("10000000"),
                 buying_power=Decimal("10000000"),
-                observed_at=datetime(2026, 6, 3, 23, 30, tzinfo=UTC),
+                observed_at=cycle_at,
                 source="stub:account_snapshot",
             ),
         ),
-        now=datetime(2026, 6, 3, 23, 30, tzinfo=UTC),
+        now=cycle_at,
     )
 
+    assert result.payload["errors"] == []
     assert result.payload["applied"][0]["approved"] == 1
     assert observed_candidates[0]["entry_reference_price"] == "71500"
     assert observed_candidates[0]["entry_reference_source"] == (
         "quantity_policy.estimated_reference_price"
     )
+    valid_until = datetime.fromisoformat(observed_candidates[0]["binding"]["valid_until"])
+    expected_deadline = cycle_at + timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
+    market_open = datetime(2026, 6, 4, 0, 0, tzinfo=UTC)
+    if cycle_at < market_open:
+        expected_deadline = min(expected_deadline, market_open)
+    assert valid_until == expected_deadline
     with session_factory() as db:
         item = db.get(ExecutionPlanItem, item_id)
         assert item is not None
@@ -9228,12 +9257,53 @@ def test_signal_next_open_ingress_persists_then_async_sizes_exactly_one_job(
         settings=settings,
         session_factory=session_factory,
         adapter=WatchSizingBrokerStub(reconcile_payloads=[]),
-        now=datetime(2026, 6, 3, 23, 31, tzinfo=UTC),
+        now=cycle_at + timedelta(minutes=1),
     )
     assert retry.payload["reason"] == "no_unsized_watch_candidates"
     with session_factory() as db:
         assert len(db.scalars(select(ExecutionJob)).all()) == 1
     engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("us_equity", "request_at", "expected_deadline"),
+    [
+        pytest.param(False, "2026-06-03T00:30:00+00:00", "2026-06-03T00:35:00+00:00", id="future-krx-date"),
+        pytest.param(False, "2026-06-05T00:30:00+00:00", "2026-06-04T00:00:00+00:00", id="past-krx-date"),
+        pytest.param(True, "2026-06-04T13:29:00+00:00", "2026-06-04T13:30:00+00:00", id="us-preopen"),
+        pytest.param(True, "2026-06-04T13:31:00+00:00", "2026-06-04T13:30:00+00:00", id="us-after-open"),
+    ],
+)
+def test_next_open_binding_preserves_other_date_and_us_deadlines(
+    us_equity: bool,
+    request_at: str,
+    expected_deadline: str,
+) -> None:
+    item = _next_open_watch_item()
+    if us_equity:
+        item.symbol = "AAPL"
+        item.provider = "kis"
+        item.asset_class = "us_equity"
+        item.venue = "NASD"
+        item.risk_context = {**item.risk_context, "exchange": "NASD"}
+    plan = ExecutionPlan(
+        id="bound-next-open",
+        external_plan_id="bound-next-open",
+        market_date=date(2026, 6, 4),
+        mode="paper",
+        items=[item],
+    )
+    candidate = _candidate_payload(item)
+    payload = _sizing_request_payload(
+        settings=Settings(runtime_mode="paper"),
+        plan=plan,
+        candidates=[candidate],
+        account_context={"available": False, "observed_at": request_at},
+        candidate_universe=_candidate_universe_payload([candidate]),
+        request_started_at=datetime.fromisoformat(request_at),
+    )
+
+    assert payload["candidates"][0]["binding"]["valid_until"] == expected_deadline
 
 
 def test_next_open_sizing_quarantines_a_candidate_bound_to_another_account(
