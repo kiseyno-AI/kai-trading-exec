@@ -25075,7 +25075,8 @@ def test_live_kis_us_held_stop_ignores_buy_only_otc_quarantine() -> None:
     engine.dispose()
 
 
-def test_final_target_sell_boundary_rejects_agent_stop_relaxation() -> None:
+@pytest.mark.parametrize("cached_stop", [False, True])
+def test_final_target_sell_boundary_rejects_agent_stop_relaxation(tmp_path, cached_stop) -> None:
     observed_at = datetime.now(UTC)
     adapter = StubBrokerAdapter(
         config=BrokerConfig(
@@ -25103,7 +25104,7 @@ def test_final_target_sell_boundary_rejects_agent_stop_relaxation() -> None:
         ),
     )
     settings = Settings(
-        database_url="sqlite:///:memory:",
+        database_url=f"sqlite:///{tmp_path / 'final-stop.db'}",
         runtime_mode="paper",
         kis_app_key="paper-key",
         kis_app_secret="paper-secret",
@@ -25162,7 +25163,7 @@ def test_final_target_sell_boundary_rejects_agent_stop_relaxation() -> None:
             provider="kis",
             venue="kis",
             asset_class="stock",
-            trigger_price=Decimal("70000"),
+            trigger_price=Decimal("55000") if cached_stop else Decimal("70000"),
             quantity_policy=stop_policy,
             risk_context=stop_risk,
         )
@@ -25185,6 +25186,12 @@ def test_final_target_sell_boundary_rejects_agent_stop_relaxation() -> None:
             entry_price=Decimal("65000"),
         )
         db.commit()
+        if cached_stop:
+            with app.state.db_session_factory() as concurrent:
+                current_stop = concurrent.get(ExecutionPlanItem, stop.id)
+                current_stop.trigger_price = Decimal("70000")
+                concurrent.commit()
+            assert stop.trigger_price == Decimal("55000")
         result = monitoring_service._place_monitoring_order(
             settings=settings,
             db=db,

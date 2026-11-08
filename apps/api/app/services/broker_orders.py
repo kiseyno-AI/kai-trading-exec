@@ -7543,6 +7543,7 @@ def _final_target_sell_stop_integrity_failure(
         )
         .options(undefer(ExecutionPlanItem.risk_context))
         .with_for_update()
+        .execution_options(populate_existing=True)
     ).all()
     sibling_stops = select_plan_item_family_members(
         anchor=plan_item,
