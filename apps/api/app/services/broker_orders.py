@@ -14548,6 +14548,8 @@ def _apply_upbit_paper_position(
             ExecutionPosition.exchange == position_identity.exchange,
             ExecutionPosition.symbol == symbol,
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if position is None:
         position = ExecutionPosition(
