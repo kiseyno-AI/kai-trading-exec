@@ -998,7 +998,8 @@ class KISTokenCacheStore:
         if failed_at is None or cooldown_until is None:
             raise KISTokenCacheError('KIS token failure timestamps are invalid')
         if record_type == 'failure' and (
-            error_kind not in {'http', 'timeout', 'transport', 'protocol'}
+            not isinstance(error_kind, str)
+            or error_kind not in {'http', 'timeout', 'transport', 'protocol'}
             or not isinstance(retryable, bool)
         ):
             raise KISTokenCacheError('KIS token failure details are invalid')
