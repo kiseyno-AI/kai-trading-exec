@@ -93,26 +93,98 @@ Each process owns its database pool and monitoring state. Keep the total configu
 
 ## Architecture and execution flow
 
-The service is a FastAPI application backed by SQLAlchemy and Alembic. Its durable flow is:
+Exec is a FastAPI application backed by SQLAlchemy and Alembic. Core supplies decisions and plan material; Exec owns accepted execution state, broker-facing lifecycle, runtime controls, and scoped fill/position truth. HTTP routes and enabled background workers use the same execution services.
 
-```text
-Core execution plan / operator request
-                  |
-                  v
- validation -> runtime controls -> account/risk/session gates
-                  |
-                  v
-       durable job and order lifecycle
-                  |
-                  v
-             broker adapter
-                  |
-                  v
-monitoring -> reconciliation -> fills/positions/failures
-                  |
-                  v
-       Core/Web execution read models
+The [English architecture catalog](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md) traces the source at [`f314d657ac451`](https://github.com/kiseyno-AI/kai-trading-exec/tree/f314d657ac451cdca68246bd2b64c45afa71c7bb). Diagrams describe implemented boundaries and conditional work, not deployed configuration or proof that all interleavings are correct.
+
+```mermaid
+flowchart TD
+    C["Core contracts"] --> A["Exec API"]
+    U["Operator controls"] --> A
+    A --> D["Plans, controls and execution journals"]
+    D --> W["Dispatch and monitoring workers"]
+    W --> G["Current evidence and final gates"]
+    G --> B["Broker adapters"]
+    B --> R["Order, fill and position reconciliation"]
+    R --> D
+    B -->|quotes and account evidence| W
+    D --> V["Core and Web read models"]
 ```
+
+### Daily runtime flow
+
+The runtime uses separate dispatch, monitoring, sizing, and provider-specific loops. Its [daily flow](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#daily-runtime-flow) explains their market windows, persisted gates, recovery, and holding-period maintenance.
+
+```mermaid
+flowchart TD
+    P["Persisted plan"] --> A["Applicable activation and BUY authority"]
+    A --> S["Required sizing"]
+    S --> E["Due jobs and price watches"]
+    E --> M{"Session and evidence usable?"}
+    M -->|no| W["Wait, refresh or retain block"]
+    W --> M
+    M -->|yes| X["Dispatch or trigger evaluation"]
+    X --> O["Persist intent and submit"]
+    O --> R["Reconcile and maintain protective exits"]
+    R --> E
+```
+
+| Phase | Runtime behavior |
+| --- | --- |
+| Startup | Inspect requested-worker schema/readiness, initialize durable controls, and start only enabled coordinators. |
+| Sizing window | Default **08:00–20:00 local time**; this is a worker window, not permission to trade outside an exchange session. |
+| KRX target date | Next-open jobs start no earlier than the expected open. Late arrivals may still be evaluated on their target date, subject to current calendar, session, quote, authority, and account gates. |
+| Active monitoring | Fetch bounded quotes, prioritize held-position work, evaluate deterministic BUY triggers and eligible protective SELL actions, then recheck final broker boundaries. |
+| Closed/session transition | Use route-aware idling; optional NXT/off-hours, US, and crypto paths retain their independent enablement and evidence requirements. |
+| After submission | ACK, fills, broker positions, family inventory, and feedback remain distinct persisted facts. |
+
+### Feature diagrams
+
+#### Contract registration and conditional activation
+
+```mermaid
+flowchart TD
+    C["Core v4 contract"] --> V["Mode, material and family checks"]
+    V -->|invalid| R["Reject intake"]
+    V -->|valid| P["Persist contract and ACK"]
+    P --> B{"Core-confirmed binding?"}
+    B -->|yes| H["BUY activation pending"]
+    B -->|no| E["Eligible plan state"]
+    H --> A["Exact activation checks"]
+    A -->|matching identity and generation| E
+    A -->|mismatch| H
+```
+
+Registration proves intake, not a broker fill. A scoped Core BUY fence is committed before item projection; an unfinished projection stays blocked. Revocation preserves protective exits when broker exposure is possible. [Contract, authority, and revocation diagrams](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#core-intake-activation-and-authority).
+
+#### Protective exits follow exact entry ownership
+
+```mermaid
+flowchart TD
+    F["Scoped fills and broker positions"] --> I["Canonical family inventory"]
+    I --> Q{"Ownership and chronology usable?"}
+    Q -->|no| B["Coverage issue or manual review"]
+    Q -->|yes| M["Stop, target and time-exit monitors"]
+    M --> T["Current trigger and family quantity cap"]
+    T --> G["Current SELL and broker gates"]
+    G --> O["Order and reconciliation evidence"]
+    O --> F
+```
+
+The same symbol can belong to separate decision lanes. Protective quantities remain bound to the exact entry family, and ambiguous history cannot authorize borrowing another family's inventory. Short-term holding age includes the entry session; signal entries have no implicit time exit without policy. [Lineage and protection](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#protective-exits-and-decision-lineage).
+
+| Feature | Detailed structure and source evidence |
+| --- | --- |
+| Startup, shutdown, worker readiness | [Startup and lifecycle](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#startup-readiness-and-shutdown) |
+| Dispatch, monitoring, watch sizing, provider loops | [Worker catalog and defaults](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#worker-catalog-and-code-defaults) |
+| Core intake, activation, scoped authority, revocation | [Contract boundaries](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#core-intake-activation-and-authority) |
+| Sizing, price triggers, scheduled entries, optional exit-agent decisions | [Sizing and trigger execution](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#sizing-and-trigger-execution) |
+| Pause, kill switch, hourly risk, account recovery | [Control scopes](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#runtime-controls-and-recovery-scopes) |
+| Idempotent intent, broker ACK, uncertain outcome, reconciliation | [Broker lifecycle sequence](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#broker-submission-acknowledgement-and-reconciliation) |
+| KIS, Alpaca, Upbit and provider isolation | [Provider and feature map](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#provider-isolation-and-feature-map) |
+| FIFO, exact family outcomes, advisory learning, weekly exports | [Feedback flow](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#feedback-and-review-artifacts) |
+
+The [2026-11-08 audit checkpoint](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/audit/2026-11-08-checkpoint.md) records baseline results, reproduced defects, local patch status, and unfinished manual coverage. No application-code changes are included in this README update. The earlier uncommitted patches were not found after workspace reconnection and require recovery or recreation and validation before publication.
 
 ### Decision and data-integrity contract
 
@@ -222,7 +294,7 @@ account's heartbeat.
 | Alpaca US equities | isolated paper runtime | separately gated | SPY/QQQ by default, IEX data, market-clock enforcement |
 | Upbit crypto | simulated lifecycle | not implemented | paper plans only; live requests fail closed |
 
-Live automated new-buy support is intentionally narrower than manual routing. KIS KRX requires the authoritative trading-day check plus a timestamped executable ask; KIS US uses the authenticated overseas best-bid/ask endpoint with exchange date/time provenance. Alpaca US-equity and NXT/SOR automated new buys fail closed until their venue-correct executable quote lanes are implemented. Automated protective sells are not exempt from quote integrity checks: KIS KRX and KIS US target/stop submissions reacquire a same-route, timestamped executable bid at the final broker boundary.
+Live automated new-buy support is intentionally narrower than manual routing. KIS KRX requires the authoritative trading-day check plus a timestamped executable ask; KIS US uses the authenticated overseas best-bid/ask endpoint with exchange date/time provenance. The generic live Alpaca US-equity BUY paths whose source is `monitoring:`, `execution-job:`, or `short-term-watcher:` fail closed because their trusted executable quote lane is unsupported. The dedicated Alpaca US-equity strategy worker is a separate path behind its global and strategy-specific live gates. NXT/SOR automated new buys remain blocked until their venue-correct executable quote lane is implemented. [Provider boundaries](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#provider-isolation-and-feature-map). Automated protective sells are not exempt from quote integrity checks: KIS KRX and KIS US target/stop submissions reacquire a same-route, timestamped executable bid at the final broker boundary.
 
 KIS account reads consume the broker's complete bounded cursor graph before
 declaring holdings or open orders complete. `F`/`M` responses continue with the
@@ -589,7 +661,7 @@ explicit `--openclaw-home`, `OPENCLAW_STATE_DIR`, then `~/.openclaw`.
 
 Profitability approval is deterministic at the order boundary. Every live short-term watch buy must show at least KRW 3 billion of timestamp-bound turnover and a cost-adjusted reward/risk ratio of at least 1.80 at trigger time and at the final broker fence, whether or not Core attached a delegated-gate token. `KAI_EXEC_KIS_KRX_ROUND_TRIP_NON_SPREAD_COST_BPS` defaults to a conservative server-owned 50 bps round-trip floor, then Exec adds the fresh executable bid/ask spread. Persisted Core values and agent output cannot reduce or relabel that estimate. Increase the setting when the account's calibrated schedule is higher; invalid or negative configuration is rejected. The default is based on the published [KIS fee and transaction-tax schedule](https://securities.koreainvestment.com/main/customer/guide/_static/TF04ae010000.jsp). Agent confidence, risk flags, tactical labels, or agent-authored market context may reduce pre-monitor sizing, but cannot cancel a Core WAIT, invent confirmation/liquidity/cost evidence, or relax the trigger-time and final-order floors.
 
-A next-open `exec_agent_sized` policy is never converted to shares by arithmetic fallback. Signal-decider next-open entries remain unsized until the asynchronous worker records an exact, verified agent approval. For an intraday Core WAIT only, a verified subjective agent reject may be normalized to a conservative server quantity inside the same deterministic envelope; unverified runtime output and every hard envelope failure remain fail-closed. Before the market opens, a next-open approval becomes one idempotent limit-only job capped at its conservative sizing reference; at and after the opening deadline it terminates without an order. The first attempt requires the current plan date, authoritative session evidence, and the `KAI_EXEC_NEXT_OPEN_BUY_INITIAL_SUBMISSION_GRACE_SECONDS` window, then rechecks the window and executable quote immediately before submission. Missing or invalid target/stop geometry rejects the approval, and legacy scheduled rows produced by the old unverified normalizer are quarantined. Agent output is accepted only as a single raw JSON object with exact identities, unique keys, and finite numbers. A persisted `verified_exec_agent_watch_sizing` label is not execution authority by itself: the reloaded runtime-contract proof, mirrored decision identity, and final quantity, price, notional, and sizing adjustment must agree exactly. For Core v4, that fully proven `exec_agent_watch_sizing` record is the only persisted source allowed to grant positive sizing; historical `exec_agent` and `short_term_exec_agent_v1` shapes are fenced at their entry family without changing generic non-Core plans. Bounded attempt metadata remains part of the proven transition into either approval or rejection, and either final outcome clears the prior defer latch so stale retry state cannot override current execution truth. On upgrade, narrowly proven pre-fix terminal rejects and reported-unverified approvals are canonicalized item by item only when there is no linked order, same-route order that is not provably local and unsubmitted, fill, or nonzero position evidence. Possible exposure keeps the family in manual review with protective exits preserved. Exact immutable item mapping keeps unrelated verified or retryable families unchanged; globally ambiguous intake identity falls back to fencing every buy. If the migrated item was the final entry, the account route must still be proven and all linked or same-route order, fill, and quantity/base-quantity position truth must prove no exposure before the parent closes as `completed_no_trade` and linked exits become `not_applicable`.
+A next-open `exec_agent_sized` policy is never converted to shares by arithmetic fallback. Signal-decider next-open entries remain unsized until the asynchronous worker records an exact, verified agent approval. For an intraday Core WAIT only, a verified subjective agent reject may be normalized to a conservative server quantity inside the same deterministic envelope; unverified runtime output and every hard envelope failure remain fail-closed. A next-open approval becomes one idempotent limit-only job capped at its conservative sizing reference. For KIS/KRX, next-open authority remains eligible for evaluation throughout its target trading date: the first submission must match that date, occur no earlier than the expected open, and pass the authoritative calendar, current executable quote, and all final broker gates. It expires after the target date rather than automatically at 09:00; remaining eligible does not authorize submission in a closed or unsupported session. The separately supported US-equity job path retains the opening deadline and `KAI_EXEC_NEXT_OPEN_BUY_INITIAL_SUBMISSION_GRACE_SECONDS` check, including a monotonic recheck before submission. Core v4 delegated US sizing remains unsupported. [Source-backed daily flow](https://github.com/kiseyno-AI/kai-trading-exec/blob/4cf71ccf3043a23882346656c92ee5e771310047/docs/architecture/README.md#daily-runtime-flow). Missing or invalid target/stop geometry rejects the approval, and legacy scheduled rows produced by the old unverified normalizer are quarantined. Agent output is accepted only as a single raw JSON object with exact identities, unique keys, and finite numbers. A persisted `verified_exec_agent_watch_sizing` label is not execution authority by itself: the reloaded runtime-contract proof, mirrored decision identity, and final quantity, price, notional, and sizing adjustment must agree exactly. For Core v4, that fully proven `exec_agent_watch_sizing` record is the only persisted source allowed to grant positive sizing; historical `exec_agent` and `short_term_exec_agent_v1` shapes are fenced at their entry family without changing generic non-Core plans. Bounded attempt metadata remains part of the proven transition into either approval or rejection, and either final outcome clears the prior defer latch so stale retry state cannot override current execution truth. On upgrade, narrowly proven pre-fix terminal rejects and reported-unverified approvals are canonicalized item by item only when there is no linked order, same-route order that is not provably local and unsubmitted, fill, or nonzero position evidence. Possible exposure keeps the family in manual review with protective exits preserved. Exact immutable item mapping keeps unrelated verified or retryable families unchanged; globally ambiguous intake identity falls back to fencing every buy. If the migrated item was the final entry, the account route must still be proven and all linked or same-route order, fill, and quantity/base-quantity position truth must prove no exposure before the parent closes as `completed_no_trade` and linked exits become `not_applicable`.
 
 The shared market-regime guardrail **downsizes** risk-off and caution buys using configured multipliers/caps. A downsize becomes a rejection only when another reject rule applies or the result falls below one share. The live watch-buy path is stricter: risk-off remains a hard veto unless `KAI_EXEC_WATCH_BUY_LIVE_MARKET_REGIME_DOWNSIZE_ALLOWED=true`.
 
