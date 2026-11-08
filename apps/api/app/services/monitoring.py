@@ -13013,7 +13013,11 @@ def _derived_source_plan_item_id(entry_item: ExecutionPlanItem, suffix: str) -> 
     source = entry_item.source_plan_item_id
     if not source:
         return None
-    return f"{source}:{suffix}"
+    derived = f"{source}:{suffix}"
+    if len(derived) <= 128:
+        return derived
+    digest = json_payload_hash({"source": source, "suffix": suffix})
+    return f"post-entry-monitor:{digest}"
 
 
 def _post_entry_review_state(
