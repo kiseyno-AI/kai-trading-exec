@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, DecimalException, ROUND_DOWN
 from hashlib import sha256
 import hmac
+import json
+import logging
 from time import monotonic
 from typing import Iterator
 from zoneinfo import ZoneInfo
@@ -380,6 +382,8 @@ class RejectedOrderRetryLineageProof:
     automated_monitoring_family_identity: dict[str, object] | None = None
     automated_monitoring_family_error: str | None = None
 
+
+LOGGER = logging.getLogger(__name__)
 
 def _normalized_strategy_lane(value: object) -> str | None:
     if not isinstance(value, str):
@@ -1056,6 +1060,9 @@ def _place_broker_order_serialized(
                     "secret or complete reviewed operator remediation"
                 ),
             )
+        _recover_degraded_replay(
+            settings=settings, db=db, order=existing, command=logical_command
+        )
         return PlaceBrokerOrderResult(
             status_code=200,
             payload={
@@ -4769,118 +4776,141 @@ def _place_broker_order_serialized(
             },
         )
 
-    order.broker_order_id = placement.broker_order_id
-    apply_broker_order_status(order=order, status=placement.normalized_status.value)
-    order.submitted_at = placement.submitted_at
-    order.last_broker_sync_at = placement.observed_at
-    pre_ack_request_metadata = (
-        dict(order.request_metadata)
-        if isinstance(order.request_metadata, dict)
-        else {}
-    )
-    placement_request_metadata = (
-        dict(placement.request_metadata)
-        if isinstance(placement.request_metadata, dict)
-        else {}
-    )
-    order_request_metadata = _merge_order_request_metadata(
-        base={**pre_ack_request_metadata, **placement_request_metadata},
-        command=routed_command,
-        request_source=request_source,
-        route_decision=route_decision,
-        canonical_execution_scope=(
-            pre_ack_request_metadata.get("execution_scope")
-            if isinstance(pre_ack_request_metadata.get("execution_scope"), dict)
-            else None
-        ),
-    )
-    order_request_metadata = _preserve_decision_lineage(
-        request_metadata=order_request_metadata,
-        existing_order=order,
-    )
-    stable_account_scope = pre_ack_request_metadata.get("broker_account_scope")
-    if isinstance(stable_account_scope, dict):
-        # Broker acknowledgements may omit or echo arbitrary request metadata.
-        # The account scope was derived locally before submission and is an
-        # immutable attribution boundary for fills, PnL, and feedback.
-        order_request_metadata["broker_account_scope"] = stable_account_scope
-    stable_symbol_exposure_reservation = pre_ack_request_metadata.get(
-        SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY
-    )
-    if isinstance(stable_symbol_exposure_reservation, dict):
-        # This locally-derived valuation is part of the durable pre-submit
-        # reservation. A broker echo must not replace it after acknowledgement.
-        order_request_metadata[SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY] = (
-            stable_symbol_exposure_reservation
+    plan_item_id_for_recovery = plan_item.id if plan_item is not None else None
+    # Compare-and-set evidence for the degraded path: what the order and plan
+    # item looked like before this acknowledgement touched them.
+    order_status_before_ack = order.status
+    plan_item_state_before_ack = _plan_item_cas_state(plan_item)
+    try:
+        order.broker_order_id = placement.broker_order_id
+        apply_broker_order_status(order=order, status=placement.normalized_status.value)
+        order.submitted_at = placement.submitted_at
+        order.last_broker_sync_at = placement.observed_at
+        pre_ack_request_metadata = (
+            dict(order.request_metadata)
+            if isinstance(order.request_metadata, dict)
+            else {}
         )
-    if account_gate_decision is not None:
-        order_request_metadata["account_drawdown_recovery_policy"] = {
-            "policy_version": 1,
-            "recovery_scope": _account_drawdown_recovery_scope(
-                settings=settings,
-                provider=adapter.provider,
-                asset_class=logical_command.asset_class,
-                exchange=logical_command.exchange,
+        placement_request_metadata = (
+            dict(placement.request_metadata)
+            if isinstance(placement.request_metadata, dict)
+            else {}
+        )
+        order_request_metadata = _merge_order_request_metadata(
+            base={**pre_ack_request_metadata, **placement_request_metadata},
+            command=routed_command,
+            request_source=request_source,
+            route_decision=route_decision,
+            canonical_execution_scope=(
+                pre_ack_request_metadata.get("execution_scope")
+                if isinstance(pre_ack_request_metadata.get("execution_scope"), dict)
+                else None
             ),
-            "policy_fingerprint": recovery_policy_fingerprint(settings),
-        }
-    order.request_metadata = _redacted_payload(order_request_metadata) or {}
-    response_metadata = _redacted_payload(placement.response_metadata) or {}
-    if account_gate_decision is not None:
-        response_metadata["account_drawdown_gate"] = account_gate_decision.summary
-    order.response_metadata = _redacted_payload(response_metadata) or {}
-    order.last_error_classification = None
-    order.last_error_code = None
-    order.last_error_message = None
-    order.last_error_retryable = None
-    order.raw_broker_payload = _redacted_payload(placement.response_payload)
-    event_observed_at = _response_event_observed_at(
-        observed_at=placement.observed_at,
-        request_observed_at=request_observed_at,
-    )
-    db.add(
-        BrokerOrderEvent(
-            broker_order_pk=order.id,
-            event_type="submit_acknowledged",
-            event_source=BrokerEventSource.SUBMISSION.value,
-            normalized_status=order.status,
-            broker_status=placement.broker_status,
-            message=placement.message,
-            request_payload=_redacted_payload(placement.request_payload),
-            response_payload=_redacted_payload(placement.response_payload),
-            payload=_redacted_payload({"provider": adapter.provider}),
-            observed_at=event_observed_at,
         )
-    )
-    if plan_item is not None:
-        set_plan_item_status(
+        order_request_metadata = _preserve_decision_lineage(
+            request_metadata=order_request_metadata,
+            existing_order=order,
+        )
+        stable_account_scope = pre_ack_request_metadata.get("broker_account_scope")
+        if isinstance(stable_account_scope, dict):
+            # Broker acknowledgements may omit or echo arbitrary request metadata.
+            # The account scope was derived locally before submission and is an
+            # immutable attribution boundary for fills, PnL, and feedback.
+            order_request_metadata["broker_account_scope"] = stable_account_scope
+        stable_symbol_exposure_reservation = pre_ack_request_metadata.get(
+            SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY
+        )
+        if isinstance(stable_symbol_exposure_reservation, dict):
+            # This locally-derived valuation is part of the durable pre-submit
+            # reservation. A broker echo must not replace it after acknowledgement.
+            order_request_metadata[SYMBOL_EXPOSURE_RESERVATION_METADATA_KEY] = (
+                stable_symbol_exposure_reservation
+            )
+        if account_gate_decision is not None:
+            order_request_metadata["account_drawdown_recovery_policy"] = {
+                "policy_version": 1,
+                "recovery_scope": _account_drawdown_recovery_scope(
+                    settings=settings,
+                    provider=adapter.provider,
+                    asset_class=logical_command.asset_class,
+                    exchange=logical_command.exchange,
+                ),
+                "policy_fingerprint": recovery_policy_fingerprint(settings),
+            }
+        order.request_metadata = _redacted_payload(order_request_metadata) or {}
+        response_metadata = _redacted_payload(placement.response_metadata) or {}
+        if account_gate_decision is not None:
+            response_metadata["account_drawdown_gate"] = account_gate_decision.summary
+        order.response_metadata = _redacted_payload(response_metadata) or {}
+        order.last_error_classification = None
+        order.last_error_code = None
+        order.last_error_message = None
+        order.last_error_retryable = None
+        order.raw_broker_payload = _redacted_payload(placement.response_payload)
+        event_observed_at = _response_event_observed_at(
+            observed_at=placement.observed_at,
+            request_observed_at=request_observed_at,
+        )
+        db.add(
+            BrokerOrderEvent(
+                broker_order_pk=order.id,
+                event_type="submit_acknowledged",
+                event_source=BrokerEventSource.SUBMISSION.value,
+                normalized_status=order.status,
+                broker_status=placement.broker_status,
+                message=placement.message,
+                request_payload=_redacted_payload(placement.request_payload),
+                response_payload=_redacted_payload(placement.response_payload),
+                payload=_redacted_payload({"provider": adapter.provider}),
+                observed_at=event_observed_at,
+            )
+        )
+        if plan_item is not None:
+            set_plan_item_status(
+                db=db,
+                plan_item=plan_item,
+                status=_plan_item_status_for_order_status(order.status),
+                source="broker_order_service",
+                reason=placement.message,
+                payload={
+                    "broker_order_pk": order.id,
+                    "broker_order_id": placement.broker_order_id,
+                    "idempotency_key": order.idempotency_key,
+                    "event_type": "submit_acknowledged",
+                },
+            )
+
+        _record_upbit_paper_simulated_fill(
+            settings=settings,
             db=db,
+            order=order,
+            command=routed_command,
             plan_item=plan_item,
-            status=_plan_item_status_for_order_status(order.status),
-            source="broker_order_service",
-            reason=placement.message,
-            payload={
-                "broker_order_pk": order.id,
-                "broker_order_id": placement.broker_order_id,
-                "idempotency_key": order.idempotency_key,
-                "event_type": "submit_acknowledged",
-            },
+            observed_at=event_observed_at + timedelta(microseconds=1),
         )
 
-    _record_upbit_paper_simulated_fill(
-        settings=settings,
-        db=db,
-        order=order,
-        command=routed_command,
-        plan_item=plan_item,
-        observed_at=event_observed_at + timedelta(microseconds=1),
-    )
-
-    # Persist the broker acknowledgement before optional post-submit bookkeeping.
-    # That bookkeeping can be retried or repaired, while a lost broker order id
-    # can otherwise turn a harmless retry into a duplicate external order.
-    db.commit()
-    db.refresh(order)
+        # Persist the broker acknowledgement before optional post-submit bookkeeping.
+        # That bookkeeping can be retried or repaired, while a lost broker order id
+        # can otherwise turn a harmless retry into a duplicate external order.
+        db.commit()
+        db.refresh(order)
+    except Exception as ack_persistence_failure:
+        # The broker has already accepted the order. Losing its id here would
+        # leave an accepted order looking like an unsent request until a later
+        # reconciliation finds it, so persist the minimum durable acknowledgement
+        # instead of surfacing a 500. A replay of this idempotency key then
+        # returns the stored order and never resubmits.
+        order = _persist_degraded_broker_acknowledgement(
+            settings=settings,
+            db=db,
+            idempotency_key=command.idempotency_key,
+            plan_item_id=plan_item_id_for_recovery,
+            placement=placement,
+            failure=ack_persistence_failure,
+            command=routed_command,
+            order_status_before_ack=order_status_before_ack,
+            plan_item_state_before_ack=plan_item_state_before_ack,
+        )
 
     if before_success_commit is not None:
         before_success_commit()
@@ -4897,6 +4927,278 @@ def _place_broker_order_serialized(
             "message": placement.message or "broker order submitted",
             "order": serialize_broker_order(persisted or order, include_events=True),
         },
+    )
+
+
+DEGRADED_ACK_EVENT_TYPE = "submit_acknowledged_degraded"
+# Plan-item statuses that only mirror this order's own submission. A replay may
+# advance such an item to the simulated fill; any other status belongs to
+# someone else (a Core revocation, a fence, an operator) and is left alone.
+_ORDER_MIRROR_PLAN_ITEM_STATUSES = frozenset(
+    {
+        "broker_order_submission_pending",
+        "broker_order_submitted",
+        "broker_order_open",
+    }
+)
+
+
+def _plan_item_cas_state(plan_item: ExecutionPlanItem | None) -> tuple[str, str] | None:
+    """Status plus a canonical hash of the risk context (where fences and Core
+    authority projections live)."""
+
+    if plan_item is None:
+        return None
+    risk = plan_item.risk_context if isinstance(plan_item.risk_context, dict) else {}
+    digest = sha256(
+        json.dumps(risk, sort_keys=True, default=str, separators=(",", ":")).encode()
+    ).hexdigest()
+    return str(plan_item.status), digest
+
+
+def _persist_degraded_broker_acknowledgement(
+    *,
+    settings: Settings,
+    db: Session,
+    idempotency_key: str,
+    plan_item_id: str | None,
+    placement: object,
+    failure: Exception,
+    command: PlaceOrderRequest,
+    order_status_before_ack: str,
+    plan_item_state_before_ack: tuple[str, str] | None,
+) -> BrokerOrder:
+    """Record the minimum durable broker acknowledgement after bookkeeping failed.
+
+    Called when the broker accepted an order (``adapter.place_order`` returned)
+    but persisting the full acknowledgement raised. Every write is a
+    compare-and-set against the state before the acknowledgement, so this path
+    never undoes progress or someone else's decision:
+
+    * if the full acknowledgement already committed (the failure came after the
+      commit), nothing is changed -- a filled order stays filled;
+    * the order status is set from the broker response only while the stored
+      status is still the pre-acknowledgement one;
+    * the plan item is updated only while its status and risk context are
+      unchanged, so a Core revocation or fence that landed meanwhile survives;
+    * an Upbit paper order gets its local simulated fill retried, which a later
+      replay of the same idempotency key also retries.
+
+    If the minimal write fails the error propagates; the log carries the
+    idempotency key and broker order id an operator needs to reconcile by hand.
+    """
+
+    broker_order_id = getattr(placement, "broker_order_id", None)
+    LOGGER.critical(
+        "broker_acknowledgement_persistence_failed",
+        extra={
+            "idempotency_key": idempotency_key,
+            "broker_order_id": broker_order_id,
+            "exception_type": type(failure).__name__,
+        },
+        exc_info=failure,
+    )
+    db.rollback()
+    try:
+        order = _load_order_by_idempotency_key(
+            settings=settings,
+            db=db,
+            idempotency_key=idempotency_key,
+        )
+        if order is None:
+            raise failure
+        db.refresh(order, with_for_update=True)
+        if order.broker_order_id is not None:
+            if order.broker_order_id != broker_order_id:
+                raise RuntimeError(
+                    "stored broker order id differs from the acknowledgement"
+                ) from failure
+            # The full acknowledgement is already durable; the failure came
+            # after its commit. Rewriting anything here could only regress it.
+            LOGGER.warning(
+                "broker_acknowledgement_already_durable",
+                extra={"idempotency_key": idempotency_key, "status": order.status},
+            )
+            db.rollback()
+            return order
+        observed_at = getattr(placement, "observed_at", None) or datetime.now(UTC)
+        order.broker_order_id = broker_order_id
+        status_applied = order.status == order_status_before_ack
+        if status_applied:
+            apply_broker_order_status(
+                order=order, status=placement.normalized_status.value  # type: ignore[attr-defined]
+            )
+        order.submitted_at = getattr(placement, "submitted_at", None)
+        order.last_broker_sync_at = observed_at
+        db.add(
+            BrokerOrderEvent(
+                broker_order_pk=order.id,
+                event_type=DEGRADED_ACK_EVENT_TYPE,
+                event_source=BrokerEventSource.SUBMISSION.value,
+                normalized_status=order.status,
+                broker_status=getattr(placement, "broker_status", None),
+                message=(
+                    "broker accepted the order but full acknowledgement bookkeeping "
+                    "failed; minimal acknowledgement recorded"
+                ),
+                payload=_redacted_payload(
+                    {
+                        "broker_order_id": broker_order_id,
+                        "bookkeeping_exception_type": type(failure).__name__,
+                        "status_applied": status_applied,
+                    }
+                ),
+                observed_at=observed_at,
+            )
+        )
+        db.commit()
+        db.refresh(order)
+    except Exception:
+        db.rollback()
+        LOGGER.critical(
+            "broker_acknowledgement_degraded_persistence_failed",
+            extra={
+                "idempotency_key": idempotency_key,
+                "broker_order_id": broker_order_id,
+            },
+            exc_info=True,
+        )
+        raise
+    plan_item_updated = False
+    if plan_item_id is not None:
+        # Best effort: the order acknowledgement above is already durable.
+        try:
+            plan_item = db.get(
+                ExecutionPlanItem,
+                plan_item_id,
+                with_for_update=True,
+                options=[undefer(ExecutionPlanItem.risk_context)],
+            )
+            if plan_item is not None and _plan_item_cas_state(plan_item) == plan_item_state_before_ack:
+                set_plan_item_status(
+                    db=db,
+                    plan_item=plan_item,
+                    status=_plan_item_status_for_order_status(order.status),
+                    source="broker_order_service",
+                    reason="broker acknowledgement recorded in degraded mode",
+                    payload={
+                        "broker_order_pk": order.id,
+                        "broker_order_id": broker_order_id,
+                        "idempotency_key": idempotency_key,
+                        "event_type": DEGRADED_ACK_EVENT_TYPE,
+                    },
+                )
+                db.commit()
+                plan_item_updated = True
+            else:
+                db.rollback()
+                LOGGER.warning(
+                    "broker_acknowledgement_plan_item_changed_since_submission",
+                    extra={"idempotency_key": idempotency_key, "plan_item_id": plan_item_id},
+                )
+        except Exception:
+            db.rollback()
+            LOGGER.exception(
+                "broker_acknowledgement_plan_item_status_failed",
+                extra={"idempotency_key": idempotency_key},
+            )
+    _retry_paper_simulated_fill(
+        settings=settings,
+        db=db,
+        order=order,
+        command=command,
+        update_plan_item=plan_item_updated,
+    )
+    return order
+
+
+def _retry_paper_simulated_fill(
+    *,
+    settings: Settings,
+    db: Session,
+    order: BrokerOrder,
+    command: PlaceOrderRequest,
+    update_plan_item: bool,
+) -> None:
+    """Best effort: complete an Upbit paper order's local fill if it is missing.
+
+    Paper orders have no broker that a reconciliation could ask, so a fill the
+    simulator never wrote would otherwise stay missing for good. Idempotent:
+    an existing simulated fill or a non-open order is left alone.
+    """
+
+    if command.provider != "upbit" or settings.runtime_mode != "paper":
+        return
+    try:
+        db.refresh(order, with_for_update=True)
+        open_statuses = {
+            NormalizedBrokerOrderStatus.SUBMITTED.value,
+            NormalizedBrokerOrderStatus.OPEN.value,
+        }
+        already_filled = db.scalar(
+            select(ExecutionFill.id).where(
+                ExecutionFill.broker_order_pk == order.id,
+                ExecutionFill.broker_fill_id == f"paper-fill:{order.idempotency_key}",
+            )
+        )
+        if order.status not in open_statuses or already_filled is not None:
+            db.rollback()
+            return
+        plan_item = (
+            db.get(ExecutionPlanItem, order.execution_plan_item_id, with_for_update=True)
+            if update_plan_item and order.execution_plan_item_id
+            else None
+        )
+        _record_upbit_paper_simulated_fill(
+            settings=settings,
+            db=db,
+            order=order,
+            command=command,
+            plan_item=plan_item,
+            observed_at=datetime.now(UTC),
+        )
+        db.commit()
+        db.refresh(order)
+    except Exception:
+        db.rollback()
+        LOGGER.exception(
+            "paper_simulated_fill_retry_failed",
+            extra={"idempotency_key": order.idempotency_key},
+        )
+
+
+def _recover_degraded_replay(
+    *,
+    settings: Settings,
+    db: Session,
+    order: BrokerOrder,
+    command: PlaceOrderRequest,
+) -> None:
+    """On a replay of a degraded acknowledgement, retry what the degraded path could not."""
+
+    if command.provider != "upbit" or settings.runtime_mode != "paper":
+        return
+    degraded = db.scalar(
+        select(BrokerOrderEvent.id).where(
+            BrokerOrderEvent.broker_order_pk == order.id,
+            BrokerOrderEvent.event_type == DEGRADED_ACK_EVENT_TYPE,
+        )
+    )
+    if degraded is None:
+        return
+    plan_item = (
+        db.get(ExecutionPlanItem, order.execution_plan_item_id)
+        if order.execution_plan_item_id
+        else None
+    )
+    _retry_paper_simulated_fill(
+        settings=settings,
+        db=db,
+        order=order,
+        command=command,
+        update_plan_item=(
+            plan_item is not None and plan_item.status in _ORDER_MIRROR_PLAN_ITEM_STATUSES
+        ),
     )
 
 
