@@ -51,6 +51,52 @@ def test_default_downside_guardrails_are_conservative_after_loss_week() -> None:
     assert settings.exec_agent_watch_sizing_timeout_seconds == 900
 
 
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_market_regime_treats_nonfinite_breadth_as_incomplete(value: str) -> None:
+    evaluated_at = datetime(2026, 7, 15, 0, 5, tzinfo=UTC)
+    result = evaluate_market_regime_guardrail(
+        settings=Settings(),
+        context={
+            "market_breadth": {
+                "market_date": "2026-07-15",
+                "observed_at": evaluated_at.isoformat(),
+                "up_ratio": value,
+                "advance_decline_ratio": value,
+            },
+        },
+        original_notional=Decimal("1000000"),
+        original_quantity=10,
+        reference_price=Decimal("100000"),
+        now=evaluated_at,
+    )
+
+    assert result.action == "downsize"
+    assert result.reason_code == "market_breadth_incomplete_caution"
+    assert result.audit["breadth"]["up_ratio"] is None
+    assert result.audit["breadth"]["advance_decline_ratio"] is None
+    assert "market_breadth_incomplete" in result.audit["warnings"]
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_market_regime_keeps_nonfinite_sector_exposure_unknown(value: str) -> None:
+    result = evaluate_market_regime_guardrail(
+        settings=Settings(),
+        context={
+            "sector_context": {
+                "sector_name": "semiconductor",
+                "relative_state": "weak",
+                "same_sector_exposure_count": value,
+            },
+        },
+        original_notional=Decimal("1000000"),
+        now=datetime(2026, 7, 15, 0, 5, tzinfo=UTC),
+    )
+
+    assert result.action == "downsize"
+    assert result.audit["sector"]["same_sector_exposure_count"] is None
+    assert "sector_account_exposure_unavailable" in result.audit["warnings"]
+
+
 def test_live_market_regime_omits_stale_plan_day_sector_context() -> None:
     evaluated_at = datetime(2026, 7, 15, 0, 5, tzinfo=UTC)
     result = evaluate_market_regime_guardrail(
