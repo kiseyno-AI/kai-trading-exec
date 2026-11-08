@@ -1,5 +1,7 @@
 # ARCHITECTURE
 
+For source-traced implementation diagrams, daily runtime flow, worker defaults, and feature boundaries, see the [runtime architecture catalog](docs/architecture/README.md). The delivery phases below are design notes, not a measurement of deployed capabilities. The [2026-11-08 audit checkpoint](docs/audit/2026-11-08-checkpoint.md) records the incomplete correctness review and unpublished local patches.
+
 ## Mission
 
 Keep real trading execution and monitoring alive, isolated, and auditable even when `kai-trading-core` is restarted, redeployed, or temporarily unhealthy.
