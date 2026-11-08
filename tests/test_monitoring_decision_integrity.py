@@ -5945,7 +5945,13 @@ def test_watch_queue_ignores_cross_lane_signal_alignment_and_warnings(
     ) == 0
 
 
-def test_watch_queue_does_not_prioritize_caller_supplied_full_cost_economics() -> None:
+@pytest.mark.parametrize(
+    "non_ascii_provenance_field",
+    (None, "route_fingerprint", "liquidity_evidence_hash", "material_hash", "binding"),
+)
+def test_watch_queue_does_not_prioritize_caller_supplied_full_cost_economics(
+    non_ascii_provenance_field: str | None,
+) -> None:
     settings = Settings(
         database_url="sqlite:///:memory:",
         runtime_mode="live",
@@ -6035,6 +6041,16 @@ def test_watch_queue_does_not_prioritize_caller_supplied_full_cost_economics() -
                 ),
                 evaluated_at=evaluated_at,
             )
+        elif non_ascii_provenance_field is not None:
+            evidence = risk_context["exec_trigger_time_full_cost_economics_v1"]
+            provenance = monitoring_service._trigger_time_full_cost_economics_provenance(
+                settings=settings,
+                item=item,
+                evidence=evidence,
+            )
+            assert provenance is not None
+            provenance[non_ascii_provenance_field] = "잘못된 증거"
+            evidence["provenance"] = provenance
         return item
 
     forged = watch_item(symbol="900011", forged=True)

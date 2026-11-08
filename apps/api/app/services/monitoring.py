@@ -2376,6 +2376,13 @@ def _trigger_time_full_cost_economics_provenance_is_valid(
         "binding",
     }:
         return False
+    if any(
+        not str(provenance.get(field) or "").isascii()
+        for field in (
+            "route_fingerprint", "liquidity_evidence_hash", "material_hash", "binding"
+        )
+    ):
+        return False
     if (
         provenance.get("version")
         != TRIGGER_TIME_FULL_COST_ECONOMICS_PROVENANCE_VERSION
