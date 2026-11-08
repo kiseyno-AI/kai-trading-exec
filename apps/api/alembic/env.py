@@ -15,7 +15,7 @@ if config.config_file_name is not None:
 
 settings = get_settings()
 ensure_database_parent_dir(settings.database_url)
-config.set_main_option("sqlalchemy.url", settings.database_url)
+config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 target_metadata = Base.metadata
 
 
