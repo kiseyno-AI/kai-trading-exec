@@ -3104,6 +3104,57 @@ def test_trade_outcome_feedback_portfolio_risk_and_sell_reason_contributions(tmp
     engine.dispose()
 
 
+def test_feedback_sector_weights_remain_unknown_for_incomplete_currency_values(tmp_path) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="incomplete-sector-plan",
+        external_plan_id="incomplete-sector-plan",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    for index, (symbol, average_price) in enumerate(
+        [("005930", Decimal("100")), ("000660", None)]
+    ):
+        session.add_all(
+            [
+                ExecutionPlanItem(
+                    plan=plan,
+                    plan_item_index=index,
+                    symbol=symbol,
+                    side="buy",
+                    intent="next_open_buy",
+                    status="filled",
+                    risk_context={"sector": "Semiconductors"},
+                ),
+                ExecutionPosition(
+                    mode="paper",
+                    symbol=symbol,
+                    quantity=1,
+                    average_price=average_price,
+                    updated_from="broker_reconciliation",
+                ),
+            ]
+        )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC)
+    )
+
+    risk = report["portfolio_risk"]
+    assert risk["positions_missing_market_value_count"] == 1
+    assert risk["total_market_value"] is None
+    assert len(risk["sector_concentration"]) == 1
+    sector = risk["sector_concentration"][0]
+    assert sector["market_value"] == "100.0000"
+    assert sector["currency_weight_pct"] is None
+    assert sector["portfolio_weight_pct"] is None
+    session.close()
+    engine.dispose()
+
+
 def test_trade_outcome_feedback_sector_lookup_caps_each_symbol(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(

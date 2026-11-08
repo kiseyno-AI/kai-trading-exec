@@ -3164,6 +3164,7 @@ def _sector_concentration(
     rows = []
     for (sector, currency), values in stats.items():
         value = sum(values, Decimal("0"))
+        currency_total = totals_by_currency.get(currency) if currency is not None else None
         rows.append(
             {
                 "sector": sector,
@@ -3179,8 +3180,8 @@ def _sector_concentration(
                     else None
                 ),
                 "currency_weight_pct": _decimal_text(
-                    (value / totals_by_currency[currency] * Decimal("100"))
-                    if currency is not None and totals_by_currency[currency] > 0
+                    (value / currency_total * Decimal("100"))
+                    if currency_total is not None and currency_total > 0
                     else None
                 ),
             }
