@@ -63,6 +63,33 @@ def test_non_loopback_api_requires_bearer_token() -> None:
         )
 
 
+def test_non_ascii_bearer_token_is_rejected_without_calling_route() -> None:
+    app, engine = _app(
+        Settings(
+            database_url="sqlite:///:memory:",
+            api_bearer_token="internal-secret",
+        )
+    )
+    route_called = False
+
+    @app.post("/protected")
+    async def protected() -> dict:
+        nonlocal route_called
+        route_called = True
+        return {"ok": True}
+
+    try:
+        response = TestClient(app).post(
+            "/protected", headers={b"Authorization": b"Bearer invalid-\xff"}
+        )
+        assert response.status_code == 401
+        assert response.headers["www-authenticate"] == "Bearer"
+        assert response.json() == {"detail": "Unauthorized"}
+        assert route_called is False
+    finally:
+        engine.dispose()
+
+
 def test_non_loopback_api_allows_configured_bearer_token() -> None:
     app, engine = _app(
         Settings(
