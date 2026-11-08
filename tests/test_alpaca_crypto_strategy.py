@@ -266,6 +266,36 @@ def _seed_protected_strategy_position(
     return coordinator_scope, route_scope
 
 
+@pytest.mark.parametrize("field", ["h", "v"])
+def test_daily_bar_import_skips_infinite_values_before_persistence(field: str) -> None:
+    settings = _settings()
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    valid = {
+        "t": "2026-08-15T00:00:00+00:00",
+        "o": "100",
+        "h": "101",
+        "l": "99",
+        "c": "100",
+        "v": "10",
+    }
+    invalid = {**valid, "t": "2026-08-14T00:00:00+00:00", field: "Infinity"}
+    with session_factory() as db:
+        normalized = strategy_module._normalize_and_persist_bars(
+            db=db,
+            raw_bars={"BTC/USD": [invalid, valid]},
+            observed_at=datetime(2026, 8, 17, 0, 20, tzinfo=UTC),
+        )
+        db.commit()
+
+        assert [bar.bar_date for bar in normalized["BTC/USD"]] == [date(2026, 8, 15)]
+        persisted = db.query(CryptoDailyBar).all()
+        assert len(persisted) == 1
+        assert persisted[0].high_price == Decimal("101")
+        assert persisted[0].volume == Decimal("10")
+
+
 def test_daily_cycle_persists_signals_stops_and_submits_once_per_closed_bar(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

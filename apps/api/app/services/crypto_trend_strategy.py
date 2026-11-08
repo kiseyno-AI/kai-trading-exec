@@ -54,7 +54,10 @@ class DailyBar:
             raise ValueError("symbol is required")
         object.__setattr__(self, "symbol", symbol)
         for field_name in ("open", "high", "low", "close", "volume"):
-            object.__setattr__(self, field_name, _decimal(getattr(self, field_name)))
+            value = _decimal(getattr(self, field_name))
+            if not value.is_finite():
+                raise ValueError("OHLC prices and volume must be finite")
+            object.__setattr__(self, field_name, value)
         if min(self.open, self.high, self.low, self.close) <= ZERO:
             raise ValueError("OHLC prices must be positive")
         if self.volume < ZERO:
