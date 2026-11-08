@@ -47,6 +47,44 @@ from app.services.runtime_controls import ControlCommand, resume_runtime
 OBSERVED_AT = datetime(2026, 9, 11, 14, 30, tzinfo=UTC)
 
 
+@pytest.mark.parametrize("message", [
+    "service unavailable", "invalid device credentials", "account privileges denied",
+    "private endpoint rejected",
+])
+def test_rejection_words_containing_vi_do_not_authorize_market_retries(message: str) -> None:
+    order = BrokerOrder(broker_name="kis", side="buy")
+
+    result = rejected_order_retries_service.classify_rejected_order(
+        order=order, payload={"reject_reason_message": message},
+    )
+
+    assert result.classification == "unknown_reject"
+    assert result.retryable is False
+    assert result.temporary_reason is None
+
+
+@pytest.mark.parametrize(("message", "reason"), [
+    ("VI active", "volatility_interruption"),
+    ("volatility interruption", "volatility_interruption"),
+    ("변동성완화", "volatility_interruption"),
+    ("(VI)", "orderability_window"),
+    ("VI발동", "orderability_window"),
+    ("market closed", "orderability_window"),
+])
+def test_explicit_vi_and_market_rejection_classifications_are_preserved(
+    message: str, reason: str
+) -> None:
+    order = BrokerOrder(broker_name="kis", side="buy")
+
+    result = rejected_order_retries_service.classify_rejected_order(
+        order=order, payload={"reject_reason_message": message},
+    )
+
+    assert result.classification == "temporary_market_state"
+    assert result.retryable is True
+    assert result.temporary_reason == reason
+
+
 def test_retry_snapshot_coverage_uses_typed_completeness_for_every_provider() -> None:
     with pytest.raises(Exception, match="retry_broker_open_orders_incomplete"):
         rejected_order_retries_service._validate_snapshot_open_order_coverage(
