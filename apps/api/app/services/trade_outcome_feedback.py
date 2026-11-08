@@ -4756,9 +4756,10 @@ def _stored_tightened_exit_execution_evidence(
             and Decimal("0") < low_price <= tightened_stop
             and interval_started_at is not None
             and interval_started_at > tighten_recorded_at
-            and interval_started_at <= sell_filled_at
+            and observed_at is not None
+            and interval_started_at <= observed_at <= sell_filled_at
         ):
-            candidates.append((interval_started_at, low_price, "stored_ohlc_low"))
+            candidates.append((observed_at, low_price, "stored_ohlc_low"))
             continue
 
         if (

@@ -3903,6 +3903,75 @@ def test_candidate_rule_replay_uses_stored_tradable_price_below_tightened_stop(t
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("observed_at", "eligible"),
+    [
+        (None, False),
+        ("2026-06-12T05:00:00+00:00", False),
+        ("2026-06-10T04:30:00+00:00", False),
+        ("2026-06-10T05:05:00+00:00", True),
+    ],
+)
+def test_tightened_exit_ohlc_replay_requires_timely_observation(
+    tmp_path, observed_at, eligible
+) -> None:
+    engine, session = _session()
+    settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
+    plan = ExecutionPlan(
+        id="ohlc-observation-plan",
+        external_plan_id="ohlc-observation-plan",
+        source="kai-trading-core",
+        mode="paper",
+    )
+    session.add(plan)
+    _add_closed_trade(
+        session,
+        plan=plan,
+        suffix="ohlc-observation",
+        symbol="005930",
+        buy_price="100",
+        sell_price="97",
+        filled_day=10,
+        risk_context={
+            "post_entry_review": {
+                "reasons": [
+                    "gap_down_breached_risk_threshold",
+                    "next_day_no_progress",
+                    "max_holding_without_progress",
+                ],
+                "tightened_stop_price": "99",
+                "recorded_at": "2026-06-10T04:00:00+00:00",
+                "exit_execution_evidence": {
+                    "low": "95",
+                    "interval_started_at": "2026-06-10T05:00:00+00:00",
+                    "observed_at": observed_at,
+                },
+            }
+        },
+    )
+    session.commit()
+
+    report = generate_trade_outcome_feedback(
+        settings=settings, db=session, as_of=datetime(2026, 6, 20, tzinfo=UTC)
+    )
+
+    tightened = next(
+        row for row in report["candidate_rule_replay"]["rules"]
+        if row["rule_id"] == "post_entry_no_progress_exit_tighten"
+    )
+    evidence = tightened["top_matched_examples"][0]["evidence"]
+    assert evidence["replay_eligible"] is eligible
+    if eligible:
+        assert evidence["execution_evidence_source"] == "stored_ohlc_low"
+        assert evidence["execution_evidence_observed_at"] == observed_at
+        assert tightened["net_pnl_delta_krw"] == "-20.0000"
+    else:
+        assert evidence["replay_status"] == "missing_post_tighten_execution_evidence"
+        assert tightened["net_pnl_delta_krw"] == "0.0000"
+    session.close()
+    engine.dispose()
+
+
 def test_candidate_rule_replay_does_not_promote_three_tightens_without_price_path(tmp_path) -> None:
     engine, session = _session()
     settings = Settings(runtime_mode="paper", trade_outcome_feedback_dir=str(tmp_path))
