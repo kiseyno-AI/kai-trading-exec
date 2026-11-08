@@ -2,7 +2,9 @@
 
 **Status: incomplete; the application patch set has not been published or fully validated.**
 
-This remote branch preserves English architecture documentation and this checkpoint. The source and test changes described as local below remain in the audit checkout, which became unavailable before final testing and publication. **They are not included in this documentation-only commit.** A newly added stale-reconciliation regression still fails, and the existing monitoring failure remains unresolved. No task change was merged to `main`.
+This checkpoint accompanies the English architecture documentation. The source and test changes described as local below were last observed in the audit checkout before final testing and publication; their survival could not be confirmed after workspace reconnection. **They are not included in this documentation-only commit.** At interruption, a newly added stale-reconciliation regression was still failing and the monitoring failure remained unresolved. The user authorized promotion of the README and connected documentation to `main`; no application/source-code or test change from this audit is included in that promotion.
+
+**Workspace reconnection update:** On reconnection, the earlier uncommitted audit patches and scratch test artifacts could not be located in the available workspace; the earlier Exec audit checkout was also absent. The findings and test results below describe the last observed pre-interruption work. They do not establish that those source patches are currently available. Code changes must be recovered or recreated and validated before publication.
 
 ## Baseline and scope
 
@@ -135,7 +137,7 @@ The code-only Graphify map contained **8,756 nodes, 42,110 edges, and 202 commun
 
 ## Safe continuation and publication gate
 
-1. Restore the local checkout and inspect the full uncommitted diff; preserve the new regressions and known-good focused fixes.
+1. Recover or recreate the earlier local source fixes and regressions; the previous Exec checkout and uncommitted audit patches were not found after workspace reconnection.
 2. Implement EXEC-5 and validate stale observations alongside concurrent cumulative-fill handling.
 3. Diagnose the first-cycle monitoring timeout without weakening production gates to satisfy a fixture.
 4. Continue the missing manual review and reproduce additional findings before changing behavior.
