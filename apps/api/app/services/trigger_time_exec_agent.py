@@ -2090,7 +2090,6 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> None:
         pass
     try:
         process.wait(timeout=0.5)
-        return
     except subprocess.TimeoutExpired:
         pass
     try:
