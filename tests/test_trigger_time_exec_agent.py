@@ -63,6 +63,48 @@ from test_broker_auth import (
 )
 
 
+@pytest.mark.parametrize(
+    "malformed_field",
+    [
+        None,
+        "bid",
+        "ask",
+        "spread",
+        "spread_bps",
+        "orderbook_depth",
+        "orderbook_imbalance",
+        "volume",
+        "turnover",
+        "day_high",
+        "day_low",
+    ],
+)
+def test_live_market_quality_reports_malformed_numbers_without_raising(
+    malformed_field: str | None,
+) -> None:
+    fields = {
+        "bid": "100",
+        "ask": "101",
+        "spread": "1",
+        "spread_bps": "100",
+        "orderbook_depth": "10",
+        "orderbook_imbalance": "0.2",
+        "volume": "1000",
+        "turnover": "100000",
+        "day_high": "110",
+        "day_low": "90",
+    }
+    if malformed_field is not None:
+        fields[malformed_field] = "not-a-number"
+
+    assert trigger_time_exec_agent._live_execution_quality_invalid_fields(
+        **fields,
+        require_intraday_range=True,
+        session_type="regular",
+        normal_ordering_available=True,
+    ) == ([] if malformed_field is None else [malformed_field])
+
+
 @pytest.mark.parametrize("exchange", ["KRX", "KOSPI", "KOSDAQ", "NXT", "SOR"])
 def test_live_market_buy_authority_gate_covers_all_domestic_kis_routes(
     exchange: str,
