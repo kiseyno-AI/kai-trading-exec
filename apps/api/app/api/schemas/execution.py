@@ -545,7 +545,7 @@ class CoreExecutionPlanRequestV4(BaseModel):
             if item.quantity_policy.get("type") != "position_exit_from_entry":
                 raise ValueError("protective exit quantity_policy.type is invalid")
             linked_entry_key = item.quantity_policy.get("linked_entry_item_key")
-            entry = entries.get(linked_entry_key)
+            entry = entries.get(linked_entry_key) if isinstance(linked_entry_key, str) else None
             if entry is None:
                 raise ValueError("protective exit must reference an in-request buy")
             if (

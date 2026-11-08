@@ -1448,6 +1448,35 @@ def test_v4_intake_rejects_executable_fields_in_delegated_buy_policy(
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("linked_entry_key", "expected_status"),
+    [
+        pytest.param([], 422, id="list"),
+        pytest.param({}, 422, id="object"),
+        pytest.param(None, 422, id="missing"),
+        pytest.param("unknown-entry", 422, id="unknown"),
+        pytest.param("core-plan-1:next_open_buy", 201, id="valid"),
+    ],
+)
+def test_v4_intake_validates_protective_exit_link_shape(
+    linked_entry_key: object,
+    expected_status: int,
+) -> None:
+    app, engine = _build_test_app()
+    client = TestClient(app, raise_server_exceptions=False)
+    payload = _plan_payload(plan_id="core-v4-protective-exit-link")
+    payload["items"][1]["quantity_policy"]["linked_entry_item_key"] = linked_entry_key
+    _refresh_material_fingerprint(payload)
+
+    response = client.post("/v4/execution-plans", json=payload)
+
+    assert response.status_code == expected_status, response.text
+    with app.state.db_session_factory() as session:
+        plan = session.scalar(select(ExecutionPlan))
+        assert (plan is not None) is (expected_status == 201)
+    engine.dispose()
+
+
 def test_v4_intake_rejects_timezone_naive_request_timestamp() -> None:
     app, engine = _build_test_app()
     client = TestClient(app)
