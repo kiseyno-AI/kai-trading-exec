@@ -586,9 +586,10 @@ def _decimal_value(value: Any) -> Decimal | None:
     if value is None:
         return None
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except Exception:
         return None
+    return parsed if parsed.is_finite() else None
 
 
 def _first_decimal_value(payload: dict[str, object], *, keys: tuple[str, ...]) -> Decimal | None:

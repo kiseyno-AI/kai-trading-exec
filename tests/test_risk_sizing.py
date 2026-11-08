@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
+
 from app.core.config import Settings, load_settings
 from app.services.risk_sizing import (
     RiskSizingRejection,
@@ -329,6 +331,38 @@ def test_risk_sizing_missing_data_can_be_conservative() -> None:
     assert decision.quantity == 15
     assert decision.cap_details["missing_data_behavior"] == "conservative"
     assert decision.cap_details["missing_data_reasons"] == "missing_volatility,missing_correlation"
+    assert decision.cap_details["vol_corr_cap_reason"] == "missing_data_conservative"
+
+
+@pytest.mark.parametrize("value", ["NaN", "sNaN", "Infinity", "-Infinity"])
+@pytest.mark.parametrize("field", ["realized_volatility_pct", "max_holding_correlation"])
+def test_risk_sizing_nonfinite_context_uses_existing_missing_data_policy(field, value) -> None:
+    settings = Settings(
+        vol_corr_sizing_enabled=True,
+        vol_corr_missing_data_behavior="conservative",
+        vol_corr_missing_data_multiplier=Decimal("0.50"),
+    )
+    context = {
+        "holding_symbols": ["000660"],
+        "realized_volatility_pct": "2.0",
+        "max_holding_correlation": "0.5",
+        field: value,
+    }
+    decision = resolve_risk_based_buy_quantity(
+        settings=settings,
+        account_basis=Decimal("10000000"),
+        available_cash=Decimal("10000000"),
+        entry_price=Decimal("100000"),
+        stop_price=Decimal("95000"),
+        confidence=Decimal("0.70"),
+        vol_corr_context=context,
+    )
+
+    assert isinstance(decision, RiskSizingResult)
+    assert decision.quantity == 15
+    assert decision.cap_details["missing_data_reasons"] == (
+        "missing_volatility" if field == "realized_volatility_pct" else "missing_correlation"
+    )
     assert decision.cap_details["vol_corr_cap_reason"] == "missing_data_conservative"
 
 
