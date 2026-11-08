@@ -5131,6 +5131,20 @@ def _retry_paper_simulated_fill(
     if command.provider != "upbit" or settings.runtime_mode != "paper":
         return
     try:
+        # Legacy Core fencing locks the plan item before its linked orders.
+        plan_item = (
+            db.get(
+                ExecutionPlanItem,
+                order.execution_plan_item_id,
+                with_for_update=True,
+                populate_existing=True,
+                options=[undefer(ExecutionPlanItem.risk_context)],
+            )
+            if expected_plan_item_state is not None and order.execution_plan_item_id
+            else None
+        )
+        if _plan_item_cas_state(plan_item) != expected_plan_item_state:
+            plan_item = None
         db.refresh(order, with_for_update=True)
         open_statuses = {
             NormalizedBrokerOrderStatus.SUBMITTED.value,
@@ -5145,19 +5159,6 @@ def _retry_paper_simulated_fill(
         if order.status not in open_statuses or already_filled is not None:
             db.rollback()
             return
-        plan_item = (
-            db.get(
-                ExecutionPlanItem,
-                order.execution_plan_item_id,
-                with_for_update=True,
-                populate_existing=True,
-                options=[undefer(ExecutionPlanItem.risk_context)],
-            )
-            if expected_plan_item_state is not None and order.execution_plan_item_id
-            else None
-        )
-        if _plan_item_cas_state(plan_item) != expected_plan_item_state:
-            plan_item = None
         _record_upbit_paper_simulated_fill(
             settings=settings,
             db=db,
