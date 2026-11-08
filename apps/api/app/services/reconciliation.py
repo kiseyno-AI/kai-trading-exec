@@ -248,6 +248,26 @@ def reconcile_broker_order(
             operator_reason=operator_reason,
         )
 
+    # Serialize durable deltas after the broker read, using current fill history.
+    if db.get_bind().dialect.name == "sqlite":
+        table = BrokerOrder.__table__
+        db.execute(
+            update(table)
+            .where(table.c.id == order.id)
+            .values(status=table.c.status, updated_at=table.c.updated_at)
+        )
+    if order.execution_plan_item_id is not None:
+        # Core revocation takes the plan-item lock before the order lock too.
+        db.get(
+            ExecutionPlanItem,
+            order.execution_plan_item_id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+    db.refresh(order, with_for_update=True)
+    db.expire(order, ["fills"])
+    order_status_before = order.status
+
     event_time = _parse_timestamp(payload.get("observed_at"), fallback=event_time)
     normalized_status = _normalize_status(payload.get("status"))
     fills, fill_delta_anomalies = _parse_fills_from_payload(
