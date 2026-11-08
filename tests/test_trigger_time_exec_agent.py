@@ -1856,9 +1856,11 @@ def test_stale_trigger_reclaim_allows_explicit_pullback_strategy_profile(
     "initial_target_status",
     ["target_sell_monitoring", "target_sell_triggered_blocked"],
 )
+@pytest.mark.parametrize("expired_cycle_budget", (False, True))
 def test_trigger_time_sell_agent_can_adjust_quantity_limit_and_stop(
     monkeypatch: pytest.MonkeyPatch,
     initial_target_status: str,
+    expired_cycle_budget: bool,
 ) -> None:
     app, engine, client, broker_adapter, captured = _build_trigger_agent_app(
         monkeypatch=monkeypatch,
@@ -1928,6 +1930,34 @@ def test_trigger_time_sell_agent_can_adjust_quantity_limit_and_stop(
             )
         )
         session.commit()
+
+    if expired_cycle_budget:
+        bounded_settings = monitoring._cycle_bounded_trigger_agent_settings
+        with monkeypatch.context() as expired_cycle:
+            expired_cycle.setattr(
+                monitoring,
+                "_cycle_bounded_trigger_agent_settings",
+                lambda *, settings, cycle_started: bounded_settings(
+                    settings=settings,
+                    cycle_started=time.monotonic() - settings.monitoring_cycle_timeout_seconds,
+                ),
+            )
+            deferred = client.post(
+                "/monitoring/evaluate",
+                json={
+                    "actor": "ops", "source": "test",
+                    "prices": [{"symbol": "005930", "price": "125100.00"}],
+                },
+            )
+        assert deferred.status_code == 200
+        assert deferred.json()["submitted_order_count"] == 0
+        assert captured == broker_adapter.order_calls == []
+        with app.state.db_session_factory() as session:
+            target_item = session.get(ExecutionPlanItem, target_item_id)
+            assert target_item.status == "target_sell_triggered_blocked"
+            assert target_item in monitoring._load_monitored_items(
+                settings=app.state.settings, db=session, symbols=["005930"],
+            )
 
     response = client.post(
         "/monitoring/evaluate",

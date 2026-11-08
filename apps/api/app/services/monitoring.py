@@ -6160,7 +6160,11 @@ def _trigger_time_agent_preflight_failure(
     item = action.item
     if not _trigger_time_agent_claim_is_current(db=db, item=item, claim=claim):
         return _trigger_time_agent_claim_lost_result(item=item, action=action)
-    item.status = "watch_buy_triggered_blocked"
+    item.status = (
+        "watch_buy_triggered_blocked"
+        if _is_watch_buy_item(item)
+        else f"{item.intent}_triggered_blocked"
+    )
     retry_after_at = recorded_at + timedelta(
         seconds=settings.monitoring_watch_buy_retry_cooldown_seconds
     )
