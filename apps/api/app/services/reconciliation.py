@@ -2737,6 +2737,10 @@ def _stale_order_repair_decision(
 ) -> dict[str, str] | None:
     if status_before not in _reconcilable_order_statuses():
         return None
+    if result is not None and int(result.get("status_code") or 200) < 400:
+        # A successful inquiry may have cleared these old failures deliberately.
+        error_code_before = None
+        error_classification_before = None
     observed_broker_code = order.last_error_code or error_code_before
     observed_classification = order.last_error_classification or error_classification_before
     if not order.broker_order_id:
