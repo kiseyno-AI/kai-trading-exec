@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, DecimalException, ROUND_DOWN
 from hashlib import sha256
 import hmac
+import json
 import logging
 from time import monotonic
 from typing import Iterator
@@ -1059,6 +1060,9 @@ def _place_broker_order_serialized(
                     "secret or complete reviewed operator remediation"
                 ),
             )
+        _recover_degraded_replay(
+            settings=settings, db=db, order=existing, command=logical_command
+        )
         return PlaceBrokerOrderResult(
             status_code=200,
             payload={
@@ -4773,6 +4777,10 @@ def _place_broker_order_serialized(
         )
 
     plan_item_id_for_recovery = plan_item.id if plan_item is not None else None
+    # Compare-and-set evidence for the degraded path: what the order and plan
+    # item looked like before this acknowledgement touched them.
+    order_status_before_ack = order.status
+    plan_item_state_before_ack = _plan_item_cas_state(plan_item)
     try:
         order.broker_order_id = placement.broker_order_id
         apply_broker_order_status(order=order, status=placement.normalized_status.value)
@@ -4899,6 +4907,9 @@ def _place_broker_order_serialized(
             plan_item_id=plan_item_id_for_recovery,
             placement=placement,
             failure=ack_persistence_failure,
+            command=routed_command,
+            order_status_before_ack=order_status_before_ack,
+            plan_item_state_before_ack=plan_item_state_before_ack,
         )
 
     if before_success_commit is not None:
@@ -4919,6 +4930,32 @@ def _place_broker_order_serialized(
     )
 
 
+DEGRADED_ACK_EVENT_TYPE = "submit_acknowledged_degraded"
+# Plan-item statuses that only mirror this order's own submission. A replay may
+# advance such an item to the simulated fill; any other status belongs to
+# someone else (a Core revocation, a fence, an operator) and is left alone.
+_ORDER_MIRROR_PLAN_ITEM_STATUSES = frozenset(
+    {
+        "broker_order_submission_pending",
+        "broker_order_submitted",
+        "broker_order_open",
+    }
+)
+
+
+def _plan_item_cas_state(plan_item: ExecutionPlanItem | None) -> tuple[str, str] | None:
+    """Status plus a canonical hash of the risk context (where fences and Core
+    authority projections live)."""
+
+    if plan_item is None:
+        return None
+    risk = plan_item.risk_context if isinstance(plan_item.risk_context, dict) else {}
+    digest = sha256(
+        json.dumps(risk, sort_keys=True, default=str, separators=(",", ":")).encode()
+    ).hexdigest()
+    return str(plan_item.status), digest
+
+
 def _persist_degraded_broker_acknowledgement(
     *,
     settings: Settings,
@@ -4927,16 +4964,28 @@ def _persist_degraded_broker_acknowledgement(
     plan_item_id: str | None,
     placement: object,
     failure: Exception,
+    command: PlaceOrderRequest,
+    order_status_before_ack: str,
+    plan_item_state_before_ack: tuple[str, str] | None,
 ) -> BrokerOrder:
     """Record the minimum durable broker acknowledgement after bookkeeping failed.
 
     Called when the broker accepted an order (``adapter.place_order`` returned)
-    but persisting the full acknowledgement raised. Only the facts proven by the
-    broker response are stored: the broker order id, normalized status and
-    timestamps, plus an explicit ``submit_acknowledged_degraded`` event so the
-    degraded record is auditable. If even this fails the error propagates; the
-    log line below carries the idempotency key and broker order id an operator
-    needs to reconcile by hand.
+    but persisting the full acknowledgement raised. Every write is a
+    compare-and-set against the state before the acknowledgement, so this path
+    never undoes progress or someone else's decision:
+
+    * if the full acknowledgement already committed (the failure came after the
+      commit), nothing is changed -- a filled order stays filled;
+    * the order status is set from the broker response only while the stored
+      status is still the pre-acknowledgement one;
+    * the plan item is updated only while its status and risk context are
+      unchanged, so a Core revocation or fence that landed meanwhile survives;
+    * an Upbit paper order gets its local simulated fill retried, which a later
+      replay of the same idempotency key also retries.
+
+    If the minimal write fails the error propagates; the log carries the
+    idempotency key and broker order id an operator needs to reconcile by hand.
     """
 
     broker_order_id = getattr(placement, "broker_order_id", None)
@@ -4958,17 +5007,33 @@ def _persist_degraded_broker_acknowledgement(
         )
         if order is None:
             raise failure
+        db.refresh(order, with_for_update=True)
+        if order.broker_order_id is not None:
+            if order.broker_order_id != broker_order_id:
+                raise RuntimeError(
+                    "stored broker order id differs from the acknowledgement"
+                ) from failure
+            # The full acknowledgement is already durable; the failure came
+            # after its commit. Rewriting anything here could only regress it.
+            LOGGER.warning(
+                "broker_acknowledgement_already_durable",
+                extra={"idempotency_key": idempotency_key, "status": order.status},
+            )
+            db.rollback()
+            return order
         observed_at = getattr(placement, "observed_at", None) or datetime.now(UTC)
         order.broker_order_id = broker_order_id
-        apply_broker_order_status(
-            order=order, status=placement.normalized_status.value  # type: ignore[attr-defined]
-        )
+        status_applied = order.status == order_status_before_ack
+        if status_applied:
+            apply_broker_order_status(
+                order=order, status=placement.normalized_status.value  # type: ignore[attr-defined]
+            )
         order.submitted_at = getattr(placement, "submitted_at", None)
         order.last_broker_sync_at = observed_at
         db.add(
             BrokerOrderEvent(
                 broker_order_pk=order.id,
-                event_type="submit_acknowledged_degraded",
+                event_type=DEGRADED_ACK_EVENT_TYPE,
                 event_source=BrokerEventSource.SUBMISSION.value,
                 normalized_status=order.status,
                 broker_status=getattr(placement, "broker_status", None),
@@ -4980,6 +5045,7 @@ def _persist_degraded_broker_acknowledgement(
                     {
                         "broker_order_id": broker_order_id,
                         "bookkeeping_exception_type": type(failure).__name__,
+                        "status_applied": status_applied,
                     }
                 ),
                 observed_at=observed_at,
@@ -4998,11 +5064,17 @@ def _persist_degraded_broker_acknowledgement(
             exc_info=True,
         )
         raise
+    plan_item_updated = False
     if plan_item_id is not None:
         # Best effort: the order acknowledgement above is already durable.
         try:
-            plan_item = db.get(ExecutionPlanItem, plan_item_id)
-            if plan_item is not None:
+            plan_item = db.get(
+                ExecutionPlanItem,
+                plan_item_id,
+                with_for_update=True,
+                options=[undefer(ExecutionPlanItem.risk_context)],
+            )
+            if plan_item is not None and _plan_item_cas_state(plan_item) == plan_item_state_before_ack:
                 set_plan_item_status(
                     db=db,
                     plan_item=plan_item,
@@ -5013,17 +5085,121 @@ def _persist_degraded_broker_acknowledgement(
                         "broker_order_pk": order.id,
                         "broker_order_id": broker_order_id,
                         "idempotency_key": idempotency_key,
-                        "event_type": "submit_acknowledged_degraded",
+                        "event_type": DEGRADED_ACK_EVENT_TYPE,
                     },
                 )
                 db.commit()
+                plan_item_updated = True
+            else:
+                db.rollback()
+                LOGGER.warning(
+                    "broker_acknowledgement_plan_item_changed_since_submission",
+                    extra={"idempotency_key": idempotency_key, "plan_item_id": plan_item_id},
+                )
         except Exception:
             db.rollback()
             LOGGER.exception(
                 "broker_acknowledgement_plan_item_status_failed",
                 extra={"idempotency_key": idempotency_key},
             )
+    _retry_paper_simulated_fill(
+        settings=settings,
+        db=db,
+        order=order,
+        command=command,
+        update_plan_item=plan_item_updated,
+    )
     return order
+
+
+def _retry_paper_simulated_fill(
+    *,
+    settings: Settings,
+    db: Session,
+    order: BrokerOrder,
+    command: PlaceOrderRequest,
+    update_plan_item: bool,
+) -> None:
+    """Best effort: complete an Upbit paper order's local fill if it is missing.
+
+    Paper orders have no broker that a reconciliation could ask, so a fill the
+    simulator never wrote would otherwise stay missing for good. Idempotent:
+    an existing simulated fill or a non-open order is left alone.
+    """
+
+    if command.provider != "upbit" or settings.runtime_mode != "paper":
+        return
+    try:
+        db.refresh(order, with_for_update=True)
+        open_statuses = {
+            NormalizedBrokerOrderStatus.SUBMITTED.value,
+            NormalizedBrokerOrderStatus.OPEN.value,
+        }
+        already_filled = db.scalar(
+            select(ExecutionFill.id).where(
+                ExecutionFill.broker_order_pk == order.id,
+                ExecutionFill.broker_fill_id == f"paper-fill:{order.idempotency_key}",
+            )
+        )
+        if order.status not in open_statuses or already_filled is not None:
+            db.rollback()
+            return
+        plan_item = (
+            db.get(ExecutionPlanItem, order.execution_plan_item_id, with_for_update=True)
+            if update_plan_item and order.execution_plan_item_id
+            else None
+        )
+        _record_upbit_paper_simulated_fill(
+            settings=settings,
+            db=db,
+            order=order,
+            command=command,
+            plan_item=plan_item,
+            observed_at=datetime.now(UTC),
+        )
+        db.commit()
+        db.refresh(order)
+    except Exception:
+        db.rollback()
+        LOGGER.exception(
+            "paper_simulated_fill_retry_failed",
+            extra={"idempotency_key": order.idempotency_key},
+        )
+
+
+def _recover_degraded_replay(
+    *,
+    settings: Settings,
+    db: Session,
+    order: BrokerOrder,
+    command: PlaceOrderRequest,
+) -> None:
+    """On a replay of a degraded acknowledgement, retry what the degraded path could not."""
+
+    if command.provider != "upbit" or settings.runtime_mode != "paper":
+        return
+    degraded = db.scalar(
+        select(BrokerOrderEvent.id).where(
+            BrokerOrderEvent.broker_order_pk == order.id,
+            BrokerOrderEvent.event_type == DEGRADED_ACK_EVENT_TYPE,
+        )
+    )
+    if degraded is None:
+        return
+    plan_item = (
+        db.get(ExecutionPlanItem, order.execution_plan_item_id)
+        if order.execution_plan_item_id
+        else None
+    )
+    _retry_paper_simulated_fill(
+        settings=settings,
+        db=db,
+        order=order,
+        command=command,
+        update_plan_item=(
+            plan_item is not None and plan_item.status in _ORDER_MIRROR_PLAN_ITEM_STATUSES
+        ),
+    )
 
 
 def _broker_error_has_rejection_acknowledgement(exc: BrokerAdapterError) -> bool:
