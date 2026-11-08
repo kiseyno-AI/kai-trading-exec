@@ -3618,7 +3618,11 @@ def _new_monitoring_item(
 
 def _monitoring_source_plan_item_id(item: ExecutionPlanItem, intent: str) -> str | None:
     if item.source_plan_item_id:
-        return f"{item.source_plan_item_id}:{intent}"
+        derived = f"{item.source_plan_item_id}:{intent}"
+        if len(derived) <= 128:
+            return derived
+        digest = json_payload_hash({"source": item.source_plan_item_id, "intent": intent})
+        return f"exec-agent-monitor:{digest}"
     return None
 
 
