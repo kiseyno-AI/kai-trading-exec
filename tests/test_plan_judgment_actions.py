@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, func, select
@@ -1696,4 +1696,104 @@ def test_postgres_restore_processes_adjusted_watch_after_limit_of_unadjusted_row
         assert str(late_item.limit_price) == "101.0000"
         assert late_item.risk_context == {}
         assert restored_audits == 1
+    engine.dispose()
+
+
+def test_prior_session_risk_off_is_released_by_first_healthy_current_session_observation(
+) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settings = Settings(
+        runtime_mode="live",
+        database_url="postgresql+psycopg://unused/test",
+        hourly_plan_judgment_recovery_required_healthy_observations=2,
+        hourly_plan_judgment_recovery_cooldown_seconds=900,
+        hourly_plan_judgment_recovery_min_observation_interval_seconds=300,
+    )
+    # Monday 15:26 KST risk; Tuesday 09:05 KST first healthy observation.
+    risk_at = datetime(2026, 11, 9, 6, 26, tzinfo=UTC)
+    tuesday_open = datetime(2026, 11, 10, 0, 5, tzinfo=UTC)
+
+    with Session(engine) as db:
+        db.add(RuntimeControlState(id="global", mode="live", paused=False))
+        db.commit()
+        plan_judgment_actions._transition_hourly_risk_off_fence_session(
+            db=db,
+            settings=settings,
+            risk_flags=3,
+            risk_reasons=["prior session risk"],
+            now=risk_at,
+        )
+        db.commit()
+        state = db.get(RuntimeControlState, "global")
+        assert state is not None and state.hourly_risk_off_active is True
+
+        plan_judgment_actions._transition_hourly_risk_off_fence_session(
+            db=db,
+            settings=settings,
+            risk_flags=0,
+            risk_reasons=[],
+            now=tuesday_open + timedelta(seconds=10),
+            observation_id="tuesday-first",
+            market_date=date(2026, 11, 10),
+            source_observed_at=tuesday_open,
+        )
+        db.commit()
+        state = db.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.hourly_risk_off_context["recovery_ready"] is True
+        assert state.hourly_risk_off_context["prior_session_risk_released"] is True
+        plan_judgment_actions._complete_hourly_risk_off_projection_session(
+            db=db,
+            state=state,
+            expected_epoch=state.hourly_risk_off_epoch,
+            now=tuesday_open + timedelta(seconds=11),
+        )
+        db.commit()
+        state = db.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.hourly_risk_off_active is False
+    engine.dispose()
+
+
+def test_same_session_risk_off_still_needs_the_configured_healthy_observations(
+) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    settings = Settings(
+        runtime_mode="live",
+        database_url="postgresql+psycopg://unused/test",
+        hourly_plan_judgment_recovery_required_healthy_observations=2,
+        hourly_plan_judgment_recovery_cooldown_seconds=0,
+        hourly_plan_judgment_recovery_min_observation_interval_seconds=1,
+    )
+    risk_at = datetime(2026, 11, 10, 1, 0, tzinfo=UTC)
+
+    with Session(engine) as db:
+        db.add(RuntimeControlState(id="global", mode="live", paused=False))
+        db.commit()
+        plan_judgment_actions._transition_hourly_risk_off_fence_session(
+            db=db,
+            settings=settings,
+            risk_flags=3,
+            risk_reasons=["same session risk"],
+            now=risk_at,
+        )
+        db.commit()
+        plan_judgment_actions._transition_hourly_risk_off_fence_session(
+            db=db,
+            settings=settings,
+            risk_flags=0,
+            risk_reasons=[],
+            now=risk_at + timedelta(seconds=2),
+            observation_id="same-day-first",
+            market_date=date(2026, 11, 10),
+            source_observed_at=risk_at + timedelta(seconds=1),
+        )
+        db.commit()
+        state = db.get(RuntimeControlState, "global")
+        assert state is not None
+        assert state.hourly_risk_off_active is True
+        assert state.hourly_risk_off_context["recovery_ready"] is False
+        assert state.hourly_risk_off_context["prior_session_risk_released"] is False
     engine.dispose()
