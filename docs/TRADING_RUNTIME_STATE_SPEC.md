@@ -31,7 +31,7 @@ It is not persisted and it is not itself an admission authority.
 | Bootstrap pause | Blocked | Active | Active | Explicit operator resume after readiness review |
 | Operator pause | Blocked | Active | Active | Explicit operator resume |
 | Kill switch | Blocked | Active | Blocked | Compare-and-swap reset using the current kill-switch event ID; runtime remains paused until explicit resume |
-| Hourly KRX risk-off | Blocked only for live KRX new/increasing buys | Active; candidates and trigger geometry are preserved | Active | Configured distinct healthy observations, observation interval, and cooldown |
+| Hourly KRX risk-off | Blocked only for live KRX new/increasing buys | Active; candidates and trigger geometry are preserved | Active | Configured distinct healthy observations, observation interval, and cooldown within one KRX session; a risk-off whose latest risk is from an earlier KRX session is released by the first validated healthy observation of the current session |
 | Core buy-authority fence | Blocked for the bound live KIS/KRX scope | Active | Active | Configured distinct fresh authoritative allow observations |
 | Account-drawdown latch | Blocked for the exact account/currency lane | Active | Active | Cooldown plus distinct healthy account snapshots; release requires a fresh candidate and never revives the rejected order |
 | Process shutdown fence | Blocked in the draining process | Draining | No new submission | New process generation after startup; no durable pause is written |

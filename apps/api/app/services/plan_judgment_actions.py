@@ -454,6 +454,18 @@ def _hourly_risk_off_fence_values(
         current_count + (1 if observation_advanced else 0),
     )
     cooldown_until = last_risk_at + timedelta(seconds=cooldown_seconds)
+    # Risk flags describe one KRX session. A risk-off whose latest risk was seen
+    # in an earlier session is released by the first validated healthy
+    # observation of the current session; a new risk observation re-activates it.
+    prior_session_risk = bool(
+        healthy_observation is not None
+        and observation_advanced
+        and last_risk_at.astimezone(_SEOUL).date()
+        < date.fromisoformat(str(healthy_observation["market_date"]))
+    )
+    if prior_session_risk:
+        healthy_count = required
+        cooldown_until = min(cooldown_until, now)
     recovery_ready = healthy_count >= required and now >= cooldown_until
     updated = dict(context)
     updated.update(
@@ -465,6 +477,7 @@ def _hourly_risk_off_fence_values(
             "cooldown_seconds": cooldown_seconds,
             "cooldown_until": cooldown_until.isoformat(),
             "cooldown_satisfied": now >= cooldown_until,
+            "prior_session_risk_released": prior_session_risk,
             "min_observation_interval_seconds": min_interval_seconds,
             "last_risk_flags": 0,
             "last_risk_reasons": [],
