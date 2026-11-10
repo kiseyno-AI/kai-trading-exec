@@ -793,16 +793,18 @@ class AutonomousRuntimeCoordinator:
                 or checked_at - self._last_core_book_wake >= CORE_BOOK_WAKE_MIN_INTERVAL_SECONDS
             ):
                 books = _fresh_krx_book_prices(quote_snapshot, now=datetime.now(UTC))
-                self._last_core_book_wake_by_symbol = {
+                recently_attempted = {
                     symbol: last for symbol, last in self._last_core_book_wake_by_symbol.items()
                     if checked_at - last < CORE_BOOK_WAKE_SYMBOL_COOLDOWN_SECONDS
                 }
                 urgent_symbol = _krx_book_urgent_symbol(
-                    snapshot, books, recently_attempted=self._last_core_book_wake_by_symbol,
+                    snapshot, books, recently_attempted=recently_attempted,
                 )
-                if urgent_symbol is not None:
+                checked_at = loop.time()
+                if urgent_symbol is not None and checked_at < deadline:
                     self._last_core_book_wake = checked_at
-                    self._last_core_book_wake_by_symbol[urgent_symbol] = checked_at
+                    recently_attempted[urgent_symbol] = checked_at
+                    self._last_core_book_wake_by_symbol = recently_attempted
                     return replace(coverage, urgent_symbol=urgent_symbol)
             remaining = deadline - loop.time()
             if not eligible or remaining <= CORE_BOOK_POLL_SECONDS:
@@ -3173,7 +3175,9 @@ async def _load_core_orderbook_snapshot(settings: Settings) -> dict[str, object]
             return None
         body = bytearray()
         headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
-        url = f"{base_url.rstrip('/')}/quotes/realtime/orderbooks"
+        url = httpx.URL(
+            scheme="http", host=target.hostname, port=target.port, path="/quotes/realtime/orderbooks",
+        )
         async with httpx.AsyncClient(trust_env=False) as client:
             async with client.stream("GET", url, headers=headers) as response:
                 if response.status_code != 200:
@@ -3189,7 +3193,7 @@ async def _load_core_orderbook_snapshot(settings: Settings) -> dict[str, object]
             and isinstance(payload.get("items"), list)
         ):
             return payload
-    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, RecursionError):
         return None
     return None
 

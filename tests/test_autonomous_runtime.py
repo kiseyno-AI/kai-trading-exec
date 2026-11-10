@@ -1582,9 +1582,9 @@ def test_unknown_krx_calendar_result_fails_open_and_throttles_retry(
         engine.dispose()
 
 
-@pytest.mark.parametrize("urgent_overruns_normal_deadline", [False, True])
+@pytest.mark.parametrize("overrun_stage", [None, "urgent_cycle", "classification"])
 def test_fresh_core_quote_wakes_sell_before_buy_and_still_polls_normally(
-    monkeypatch: pytest.MonkeyPatch, urgent_overruns_normal_deadline: bool,
+    monkeypatch: pytest.MonkeyPatch, overrun_stage: str | None,
 ) -> None:
     async def scenario() -> None:
         settings = Settings(
@@ -1637,12 +1637,22 @@ def test_fresh_core_quote_wakes_sell_before_buy_and_still_polls_normally(
         urgent_finished_at = None
         normal_started_at = None
         normal_interval = 0.15
+        if overrun_stage == "classification":
+            classify = autonomous_runtime._krx_book_urgent_symbol
+
+            def slow_classification(*args, **kwargs):
+                time.sleep(normal_interval + 0.02)
+                return classify(*args, **kwargs)
+
+            monkeypatch.setattr(autonomous_runtime, "_krx_book_urgent_symbol", slow_classification)
 
         async def monitoring_cycle(started_at, wake=None):
             nonlocal urgent_finished_at, normal_started_at
             calls.append(wake)
-            if len(calls) == 1:
-                if urgent_overruns_normal_deadline:
+            if overrun_stage == "classification":
+                coordinator._stopping = True
+            elif len(calls) == 1:
+                if overrun_stage == "urgent_cycle":
                     await asyncio.sleep(normal_interval + 0.02)
                 urgent_finished_at = asyncio.get_running_loop().time()
             else:
@@ -1659,10 +1669,17 @@ def test_fresh_core_quote_wakes_sell_before_buy_and_still_polls_normally(
             cycle=coordinator._run_monitoring_cycle,
         )
 
+        if overrun_stage == "classification":
+            assert len(calls) == 1
+            assert calls[0].urgent_symbol is None
+            assert coordinator._last_core_book_wake is None
+            assert not coordinator._last_core_book_wake_by_symbol
+            return
+
         assert calls[0].urgent_symbol == "000660"
         assert calls[0].covered_passives == frozenset({"012030"})
         assert normal_started_at is not None and urgent_finished_at is not None
-        if urgent_overruns_normal_deadline:
+        if overrun_stage == "urgent_cycle":
             assert normal_started_at - urgent_finished_at < 0.10
             assert calls[1] is None
         else:
@@ -1672,19 +1689,27 @@ def test_fresh_core_quote_wakes_sell_before_buy_and_still_polls_normally(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("response_kind", ["dribble", "nested_json"])
 def test_optional_core_response_cannot_hold_regular_monitoring_deadline(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, response_kind: str,
 ) -> None:
     async def scenario() -> None:
         request_received = asyncio.Event()
         response_closed = asyncio.Event()
         response_complete = False
 
-        async def dribble_response(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        async def core_response(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             nonlocal response_complete
             try:
                 await reader.readuntil(b"\r\n\r\n")
                 request_received.set()
+                if response_kind == "nested_json":
+                    body = b"[" * 12000 + b"]" * 12000
+                    writer.write(
+                        f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+                    )
+                    await writer.drain()
+                    return
                 writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n")
                 for _ in range(10):
                     writer.write(b" ")
@@ -1697,7 +1722,7 @@ def test_optional_core_response_cannot_hold_regular_monitoring_deadline(
                 writer.close()
                 response_closed.set()
 
-        server = await asyncio.start_server(dribble_response, "127.0.0.1", 0)
+        server = await asyncio.start_server(core_response, "127.0.0.1", 0)
         async with server:
             port = server.sockets[0].getsockname()[1]
             coordinator = AutonomousRuntimeCoordinator(
@@ -1733,7 +1758,8 @@ def test_optional_core_response_cannot_hold_regular_monitoring_deadline(
             await asyncio.wait_for(response_closed.wait(), 0.5)
 
         assert request_received.is_set()
-        assert not response_complete
+        if response_kind == "dribble":
+            assert not response_complete
         assert elapsed is not None and 0.10 <= elapsed < 0.25
 
     asyncio.run(scenario())
