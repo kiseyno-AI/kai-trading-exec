@@ -3594,7 +3594,7 @@ def test_autonomous_daily_board_uses_fast_status_and_keeps_uncached_positions(
         return [
             {
                 "symbol": symbol,
-                "monitored": symbol == "027710",
+                "monitored": True,
                 "open_order_count": 0,
                 "fill_count": 0,
                 "position_quantity": 1 if symbol == "APTX" else 0,
@@ -3625,4 +3625,6 @@ def test_autonomous_daily_board_uses_fast_status_and_keeps_uncached_positions(
     assert status_calls == [False]
     assert listed_symbol_sets == [{"027710", "APTX"}]
     assert [row["symbol"] for row in payload["symbols"]] == ["027710", "APTX"]
+    assert [row["monitored"] for row in payload["symbols"]] == [True, False]
+    assert payload["totals"]["monitored_symbol_count"] == 1
     assert payload["totals"]["position_symbol_count"] == 1
