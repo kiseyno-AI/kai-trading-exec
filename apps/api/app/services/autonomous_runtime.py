@@ -10,7 +10,9 @@ import threading
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from http.client import HTTPConnection, HTTPException
 from typing import Any, Callable, Iterable, TypeVar
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -109,6 +111,11 @@ DOMESTIC_SESSION_BOUNDARIES = (
 KRX_CALENDAR_RETRY_INTERVAL = timedelta(seconds=60)
 DISPATCH_IDLE_DB_RESCAN_INTERVAL = timedelta(seconds=60)
 MONITORING_NO_PRICE_DB_RESCAN_INTERVAL = timedelta(seconds=60)
+CORE_BOOK_POLL_SECONDS = 0.25
+CORE_BOOK_TIMEOUT_SECONDS = 0.2
+CORE_BOOK_MAX_AGE_SECONDS = 2.0
+CORE_BOOK_WAKE_MIN_INTERVAL_SECONDS = 2.0
+CORE_BOOK_WAKE_SYMBOL_COOLDOWN_SECONDS = 5.0
 _CACHED_KIS_ROUTE_EXCHANGES = KRX_EXCHANGES | frozenset({"NASD", "NYSE", "AMEX"})
 _CycleResult = TypeVar("_CycleResult")
 
@@ -362,6 +369,12 @@ class MonitoringRuntimeSnapshot:
         }
 
 
+@dataclass(frozen=True)
+class MonitoringQuoteWake:
+    urgent_symbol: str | None
+    covered_passives: frozenset[str]
+
+
 @dataclass
 class AutonomousRuntimeCoordinator:
     settings: Settings
@@ -408,6 +421,8 @@ class AutonomousRuntimeCoordinator:
         init=False,
     )
     _monitoring_symbol_cursor: int = field(default=0, init=False)
+    _last_core_book_wake: float | None = field(default=None, init=False)
+    _last_core_book_wake_by_symbol: dict[str, float] = field(default_factory=dict, init=False)
     _monitoring_next_no_price_db_check_at: datetime | None = field(
         default=None,
         init=False,
@@ -621,8 +636,10 @@ class AutonomousRuntimeCoordinator:
     ) -> None:
         try:
             first_cycle = True
+            previous_cycle_urgent = False
             while not self._stopping:
                 schedule: PeriodicLoopSchedule | None = None
+                quote_wake: MonitoringQuoteWake | None = None
                 if first_cycle and run_immediately:
                     first_cycle = False
                 else:
@@ -644,14 +661,23 @@ class AutonomousRuntimeCoordinator:
                         worker_key=worker_key,
                         schedule=schedule,
                     )
-                    await asyncio.sleep(schedule.delay_seconds)
+                    if worker_key == "monitoring":
+                        quote_wake = await self._wait_for_monitoring_quote(
+                            schedule, allow_urgent=not previous_cycle_urgent,
+                        )
+                    else:
+                        await asyncio.sleep(schedule.delay_seconds)
                     first_cycle = False
+                previous_cycle_urgent = bool(quote_wake and quote_wake.urgent_symbol)
                 if self._stopping:
                     return
                 started_at = datetime.now(UTC)
                 self._mark_cycle_started(worker_key=worker_key, started_at=started_at)
                 try:
-                    awaitable = cycle(started_at)
+                    awaitable = (
+                        self._run_monitoring_cycle(started_at, quote_wake)
+                        if quote_wake is not None else cycle(started_at)
+                    )
                     payload = await self._await_cycle_payload(
                         worker_key=worker_key,
                         awaitable=awaitable,
@@ -688,6 +714,71 @@ class AutonomousRuntimeCoordinator:
                     )
         except asyncio.CancelledError:
             return
+
+    async def _wait_for_monitoring_quote(
+        self, schedule: PeriodicLoopSchedule, *, allow_urgent: bool,
+    ) -> MonitoringQuoteWake | None:
+        settings = self.settings
+        with self._lock:
+            snapshot = self._monitoring_runtime_snapshot
+        if (
+            snapshot is None
+            or not snapshot.symbols
+            or settings.runtime_mode != "live"
+            or settings.runtime_broker_provider != "kis"
+            or not settings.market_context_enabled
+            or not settings.market_context_base_url
+            or not settings.market_context_bearer_token
+            or schedule.cadence_mode == "domestic_market_closed"
+            or not _is_regular_market_session(now=datetime.now(UTC), market_timezone="Asia/Seoul")
+        ):
+            await asyncio.sleep(schedule.delay_seconds)
+            return None
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + schedule.delay_seconds
+        covered_passives: frozenset[str] = frozenset()
+        eligible = (
+            allow_urgent and settings.monitoring_max_broker_actions_per_cycle > 0
+            and bool(snapshot.items)
+        )
+        while not self._stopping:
+            quote_snapshot = await asyncio.to_thread(_load_core_orderbook_snapshot, settings)
+            checked_at = loop.time()
+            if quote_snapshot is None:
+                covered_passives = frozenset()
+                break
+            raw_passives = quote_snapshot.get("passive_quote_symbols")
+            covered_passives = frozenset(
+                symbol for symbol in raw_passives
+                if isinstance(symbol, str) and is_canonical_krx_short_code(symbol)
+            ) if isinstance(raw_passives, list) else frozenset()
+
+            if eligible and quote_snapshot.get("connected") is True and (
+                self._last_core_book_wake is None
+                or checked_at - self._last_core_book_wake >= CORE_BOOK_WAKE_MIN_INTERVAL_SECONDS
+            ):
+                books = _fresh_krx_book_prices(quote_snapshot, now=datetime.now(UTC))
+                self._last_core_book_wake_by_symbol = {
+                    symbol: last for symbol, last in self._last_core_book_wake_by_symbol.items()
+                    if checked_at - last < CORE_BOOK_WAKE_SYMBOL_COOLDOWN_SECONDS
+                }
+                urgent_symbol = _krx_book_urgent_symbol(
+                    snapshot, books, recently_attempted=self._last_core_book_wake_by_symbol,
+                )
+                if urgent_symbol is not None:
+                    self._last_core_book_wake = checked_at
+                    self._last_core_book_wake_by_symbol[urgent_symbol] = checked_at
+                    return MonitoringQuoteWake(urgent_symbol, covered_passives)
+            if not eligible or quote_snapshot.get("connected") is not True:
+                break
+            remaining = deadline - loop.time()
+            if remaining <= CORE_BOOK_POLL_SECONDS:
+                break
+            await asyncio.sleep(CORE_BOOK_POLL_SECONDS)
+
+        await asyncio.sleep(max(0.0, deadline - loop.time()))
+        return MonitoringQuoteWake(None, covered_passives) if covered_passives else None
 
     def _periodic_loop_schedule(
         self,
@@ -887,7 +978,9 @@ class AutonomousRuntimeCoordinator:
             extra={"reason": reason, "runtime_mode": self.settings.runtime_mode},
         )
 
-    async def _run_monitoring_cycle(self, started_at: datetime) -> dict[str, object]:
+    async def _run_monitoring_cycle(
+        self, started_at: datetime, quote_wake: MonitoringQuoteWake | None = None,
+    ) -> dict[str, object]:
         lease = self._shutdown_fence.capture_cycle_lease()
         task = asyncio.current_task()
         if task is not None:
@@ -896,13 +989,16 @@ class AutonomousRuntimeCoordinator:
             return await self._run_in_thread(
                 self._monitoring_cycle_sync_guarded,
                 started_at,
+                *((quote_wake,) if quote_wake is not None else ()),
                 lease=lease,
             )
         finally:
             if task is not None:
                 self._cycle_leases.pop(task, None)
 
-    def _monitoring_cycle_sync_guarded(self, started_at: datetime) -> dict[str, object]:
+    def _monitoring_cycle_sync_guarded(
+        self, started_at: datetime, quote_wake: MonitoringQuoteWake | None = None,
+    ) -> dict[str, object]:
         acquired_lock = self._monitoring_cycle_mutex
         if not acquired_lock.acquire(blocking=False):
             stale_age_seconds: float | None = None
@@ -931,7 +1027,12 @@ class AutonomousRuntimeCoordinator:
             return payload
         self._monitoring_cycle_mutex_started_at = started_at
         try:
-            return self._monitoring_cycle_sync(started_at)
+            if quote_wake is None:
+                return self._monitoring_cycle_sync(started_at)
+            result = self._monitoring_cycle_sync(started_at, quote_wake)
+            if quote_wake.urgent_symbol is not None:
+                result["core_book_urgent_symbol"] = quote_wake.urgent_symbol
+            return result
         finally:
             self._monitoring_cycle_mutex_started_at = None
             acquired_lock.release()
@@ -1109,7 +1210,35 @@ class AutonomousRuntimeCoordinator:
         self._store_cycle_payload(worker_key="nxt_eligible_sync", payload=payload)
         return payload
 
-    def _monitoring_cycle_sync(self, started_at: datetime) -> dict[str, object]:
+    def _select_monitoring_cycle_symbols(
+        self,
+        snapshot: MonitoringRuntimeSnapshot,
+        quote_symbols: list[str],
+        quote_wake: MonitoringQuoteWake | None,
+    ) -> list[str]:
+        position_symbols = set(snapshot.positions_by_symbol) & set(quote_symbols)
+        if quote_wake is not None:
+            local_symbols = position_symbols | {item.symbol for item in snapshot.items}
+            covered_passives = (
+                quote_wake.covered_passives & set(snapshot.passive_quote_symbols)
+            ) - local_symbols
+            quote_symbols = [symbol for symbol in quote_symbols if symbol not in covered_passives]
+            if (
+                quote_wake.urgent_symbol in quote_symbols
+                and quote_wake.urgent_symbol in local_symbols
+            ):
+                return [quote_wake.urgent_symbol]
+        symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
+            desired_symbols=quote_symbols,
+            priority_symbols=position_symbols,
+            batch_size=max(int(self.settings.monitoring_max_symbols_per_cycle or 0), 1),
+            cursor=self._monitoring_symbol_cursor,
+        )
+        return symbols
+
+    def _monitoring_cycle_sync(
+        self, started_at: datetime, quote_wake: MonitoringQuoteWake | None = None,
+    ) -> dict[str, object]:
         if self.settings.runtime_mode == "live" and self.session_factory is not None:
             if not self._reconcile_and_refresh_monitoring_snapshot_if_due(started_at):
                 raise RuntimeError("live broker position reconciliation failed")
@@ -1125,13 +1254,7 @@ class AutonomousRuntimeCoordinator:
             settings=self.settings,
             domestic_trading_days=self._krx_trading_days_snapshot(),
         )
-        position_symbols = set(workset_snapshot.positions_by_symbol) & set(quote_symbols)
-        symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
-            desired_symbols=quote_symbols,
-            priority_symbols=position_symbols,
-            batch_size=max(int(self.settings.monitoring_max_symbols_per_cycle or 0), 1),
-            cursor=self._monitoring_symbol_cursor,
-        )
+        symbols = self._select_monitoring_cycle_symbols(workset_snapshot, quote_symbols, quote_wake)
         if self.session_factory is not None and self._reconcile_monitoring_orders_if_due(
             now=started_at,
             symbols=set(authoritative_workset_symbols),
@@ -1144,16 +1267,7 @@ class AutonomousRuntimeCoordinator:
                 settings=self.settings,
                 domestic_trading_days=self._krx_trading_days_snapshot(),
             )
-            position_symbols = set(workset_snapshot.positions_by_symbol) & set(quote_symbols)
-            symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
-                desired_symbols=quote_symbols,
-                priority_symbols=position_symbols,
-                batch_size=max(
-                    int(self.settings.monitoring_max_symbols_per_cycle or 0),
-                    1,
-                ),
-                cursor=self._monitoring_symbol_cursor,
-            )
+            symbols = self._select_monitoring_cycle_symbols(workset_snapshot, quote_symbols, quote_wake)
         if not symbols:
             payload = {
                 "status_code": 200,
@@ -1222,17 +1336,8 @@ class AutonomousRuntimeCoordinator:
                     )
                 )
                 if not symbols and desired_symbols:
-                    symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
-                        desired_symbols=desired_symbols,
-                        priority_symbols=(
-                            set(workset_snapshot.positions_by_symbol)
-                            & set(desired_symbols)
-                        ),
-                        batch_size=max(
-                            int(self.settings.monitoring_max_symbols_per_cycle or 0),
-                            1,
-                        ),
-                        cursor=self._monitoring_symbol_cursor,
+                    symbols = self._select_monitoring_cycle_symbols(
+                        workset_snapshot, desired_symbols, quote_wake,
                     )
                 runtime_snapshot = _monitoring_snapshot_for_symbols(
                     workset_snapshot,
@@ -3014,6 +3119,118 @@ def _dispatch_payload_changed_runtime_state(payload: dict[str, object]) -> bool:
             return True
     jobs = payload.get("jobs")
     return isinstance(jobs, list) and bool(jobs)
+
+
+def _load_core_orderbook_snapshot(settings: Settings) -> dict[str, object] | None:
+    base_url = settings.market_context_base_url
+    token = settings.market_context_bearer_token
+    if not base_url or not token:
+        return None
+    try:
+        target = urlsplit(base_url)
+        if (
+            target.scheme != "http"
+            or target.hostname not in {"127.0.0.1", "::1"}
+            or target.username is not None
+            or target.path not in {"", "/"}
+            or target.query
+            or target.fragment
+        ):
+            return None
+        connection = HTTPConnection(target.hostname, target.port, timeout=CORE_BOOK_TIMEOUT_SECONDS)
+        try:
+            connection.request("GET", "/quotes/realtime/orderbooks", headers={
+                "Authorization": f"Bearer {token}",
+            })
+            with connection.getresponse() as response:
+                if response.status != 200:
+                    return None
+                body = response.read(65537)
+        finally:
+            connection.close()
+        if len(body) > 65536:
+            return None
+        payload = json.loads(body)
+        if (
+            isinstance(payload, dict)
+            and isinstance(payload.get("connected"), bool)
+            and isinstance(payload.get("items"), list)
+        ):
+            return payload
+    except (OSError, ValueError, HTTPException):
+        return None
+    return None
+
+
+def _fresh_krx_book_prices(
+    snapshot: dict[str, object], *, now: datetime,
+) -> dict[str, tuple[Decimal, Decimal]]:
+    books: dict[str, tuple[Decimal, Decimal]] = {}
+    items = snapshot.get("items")
+    if not isinstance(items, list):
+        return books
+    for item in items:
+        if not isinstance(item, dict) or item.get("source") != "kis_orderbook_ws":
+            continue
+        symbol = item.get("symbol")
+        if not isinstance(symbol, str) or not is_canonical_krx_short_code(symbol):
+            continue
+        timestamps = (item.get("price_as_of"), item.get("price_received_at"))
+        try:
+            observed, received = (
+                datetime.fromisoformat(value) for value in timestamps if isinstance(value, str)
+            )
+        except ValueError:
+            continue
+        if (
+            observed.tzinfo is None or received.tzinfo is None
+            or not 0 <= (now - observed).total_seconds() <= CORE_BOOK_MAX_AGE_SECONDS
+            or not 0 <= (now - received).total_seconds() <= CORE_BOOK_MAX_AGE_SECONDS
+        ):
+            continue
+        bid, ask = (_parse_decimal(item.get(field)) for field in ("bid_price", "ask_price"))
+        if (
+            bid is not None and bid.is_finite()
+            and ask is not None and ask.is_finite()
+            and 0 < bid <= ask
+            and all(type(item.get(field)) is int and item[field] > 0 for field in ("bid_size", "ask_size"))
+        ):
+            books[symbol] = (bid, ask)
+    return books
+
+
+def _krx_book_urgent_symbol(
+    snapshot: MonitoringRuntimeSnapshot,
+    books: dict[str, tuple[Decimal, Decimal]],
+    *,
+    recently_attempted: dict[str, float],
+) -> str | None:
+    buy_symbol = None
+    for item in snapshot.items:
+        if (
+            item.symbol not in books or item.symbol in recently_attempted
+            or item.exchange not in {"KRX", "KOSPI", "KOSDAQ"}
+            or item.status in AGENT_ACTIVE_MONITORING_STATUSES
+        ):
+            continue
+        is_buy = item.intent in WATCH_BUY_INTENTS
+        if not is_buy:
+            position = snapshot.positions_by_symbol.get(item.symbol)
+            if (
+                item.intent not in {"stop_sell", "target_sell"}
+                or position is None or not position.monitoring_eligible
+                or not _cached_item_matches_position_route(item=item, position=position)
+            ):
+                continue
+        bid, ask = books[item.symbol]
+        if _cached_monitoring_item_triggered(
+            item=item, observed_price=ask if is_buy else bid, triggered_at=snapshot.loaded_at,
+        ):
+            if not is_buy:
+                return item.symbol
+            if buy_symbol is None:
+                buy_symbol = item.symbol
+    return buy_symbol
 
 
 def _cached_monitoring_item_triggered(

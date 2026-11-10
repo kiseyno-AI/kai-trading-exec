@@ -843,6 +843,76 @@ def test_triggered_local_item_filters_passive_quotes_from_broker_evaluation(
     assert payload["broker_action_symbols"] == []
 
 
+def test_core_book_wake_still_requires_the_existing_kis_quote_and_falls_back(
+    monkeypatch, tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'core-book-wake.db'}",
+        runtime_mode="live",
+        monitoring_max_broker_actions_per_cycle=10,
+    )
+    engine = create_db_engine(settings)
+    Base.metadata.create_all(engine)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings,
+        session_factory=create_session_factory(engine),
+        broker_adapter_factory=lambda _: None,
+    )
+    started_at = datetime(2026, 10, 26, 0, 1, tzinfo=UTC)
+    coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=started_at,
+        symbols=["000660", "005930", "032080"],
+        positions_by_symbol={
+            "005930": CachedMonitoringPosition("005930", 1, "kis", "KRX"),
+        },
+        items=[
+            CachedMonitoringItem(
+                "buy", "000660", "intraday_watch_buy", "watch_monitoring_active",
+                Decimal("80000"), provider="kis", exchange="KRX",
+            ),
+        ],
+        filled_today_symbols=[],
+        passive_quote_symbols=["032080"],
+    )
+    monkeypatch.setattr(coordinator, "_reconcile_and_refresh_monitoring_snapshot_if_due", lambda _: True)
+    monkeypatch.setattr(coordinator, "_reconcile_monitoring_orders_if_due", lambda **_: False)
+    monkeypatch.setattr(
+        coordinator, "_repair_post_entry_exit_monitors_for_cached_cycle", lambda **_: (0, 0),
+    )
+    calls = []
+
+    def load_prices(*, symbols, observed_at):
+        calls.append(symbols)
+        # The broker's current asking price has rebounded above the hint.
+        return [
+            MonitoringPriceRequest(symbol=symbol, price=Decimal("90000"), ask=Decimal("90000"))
+            for symbol in symbols
+        ]
+
+    monkeypatch.setattr(coordinator, "_load_monitoring_prices", load_prices)
+
+    def evaluate(**_):
+        pytest.fail("a Core hint alone must not reach order evaluation")
+
+    monkeypatch.setattr(autonomous_runtime, "run_autonomous_monitoring_cycle", evaluate)
+    try:
+        urgent = coordinator._monitoring_cycle_sync_guarded(
+            started_at, autonomous_runtime.MonitoringQuoteWake("000660", frozenset({"032080"})),
+        )
+        covered = coordinator._monitoring_cycle_sync_guarded(
+            started_at, autonomous_runtime.MonitoringQuoteWake(None, frozenset({"032080", "005930"})),
+        )
+        fallback = coordinator._monitoring_cycle_sync_guarded(started_at)
+    finally:
+        engine.dispose()
+
+    assert calls == [["000660"], ["005930", "000660"], ["005930", "000660", "032080"]]
+    assert urgent["core_book_urgent_symbol"] == "000660"
+    assert urgent["triggered_item_count"] == 0
+    assert covered["price_count"] == 2
+    assert fallback["price_count"] == 3
+
+
 def test_session_active_monitoring_symbols_excludes_us_equities_after_close() -> None:
     now = datetime(2026, 10, 7, 5, 0, tzinfo=UTC)  # 01:00 America/New_York
     snapshot = MonitoringRuntimeSnapshot(
@@ -1502,6 +1572,78 @@ def test_unknown_krx_calendar_result_fails_open_and_throttles_retry(
         ) is True
     finally:
         engine.dispose()
+
+
+def test_fresh_core_quote_wakes_sell_before_buy_and_still_polls_normally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        settings = Settings(
+            database_url="sqlite:///:memory:",
+            runtime_mode="live",
+            runtime_broker_provider="kis",
+            market_context_enabled=True,
+            market_context_base_url="http://127.0.0.1:8000",
+            market_context_bearer_token="fake",
+        )
+        coordinator = AutonomousRuntimeCoordinator(
+            settings=settings,
+            session_factory=None,
+            broker_adapter_factory=lambda _: None,
+        )
+        coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+            loaded_at=datetime.now(UTC),
+            symbols=["005930", "000660", "035420", "012030"],
+            positions_by_symbol={
+                "000660": CachedMonitoringPosition("000660", 1, "kis", "KRX"),
+            },
+            items=[
+                CachedMonitoringItem("buy", "005930", "watch_buy", "accepted", Decimal("100"), exchange="KRX"),
+                CachedMonitoringItem("sell", "000660", "stop_sell", "accepted", Decimal("100"), exchange="KRX"),
+                CachedMonitoringItem("other", "035420", "watch_buy", "accepted", Decimal("100"), exchange="KRX"),
+            ],
+            filled_today_symbols=[],
+            passive_quote_symbols=["012030"],
+        )
+        monkeypatch.setattr(autonomous_runtime, "_is_regular_market_session", lambda **_: True)
+
+        def snapshot(_):
+            now = datetime.now(UTC)
+            books = []
+            for symbol, observed_at in (
+                ("005930", now), ("000660", now), ("035420", now - timedelta(seconds=8)),
+            ):
+                books.append({
+                    "symbol": symbol, "bid_price": 98, "ask_price": 99, "bid_size": 2, "ask_size": 2,
+                    "price_as_of": observed_at.isoformat(), "price_received_at": observed_at.isoformat(),
+                    "source": "kis_orderbook_ws",
+                })
+            return {"items": books, "connected": True, "passive_quote_symbols": ["012030"]}
+
+        monkeypatch.setattr(autonomous_runtime, "_load_core_orderbook_snapshot", snapshot)
+        calls = []
+
+        async def monitoring_cycle(started_at, wake=None):
+            calls.append(wake)
+            if len(calls) == 2:
+                coordinator._stopping = True
+            return {"status_code": 200}
+
+        coordinator._run_monitoring_cycle = monitoring_cycle
+        coordinator._periodic_loop_schedule = lambda **_: SimpleNamespace(
+            delay_seconds=0.05, cadence_mode="market_active", next_wake_at=None,
+        )
+        await coordinator._run_periodic_loop(
+            worker_key="monitoring", interval_seconds=0.05,
+            cycle=coordinator._run_monitoring_cycle,
+        )
+
+        assert [(wake.urgent_symbol, wake.covered_passives) for wake in calls] == [
+            ("000660", frozenset({"012030"})),
+            (None, frozenset({"012030"})),
+        ]
+
+    asyncio.run(scenario())
 
 
 def test_periodic_loop_uses_session_aware_schedule(
