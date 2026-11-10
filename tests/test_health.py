@@ -47,6 +47,7 @@ from app.models.runtime import (
     RuntimeControlEvent,
     RuntimeControlState,
 )
+from app.services import autonomous_runtime as autonomous_runtime_service
 from app.services import broker_orders as broker_orders_service
 from app.services import runtime as runtime_service, runtime_controls
 from app.services import schema as schema_service
@@ -58,7 +59,12 @@ from app.services.position_identity import (
     execution_scope_payload,
     payload_with_position_identity,
 )
-from app.services.autonomous_runtime import MonitoringRuntimeSnapshot, _is_regular_market_session, _merge_symbol_priority
+from app.services.autonomous_runtime import (
+    CachedMonitoringPosition,
+    MonitoringRuntimeSnapshot,
+    _is_regular_market_session,
+    _merge_symbol_priority,
+)
 from app.services.monitoring import (
     NON_MONITORABLE_PLAN_ITEM_STATUSES,
     PROFIT_TARGET_COVERAGE_STATUSES,
@@ -8837,7 +8843,15 @@ def test_runtime_status_deduplicates_repeated_fills_before_daily_counts() -> Non
     engine.dispose()
 
 
-def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() -> None:
+def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols(monkeypatch) -> None:
+    session_time = datetime(2026, 11, 10, 4, tzinfo=UTC)
+
+    class SessionClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return session_time.astimezone(tz)
+
+    monkeypatch.setattr(autonomous_runtime_service, "datetime", SessionClock)
     app, engine = build_test_app(
         settings=Settings(
             database_url="sqlite:///:memory:",
@@ -8863,12 +8877,14 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     }
     app.state.autonomous_runtime._store_cycle_payload(
         worker_key="monitoring",
-        payload={"monitored_symbols": ["005930", "000660", "005930"]},
+        payload={"monitored_symbols": ["005930", "005930"]},
     )
     app.state.autonomous_runtime._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
         loaded_at=datetime.now(UTC),
-        symbols=["005930", "000660", "005930"],
-        positions_by_symbol={},
+        symbols=["005930", "000660", "005930", "APTX"],
+        positions_by_symbol={
+            "APTX": CachedMonitoringPosition(symbol="APTX", quantity=1, exchange="NASD"),
+        },
         items=[],
         filled_today_symbols=["282330"],
         execution_scope=exact_scope,
@@ -8955,7 +8971,7 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
         "domestic_market_closed"
     )
     assert payload["symbols"]["monitored"] == ["000660", "005930"]
-    assert payload["symbols"]["monitoring_cycle_batch"] == ["000660", "005930"]
+    assert payload["symbols"]["monitoring_cycle_batch"] == ["005930"]
     assert payload["symbols"]["filled_today"] == ["282330"]
     assert payload["symbols"]["filled_today_by_side"] == {"buy": ["282330"], "sell": ["282330"]}
     assert payload["symbols"]["filled_today_counts"] == {
@@ -8980,6 +8996,11 @@ def test_fast_runtime_status_uses_autonomous_snapshot_for_monitored_symbols() ->
     assert payload["daily_pnl"]["daily_sell_notional"] == "363300.0000"
     assert payload["daily_pnl"]["matched_sell_quantity"] == 3
     assert payload["daily_pnl"]["closed_symbols"] == ["282330"]
+
+    session_time = datetime(2026, 11, 10, 16, tzinfo=UTC)
+    us_symbols = client.get("/runtime/status").json()["symbols"]
+    assert us_symbols["monitored"] == ["APTX"]
+    assert us_symbols["monitoring_cycle_batch"] == []
 
     engine.dispose()
 

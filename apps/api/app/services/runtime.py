@@ -3894,6 +3894,16 @@ def build_runtime_status(
         snapshot_trusted=autonomous_snapshot_trusted,
         scope_reasons=autonomous_scope_reasons,
     )
+    active_monitoring_symbols = (
+        _autonomous_session_active_symbols(autonomous=autonomous)
+        if autonomous_snapshot_trusted
+        else []
+    )
+    monitoring_cycle_batch = sorted(
+        set(active_monitoring_symbols).intersection(
+            _autonomous_monitoring_symbols(autonomous=autonomous)
+        )
+    )
     monitoring_price_source = _autonomous_monitoring_price_source(autonomous)
     monitoring: dict[str, object] = _monitoring_payload_from_autonomous(
         settings=settings,
@@ -4049,12 +4059,6 @@ def build_runtime_status(
             if autonomous_snapshot_trusted
             else {}
         )
-        cycle_symbols = (
-            _autonomous_runtime_snapshot_symbols(autonomous=autonomous)
-            or _autonomous_monitoring_symbols(autonomous=autonomous)
-            if autonomous_snapshot_trusted
-            else []
-        )
         filled_summary = runtime_filled_today_summary(
             settings=settings,
             db=db,
@@ -4072,8 +4076,8 @@ def build_runtime_status(
             ),
             "filled_today_by_side": filled_summary["by_side"],
             "filled_today_counts": filled_summary["counts"],
-            "monitored": cycle_symbols,
-            "monitoring_cycle_batch": cycle_symbols,
+            "monitored": active_monitoring_symbols,
+            "monitoring_cycle_batch": monitoring_cycle_batch,
         }
         freshness["position_truth"] = position_truth_freshness_payload(
             settings=settings,
@@ -4370,13 +4374,8 @@ def build_runtime_status(
             symbols = {
                 **symbols,
                 **cached_symbols,
-                "monitored": runtime_monitored_symbols(
-                    settings=settings,
-                    db=db,
-                    provider=runtime_provider,
-                    runtime_scope=active_runtime_scope,
-                ),
-                "monitoring_cycle_batch": _autonomous_monitoring_symbols(autonomous=autonomous),
+                "monitored": active_monitoring_symbols,
+                "monitoring_cycle_batch": monitoring_cycle_batch,
             }
             freshness["summary_source"] = "fast_autonomous_runtime_snapshot"
             monthly_pnl = _default_monthly_pnl_payload(
@@ -5990,6 +5989,12 @@ def build_runtime_daily_board(
                     account_scope=runtime_scope.account_scope,
                     exchanges=runtime_scope.exchanges,
                 )
+                if settings.autonomous_runtime_enabled and runtime_provider == "kis":
+                    active_symbols = set(monitored_symbols)
+                    for symbol in symbols:
+                        symbol["monitored"] = (
+                            symbol["monitored"] and symbol["symbol"] in active_symbols
+                        )
             else:
                 symbols = list_runtime_symbols(
                     settings=settings,
@@ -6227,14 +6232,14 @@ def _autonomous_monitoring_symbols(*, autonomous: dict[str, object]) -> list[str
     return sorted({str(symbol) for symbol in symbols if str(symbol).strip()})
 
 
-def _autonomous_runtime_snapshot_symbols(*, autonomous: dict[str, object]) -> list[str]:
+def _autonomous_session_active_symbols(*, autonomous: dict[str, object]) -> list[str]:
     monitoring = autonomous.get("monitoring")
     if not isinstance(monitoring, dict):
         return []
     runtime_snapshot = monitoring.get("runtime_snapshot")
     if not isinstance(runtime_snapshot, dict):
         return []
-    symbols = runtime_snapshot.get("symbols")
+    symbols = runtime_snapshot.get("session_active_symbols")
     if not isinstance(symbols, list):
         return []
     return sorted({str(symbol) for symbol in symbols if str(symbol).strip()})

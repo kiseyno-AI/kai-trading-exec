@@ -583,6 +583,19 @@ class AutonomousRuntimeCoordinator:
     def snapshot(self) -> dict[str, object]:
         krx_calendar = self._krx_calendar_snapshot()
         with self._lock:
+            workset = self._monitoring_runtime_snapshot
+            runtime_snapshot = None
+            if workset is not None:
+                active_symbols, _ = _session_active_monitoring_symbols(
+                    workset,
+                    now=datetime.now(UTC),
+                    settings=self.settings,
+                    domestic_trading_days=self._krx_trading_days,
+                )
+                runtime_snapshot = {
+                    **workset.snapshot(),
+                    "session_active_symbols": active_symbols,
+                }
             return {
                 "enabled": self.settings.autonomous_runtime_enabled,
                 "execution_scope": _active_kis_execution_scope_payload(self.settings),
@@ -591,11 +604,7 @@ class AutonomousRuntimeCoordinator:
                     **self._monitoring_state.snapshot(),
                     "price_source_configured": self._monitoring_price_source_state.configured,
                     "price_source": self._monitoring_price_source_state.snapshot(),
-                    "runtime_snapshot": (
-                        self._monitoring_runtime_snapshot.snapshot()
-                        if self._monitoring_runtime_snapshot is not None
-                        else None
-                    ),
+                    "runtime_snapshot": runtime_snapshot,
                 },
                 "watch_exec_agent_sizing": self._watch_exec_agent_sizing_state.snapshot(),
                 "nxt_eligible_sync": self._nxt_eligible_sync_state.snapshot(),
