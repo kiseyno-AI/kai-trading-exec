@@ -10,11 +10,11 @@ import threading
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
-from http.client import HTTPConnection, HTTPException
 from typing import Any, Callable, Iterable, TypeVar
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
+import httpx
 from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
@@ -114,6 +114,7 @@ MONITORING_NO_PRICE_DB_RESCAN_INTERVAL = timedelta(seconds=60)
 CORE_BOOK_POLL_SECONDS = 0.25
 CORE_BOOK_TIMEOUT_SECONDS = 0.2
 CORE_BOOK_MAX_AGE_SECONDS = 2.0
+CORE_PASSIVE_COVERAGE_MAX_AGE_SECONDS = 10.0
 CORE_BOOK_WAKE_MIN_INTERVAL_SECONDS = 2.0
 CORE_BOOK_WAKE_SYMBOL_COOLDOWN_SECONDS = 5.0
 _CACHED_KIS_ROUTE_EXCHANGES = KRX_EXCHANGES | frozenset({"NASD", "NYSE", "AMEX"})
@@ -373,6 +374,14 @@ class MonitoringRuntimeSnapshot:
 class MonitoringQuoteWake:
     urgent_symbol: str | None
     covered_passives: frozenset[str]
+    passive_expires_at: datetime | None = None
+
+    def passive_symbols_at(self, now: datetime) -> frozenset[str]:
+        expiry = self.passive_expires_at
+        if expiry is not None and expiry.tzinfo is not None:
+            if 0 < (expiry - now).total_seconds() <= CORE_PASSIVE_COVERAGE_MAX_AGE_SECONDS:
+                return self.covered_passives
+        return frozenset()
 
 
 @dataclass
@@ -636,39 +645,42 @@ class AutonomousRuntimeCoordinator:
     ) -> None:
         try:
             first_cycle = True
-            previous_cycle_urgent = False
+            pending_regular_cycle: tuple[PeriodicLoopSchedule, float] | None = None
+            loop = asyncio.get_running_loop()
             while not self._stopping:
                 schedule: PeriodicLoopSchedule | None = None
                 quote_wake: MonitoringQuoteWake | None = None
                 if first_cycle and run_immediately:
                     first_cycle = False
                 else:
-                    schedule_now = datetime.now(UTC)
-                    if first_cycle:
-                        schedule = PeriodicLoopSchedule(
-                            delay_seconds=float(interval_seconds),
-                            cadence_mode="startup",
-                            next_wake_at=schedule_now
-                            + timedelta(seconds=float(interval_seconds)),
-                        )
+                    if pending_regular_cycle is not None:
+                        schedule, deadline = pending_regular_cycle
                     else:
-                        schedule = self._periodic_loop_schedule(
-                            worker_key=worker_key,
-                            configured_interval_seconds=interval_seconds,
-                            now=schedule_now,
-                        )
-                    self._record_worker_schedule(
-                        worker_key=worker_key,
-                        schedule=schedule,
-                    )
+                        schedule_now = datetime.now(UTC)
+                        if first_cycle:
+                            schedule = PeriodicLoopSchedule(
+                                delay_seconds=float(interval_seconds),
+                                cadence_mode="startup",
+                                next_wake_at=schedule_now + timedelta(seconds=float(interval_seconds)),
+                            )
+                        else:
+                            schedule = self._periodic_loop_schedule(
+                                worker_key=worker_key,
+                                configured_interval_seconds=interval_seconds,
+                                now=schedule_now,
+                            )
+                        deadline = loop.time() + schedule.delay_seconds
+                    self._record_worker_schedule(worker_key=worker_key, schedule=schedule)
                     if worker_key == "monitoring":
                         quote_wake = await self._wait_for_monitoring_quote(
-                            schedule, allow_urgent=not previous_cycle_urgent,
+                            schedule, deadline=deadline, allow_urgent=pending_regular_cycle is None,
+                        )
+                        pending_regular_cycle = (
+                            (schedule, deadline) if quote_wake and quote_wake.urgent_symbol else None
                         )
                     else:
                         await asyncio.sleep(schedule.delay_seconds)
                     first_cycle = False
-                previous_cycle_urgent = bool(quote_wake and quote_wake.urgent_symbol)
                 if self._stopping:
                     return
                 started_at = datetime.now(UTC)
@@ -716,8 +728,13 @@ class AutonomousRuntimeCoordinator:
             return
 
     async def _wait_for_monitoring_quote(
-        self, schedule: PeriodicLoopSchedule, *, allow_urgent: bool,
+        self, schedule: PeriodicLoopSchedule, *, deadline: float, allow_urgent: bool,
     ) -> MonitoringQuoteWake | None:
+        loop = asyncio.get_running_loop()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return None
+
         settings = self.settings
         with self._lock:
             snapshot = self._monitoring_runtime_snapshot
@@ -732,29 +749,46 @@ class AutonomousRuntimeCoordinator:
             or schedule.cadence_mode == "domestic_market_closed"
             or not _is_regular_market_session(now=datetime.now(UTC), market_timezone="Asia/Seoul")
         ):
-            await asyncio.sleep(schedule.delay_seconds)
+            await asyncio.sleep(max(0.0, deadline - loop.time()))
             return None
 
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + schedule.delay_seconds
-        covered_passives: frozenset[str] = frozenset()
+        coverage = MonitoringQuoteWake(None, frozenset())
         eligible = (
             allow_urgent and settings.monitoring_max_broker_actions_per_cycle > 0
             and bool(snapshot.items)
         )
-        while not self._stopping:
-            quote_snapshot = await asyncio.to_thread(_load_core_orderbook_snapshot, settings)
-            checked_at = loop.time()
-            if quote_snapshot is None:
-                covered_passives = frozenset()
-                break
-            raw_passives = quote_snapshot.get("passive_quote_symbols")
-            covered_passives = frozenset(
-                symbol for symbol in raw_passives
-                if isinstance(symbol, str) and is_canonical_krx_short_code(symbol)
-            ) if isinstance(raw_passives, list) else frozenset()
+        if not eligible:
+            remaining = deadline - loop.time() - CORE_BOOK_POLL_SECONDS
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+        while not self._stopping and loop.time() < deadline:
+            try:
+                async with asyncio.timeout_at(min(deadline, loop.time() + CORE_BOOK_TIMEOUT_SECONDS)):
+                    quote_snapshot = await _load_core_orderbook_snapshot(settings)
+            except TimeoutError:
+                quote_snapshot = None
 
-            if eligible and quote_snapshot.get("connected") is True and (
+            quote_snapshot = quote_snapshot or {}
+            raw_passives = quote_snapshot.get("passive_quote_symbols")
+            raw_expiry = quote_snapshot.get("passive_quote_expires_at")
+            expiry = None
+            if isinstance(raw_expiry, str):
+                try:
+                    expiry = datetime.fromisoformat(raw_expiry)
+                except ValueError:
+                    pass
+            coverage = MonitoringQuoteWake(
+                None,
+                frozenset(
+                    symbol for symbol in raw_passives
+                    if isinstance(symbol, str) and is_canonical_krx_short_code(symbol)
+                ) if isinstance(raw_passives, list) else frozenset(),
+                expiry,
+            )
+
+            connected = quote_snapshot.get("connected") is True
+            checked_at = loop.time()
+            if eligible and connected and checked_at < deadline and (
                 self._last_core_book_wake is None
                 or checked_at - self._last_core_book_wake >= CORE_BOOK_WAKE_MIN_INTERVAL_SECONDS
             ):
@@ -769,16 +803,16 @@ class AutonomousRuntimeCoordinator:
                 if urgent_symbol is not None:
                     self._last_core_book_wake = checked_at
                     self._last_core_book_wake_by_symbol[urgent_symbol] = checked_at
-                    return MonitoringQuoteWake(urgent_symbol, covered_passives)
-            if not eligible or quote_snapshot.get("connected") is not True:
-                break
+                    return replace(coverage, urgent_symbol=urgent_symbol)
             remaining = deadline - loop.time()
-            if remaining <= CORE_BOOK_POLL_SECONDS:
+            if not eligible or remaining <= CORE_BOOK_POLL_SECONDS:
                 break
-            await asyncio.sleep(CORE_BOOK_POLL_SECONDS)
+            await asyncio.sleep(
+                CORE_BOOK_POLL_SECONDS if connected else remaining - CORE_BOOK_POLL_SECONDS
+            )
 
         await asyncio.sleep(max(0.0, deadline - loop.time()))
-        return MonitoringQuoteWake(None, covered_passives) if covered_passives else None
+        return coverage if coverage.passive_symbols_at(datetime.now(UTC)) else None
 
     def _periodic_loop_schedule(
         self,
@@ -1220,7 +1254,7 @@ class AutonomousRuntimeCoordinator:
         if quote_wake is not None:
             local_symbols = position_symbols | {item.symbol for item in snapshot.items}
             covered_passives = (
-                quote_wake.covered_passives & set(snapshot.passive_quote_symbols)
+                quote_wake.passive_symbols_at(datetime.now(UTC)) & set(snapshot.passive_quote_symbols)
             ) - local_symbols
             quote_symbols = [symbol for symbol in quote_symbols if symbol not in covered_passives]
             if (
@@ -3121,7 +3155,7 @@ def _dispatch_payload_changed_runtime_state(payload: dict[str, object]) -> bool:
     return isinstance(jobs, list) and bool(jobs)
 
 
-def _load_core_orderbook_snapshot(settings: Settings) -> dict[str, object] | None:
+async def _load_core_orderbook_snapshot(settings: Settings) -> dict[str, object] | None:
     base_url = settings.market_context_base_url
     token = settings.market_context_bearer_token
     if not base_url or not token:
@@ -3137,19 +3171,17 @@ def _load_core_orderbook_snapshot(settings: Settings) -> dict[str, object] | Non
             or target.fragment
         ):
             return None
-        connection = HTTPConnection(target.hostname, target.port, timeout=CORE_BOOK_TIMEOUT_SECONDS)
-        try:
-            connection.request("GET", "/quotes/realtime/orderbooks", headers={
-                "Authorization": f"Bearer {token}",
-            })
-            with connection.getresponse() as response:
-                if response.status != 200:
+        body = bytearray()
+        headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "identity"}
+        url = f"{base_url.rstrip('/')}/quotes/realtime/orderbooks"
+        async with httpx.AsyncClient(trust_env=False) as client:
+            async with client.stream("GET", url, headers=headers) as response:
+                if response.status_code != 200:
                     return None
-                body = response.read(65537)
-        finally:
-            connection.close()
-        if len(body) > 65536:
-            return None
+                async for chunk in response.aiter_raw():
+                    if len(body) + len(chunk) > 65536:
+                        return None
+                    body.extend(chunk)
         payload = json.loads(body)
         if (
             isinstance(payload, dict)
@@ -3157,7 +3189,7 @@ def _load_core_orderbook_snapshot(settings: Settings) -> dict[str, object] | Non
             and isinstance(payload.get("items"), list)
         ):
             return payload
-    except (OSError, ValueError, HTTPException):
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
         return None
     return None
 

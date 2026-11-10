@@ -900,9 +900,17 @@ def test_core_book_wake_still_requires_the_existing_kis_quote_and_falls_back(
             started_at, autonomous_runtime.MonitoringQuoteWake("000660", frozenset({"032080"})),
         )
         covered = coordinator._monitoring_cycle_sync_guarded(
-            started_at, autonomous_runtime.MonitoringQuoteWake(None, frozenset({"032080", "005930"})),
+            started_at,
+            autonomous_runtime.MonitoringQuoteWake(
+                None, frozenset({"032080", "005930"}), datetime.now(UTC) + timedelta(seconds=5),
+            ),
         )
-        fallback = coordinator._monitoring_cycle_sync_guarded(started_at)
+        fallback = coordinator._monitoring_cycle_sync_guarded(
+            started_at,
+            autonomous_runtime.MonitoringQuoteWake(
+                None, frozenset({"032080"}), datetime.now(UTC) - timedelta(seconds=1),
+            ),
+        )
     finally:
         engine.dispose()
 
@@ -1574,8 +1582,9 @@ def test_unknown_krx_calendar_result_fails_open_and_throttles_retry(
         engine.dispose()
 
 
+@pytest.mark.parametrize("urgent_overruns_normal_deadline", [False, True])
 def test_fresh_core_quote_wakes_sell_before_buy_and_still_polls_normally(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, urgent_overruns_normal_deadline: bool,
 ) -> None:
     async def scenario() -> None:
         settings = Settings(
@@ -1607,7 +1616,7 @@ def test_fresh_core_quote_wakes_sell_before_buy_and_still_polls_normally(
         )
         monkeypatch.setattr(autonomous_runtime, "_is_regular_market_session", lambda **_: True)
 
-        def snapshot(_):
+        async def snapshot(_):
             now = datetime.now(UTC)
             books = []
             for symbol, observed_at in (
@@ -1618,30 +1627,178 @@ def test_fresh_core_quote_wakes_sell_before_buy_and_still_polls_normally(
                     "price_as_of": observed_at.isoformat(), "price_received_at": observed_at.isoformat(),
                     "source": "kis_orderbook_ws",
                 })
-            return {"items": books, "connected": True, "passive_quote_symbols": ["012030"]}
+            return {
+                "items": books, "connected": True, "passive_quote_symbols": ["012030"],
+                "passive_quote_expires_at": (now + timedelta(seconds=1)).isoformat(),
+            }
 
         monkeypatch.setattr(autonomous_runtime, "_load_core_orderbook_snapshot", snapshot)
         calls = []
+        urgent_finished_at = None
+        normal_started_at = None
+        normal_interval = 0.15
 
         async def monitoring_cycle(started_at, wake=None):
+            nonlocal urgent_finished_at, normal_started_at
             calls.append(wake)
-            if len(calls) == 2:
+            if len(calls) == 1:
+                if urgent_overruns_normal_deadline:
+                    await asyncio.sleep(normal_interval + 0.02)
+                urgent_finished_at = asyncio.get_running_loop().time()
+            else:
+                normal_started_at = asyncio.get_running_loop().time()
                 coordinator._stopping = True
             return {"status_code": 200}
 
         coordinator._run_monitoring_cycle = monitoring_cycle
         coordinator._periodic_loop_schedule = lambda **_: SimpleNamespace(
-            delay_seconds=0.05, cadence_mode="market_active", next_wake_at=None,
+            delay_seconds=normal_interval, cadence_mode="market_active", next_wake_at=None,
         )
         await coordinator._run_periodic_loop(
-            worker_key="monitoring", interval_seconds=0.05,
+            worker_key="monitoring", interval_seconds=normal_interval,
             cycle=coordinator._run_monitoring_cycle,
         )
 
-        assert [(wake.urgent_symbol, wake.covered_passives) for wake in calls] == [
-            ("000660", frozenset({"012030"})),
-            (None, frozenset({"012030"})),
-        ]
+        assert calls[0].urgent_symbol == "000660"
+        assert calls[0].covered_passives == frozenset({"012030"})
+        assert normal_started_at is not None and urgent_finished_at is not None
+        if urgent_overruns_normal_deadline:
+            assert normal_started_at - urgent_finished_at < 0.10
+            assert calls[1] is None
+        else:
+            assert calls[1].urgent_symbol is None
+            assert calls[1].covered_passives == frozenset({"012030"})
+
+    asyncio.run(scenario())
+
+
+def test_optional_core_response_cannot_hold_regular_monitoring_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        request_received = asyncio.Event()
+        response_closed = asyncio.Event()
+        response_complete = False
+
+        async def dribble_response(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            nonlocal response_complete
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                request_received.set()
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n")
+                for _ in range(10):
+                    writer.write(b" ")
+                    await writer.drain()
+                    await asyncio.sleep(0.04)
+                response_complete = True
+            except (ConnectionError, asyncio.IncompleteReadError):
+                pass
+            finally:
+                writer.close()
+                response_closed.set()
+
+        server = await asyncio.start_server(dribble_response, "127.0.0.1", 0)
+        async with server:
+            port = server.sockets[0].getsockname()[1]
+            coordinator = AutonomousRuntimeCoordinator(
+                settings=Settings(
+                    database_url="sqlite:///:memory:",
+                    runtime_mode="live",
+                    runtime_broker_provider="kis",
+                    market_context_enabled=True,
+                    market_context_base_url=f"http://127.0.0.1:{port}",
+                    market_context_bearer_token="fake",
+                ),
+                session_factory=None,
+                broker_adapter_factory=lambda _: None,
+            )
+            coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+                loaded_at=datetime.now(UTC), symbols=["012030"], positions_by_symbol={},
+                items=[], filled_today_symbols=[], passive_quote_symbols=["012030"],
+            )
+            monkeypatch.setattr(autonomous_runtime, "_is_regular_market_session", lambda **_: True)
+            loop = asyncio.get_running_loop()
+            began = loop.time()
+            elapsed = None
+
+            async def regular_cycle(_):
+                nonlocal elapsed
+                elapsed = loop.time() - began
+                coordinator._stopping = True
+                return {"status_code": 200}
+
+            await coordinator._run_periodic_loop(
+                worker_key="monitoring", interval_seconds=0.12, cycle=regular_cycle,
+            )
+            await asyncio.wait_for(response_closed.wait(), 0.5)
+
+        assert request_received.is_set()
+        assert not response_complete
+        assert elapsed is not None and 0.10 <= elapsed < 0.25
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("coverage", ["expired", "missing_expiry", "recovers"])
+def test_regular_monitoring_uses_only_current_core_passive_coverage(
+    monkeypatch: pytest.MonkeyPatch, coverage: str,
+) -> None:
+    async def scenario() -> None:
+        coordinator = AutonomousRuntimeCoordinator(
+            settings=Settings(
+                database_url="sqlite:///:memory:",
+                runtime_mode="live",
+                runtime_broker_provider="kis",
+                market_context_enabled=True,
+                market_context_base_url="http://127.0.0.1:8000",
+                market_context_bearer_token="fake",
+            ),
+            session_factory=None,
+            broker_adapter_factory=lambda _: None,
+        )
+        coordinator._monitoring_runtime_snapshot = MonitoringRuntimeSnapshot(
+            loaded_at=datetime.now(UTC), symbols=["012030", "000660"], positions_by_symbol={},
+            items=[
+                CachedMonitoringItem("buy", "000660", "watch_buy", "accepted",
+                                     Decimal("100"), exchange="KRX"),
+            ] if coverage == "recovers" else [],
+            filled_today_symbols=[], passive_quote_symbols=["012030"],
+        )
+        monkeypatch.setattr(autonomous_runtime, "_is_regular_market_session", lambda **_: True)
+        polls = 0
+        soon_expired = datetime.now(UTC) + timedelta(seconds=0.05)
+
+        async def snapshot(_):
+            nonlocal polls
+            polls += 1
+            if coverage == "recovers" and polls == 1:
+                return None
+            result = {"items": [], "connected": False, "passive_quote_symbols": ["012030"]}
+            if coverage == "expired":
+                result["passive_quote_expires_at"] = soon_expired.isoformat()
+            elif coverage == "recovers":
+                result["passive_quote_expires_at"] = (
+                    datetime.now(UTC) + timedelta(seconds=1)
+                ).isoformat()
+            return result
+
+        monkeypatch.setattr(autonomous_runtime, "_load_core_orderbook_snapshot", snapshot)
+        calls = []
+
+        async def regular_cycle(_, wake=None):
+            calls.append(wake)
+            coordinator._stopping = True
+            return {"status_code": 200}
+
+        coordinator._run_monitoring_cycle = regular_cycle
+        await coordinator._run_periodic_loop(
+            worker_key="monitoring", interval_seconds=0.35, cycle=regular_cycle,
+        )
+        if coverage == "recovers":
+            assert polls == 2
+            assert calls[0].covered_passives == frozenset({"012030"})
+        else:
+            assert calls == [None]
 
     asyncio.run(scenario())
 
@@ -1692,7 +1849,7 @@ def test_periodic_loop_uses_session_aware_schedule(
             cycle=cycle,
         )
 
-        assert sleep_delays == [1.0, 60.0]
+        assert sleep_delays == pytest.approx([1.0, 60.0], abs=0.01)
         assert cycle_calls == 2
         snapshot = coordinator.snapshot()["monitoring"]
         assert snapshot["cadence_mode"] == "domestic_market_closed"
