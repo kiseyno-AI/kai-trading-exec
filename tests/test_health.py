@@ -5388,11 +5388,19 @@ def test_autonomous_monitoring_submits_same_symbol_sell_before_watch_buy_when_ca
     engine.dispose()
 
 
-def test_same_tick_two_lane_watch_buys_share_aggregate_exposure_without_cross_lane_dedupe(
+@pytest.mark.parametrize(
+    "observed_prices",
+    [(Decimal("100"),), (Decimal("100"), Decimal("95"))],
+    ids=["same-tick", "separate-ticks"],
+)
+def test_two_lane_watch_buys_use_their_own_prices_and_share_aggregate_exposure(
     monkeypatch: pytest.MonkeyPatch,
+    observed_prices: tuple[Decimal, ...],
 ) -> None:
     _use_historical_broker_boundary(monkeypatch)
     observed_at = datetime(2026, 10, 23, 1, 5, tzinfo=UTC)
+    signal_trigger = observed_prices[0]
+    short_term_trigger = observed_prices[-1]
     broker_adapter = StubMonitoringBrokerAdapter(
         account_snapshot=BrokerAccountSnapshot(
             available_cash=Decimal("1000.00"),
@@ -5429,6 +5437,8 @@ def test_same_tick_two_lane_watch_buys_share_aggregate_exposure_without_cross_la
         item_id: str,
         decision_agent_name: str,
         accepted_at: datetime,
+        trigger_price: Decimal,
+        chase_limit_price: Decimal,
     ) -> ExecutionPlanItem:
         risk_context, quantity_policy = bind_kis_account_route(
             settings=app.state.settings,
@@ -5437,7 +5447,8 @@ def test_same_tick_two_lane_watch_buys_share_aggregate_exposure_without_cross_la
             quantity_policy={
                 "kind": "shares",
                 "quantity": 8,
-                "stop_price": "99.0000",
+                "stop_price": str(trigger_price - 1),
+                "chase_limit_price": str(chase_limit_price),
                 "max_budget": "800.0000",
             },
         )
@@ -5453,8 +5464,8 @@ def test_same_tick_two_lane_watch_buys_share_aggregate_exposure_without_cross_la
             decision_agent_name=decision_agent_name,
             quantity_policy=quantity_policy,
             risk_context=risk_context,
-            trigger_price=Decimal("100.0000"),
-            limit_price=Decimal("100.0000"),
+            trigger_price=trigger_price,
+            limit_price=chase_limit_price,
             time_in_force="day",
         )
         session.add(
@@ -5475,51 +5486,66 @@ def test_same_tick_two_lane_watch_buys_share_aggregate_exposure_without_cross_la
         with app.state.db_session_factory() as session:
             add_watch_plan(
                 session,
-                item_id="same-tick-signal-old",
+                item_id="two-lane-signal-old",
                 decision_agent_name="signal-decider",
                 accepted_at=observed_at - timedelta(minutes=3),
+                trigger_price=signal_trigger,
+                chase_limit_price=Decimal("105"),
             )
             newer_signal = add_watch_plan(
                 session,
-                item_id="same-tick-signal-new",
+                item_id="two-lane-signal-new",
                 decision_agent_name=" SIGNAL-DECIDER ",
                 accepted_at=observed_at - timedelta(minutes=2),
+                trigger_price=signal_trigger,
+                chase_limit_price=Decimal("105"),
             )
             short_term = add_watch_plan(
                 session,
-                item_id="same-tick-short-term",
+                item_id="two-lane-short-term",
                 decision_agent_name="short-term-decider",
                 accepted_at=observed_at - timedelta(minutes=1),
+                trigger_price=short_term_trigger,
+                chase_limit_price=Decimal("103"),
             )
             session.commit()
 
-            result = run_autonomous_monitoring_cycle(
-                settings=app.state.settings,
-                db=session,
-                adapter=broker_adapter,
-                prices=[
-                    MonitoringPriceRequest(
-                        symbol="005930",
-                        price=Decimal("100.0000"),
-                        observed_at=observed_at,
-                    )
-                ],
-                symbols=["005930"],
-                now=observed_at,
-            )
+            for offset, price in enumerate(observed_prices):
+                tick_at = observed_at + timedelta(seconds=offset)
+                result = run_autonomous_monitoring_cycle(
+                    settings=app.state.settings,
+                    db=session,
+                    adapter=broker_adapter,
+                    prices=[
+                        MonitoringPriceRequest(
+                            symbol="005930",
+                            price=price,
+                            observed_at=tick_at,
+                        )
+                    ],
+                    symbols=["005930"],
+                    now=tick_at,
+                )
+                assert result.status_code == 200
+                if offset == 0:
+                    assert result.payload["evaluated_item_count"] == 2
+                if price > short_term_trigger:
+                    assert result.payload["submitted_order_count"] == 1
+                    assert short_term.status == "watch_monitoring_active"
+                    assert [
+                        request.execution_plan_item_id
+                        for request in broker_adapter.order_calls
+                    ] == [newer_signal.id]
 
-            assert result.status_code == 200
-            assert result.payload["evaluated_item_count"] == 2
-            assert result.payload["submitted_order_count"] == 2
-            assert {
-                request.execution_plan_item_id
+            orders = {
+                request.execution_plan_item_id: request
                 for request in broker_adapter.order_calls
-            } == {newer_signal.id, short_term.id}
-            assert sorted(request.quantity for request in broker_adapter.order_calls) == [2, 8]
-            assert sum(
-                Decimal(request.quantity) * Decimal("100")
-                for request in broker_adapter.order_calls
-            ) == Decimal("1000")
+            }
+            assert len(broker_adapter.order_calls) == 2
+            assert orders.keys() == {newer_signal.id, short_term.id}
+            assert orders[newer_signal.id].limit_price == signal_trigger
+            assert orders[short_term.id].limit_price == short_term_trigger
+            assert sorted(request.quantity for request in orders.values()) == [2, 8]
 
             assert newer_signal.status == "watch_buy_submitted"
             assert short_term.status == "watch_buy_submitted"

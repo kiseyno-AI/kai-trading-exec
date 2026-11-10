@@ -632,6 +632,15 @@ durable but dormant: they cannot enter the monitoring universe, supersede a
 current watch, populate a runtime buy cache, or pass the final broker boundary
 before their date.
 
+Core sends a separate plan for each decision lane, `signal-decider` and
+`short-term-decider`. When both lanes delegate an executable `WAIT` for the
+same account and symbol, Exec keeps two entry families. Each uses its own
+trigger direction, trigger price, chase limit, and linked target and stop.
+`REJECT` and `AVOID_CHASE` carry no entry authority. The other lane's watch
+remains eligible. Each triggered family can submit its own buy order when its
+execution checks pass. Deduplication applies within a lane, while account cash
+and aggregate symbol exposure limits apply across both lanes.
+
 `POST /v4/execution-plans/revocations` atomically fences the exact submitted items. With no committed order or exposure, entry and exits are revoked. Any order that is not conclusively local pre-submission rejected/failed requires manual review; the stale buy and its lease remain non-claimable while protective target/stop exits are preserved. Every result has an exact per-item acknowledgement. Persisted pre-v4 plans marked as Core-originated are reconciled before job claims and direct order placement. When immutable item identity and entry/exit linkage remain exact, only the invalid entry family is fenced and independent verified or retryable siblings remain unchanged. Corrupt counts, duplicate identities, malformed linkage, or another globally ambiguous intake mapping trigger the conservative plan-wide fallback that fences every buy. Sell protection is retained in either case.
 
 ### `POST /execution-plans`
