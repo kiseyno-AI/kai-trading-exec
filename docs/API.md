@@ -1191,6 +1191,17 @@ The autonomous runtime now retries persisted `*_triggered_pending_dispatch` and
 evaluate fresh triggers when a monitoring price source is configured. This
 endpoint remains as an operator/manual override.
 
+During KRX regular trading, live KIS monitoring with authenticated loopback
+Core configuration checks `GET /quotes/realtime/orderbooks` while waiting for
+its next cycle. A fresh book that crosses a local trigger may advance one
+symbol's cycle. Sell triggers have priority and the next cycle uses the
+normal workset. The Core book only selects the symbol. The cycle fetches the
+existing broker evidence and applies the same execution checks and limits.
+Core-confirmed passive coverage can omit duplicate Exec quotes for those
+observation-only symbols. Missing coverage or an unreachable Core restores
+the normal quote workset. A wake is reported as
+`liveness.monitoring.last_cycle.core_book_urgent_symbol`.
+
 For KIS watch buys, monitoring checks the configured account/currency recovery
 latch before risk sizing. A known cooldown remains blocked without an extra
 broker snapshot; once eligible, the order service repeats the recovery check
