@@ -1248,3 +1248,88 @@ def test_kis_price_source_skips_new_quote_batch_while_timed_out_workers_are_stil
         first_thread.join(timeout=1)
         price_source.close()
         engine.dispose()
+
+
+def test_live_context_starts_before_unrelated_quote_finishes():
+    """A slow symbol must not hold every other symbol behind the quote phase."""
+    observed_at = datetime(2026, 6, 9, 1, 5, tzinfo=UTC)
+    release_slow_quote = threading.Event()
+    slow_quote_started = threading.Event()
+    context_started = threading.Event()
+
+    class Adapter(LiveMarketContextAdapter):
+        def get_current_price(self, access_token, *, symbol, exchange='KRX'):
+            if symbol == '000001':
+                slow_quote_started.set()
+                assert release_slow_quote.wait(timeout=5)
+            return super().get_current_price(access_token, symbol=symbol, exchange=exchange)
+
+        def get_live_market_context(self, access_token, *, symbol, exchange='KRX', reference_price=None):
+            if symbol == '000002':
+                context_started.set()
+            return super().get_live_market_context(
+                access_token, symbol=symbol, exchange=exchange, reference_price=reference_price,
+            )
+
+    adapter = Adapter(
+        config=BrokerConfig(provider='kis', mode='paper', configured=True, api_base_url=KIS_PAPER_API_BASE_URL),
+        token_grant=build_token_grant(),
+        current_prices={'000001': Decimal('100'), '000002': Decimal('100')},
+        current_price_observed_at=observed_at,
+    )
+    app, engine = build_test_app(
+        settings=Settings(database_url='sqlite:///:memory:', runtime_mode='paper',
+                          kis_app_key='paper-key', kis_app_secret='paper-secret', kis_account_number='12345678'),
+        broker_adapter=adapter,
+    )
+    source = KisCurrentQuoteMonitoringPriceSource(
+        settings=app.state.settings, session_factory=app.state.db_session_factory,
+        broker_adapter_factory=lambda _: adapter,
+    )
+    result = []
+    worker = threading.Thread(target=lambda: result.extend(source.get_prices(
+        symbols=['000001', '000002'], observed_at=observed_at, settings=app.state.settings,
+    )))
+    try:
+        worker.start()
+        assert slow_quote_started.wait(timeout=3)
+        assert context_started.wait(timeout=1), 'ready symbols wait behind an unrelated blocked quote'
+    finally:
+        release_slow_quote.set()
+        worker.join(timeout=3)
+        source.close()
+        engine.dispose()
+    assert [price.symbol for price in result] == ['000001', '000002']
+
+
+@pytest.mark.parametrize('symbol_count', [100, 250])
+def test_price_source_covers_full_watchlist_and_recovers_failed_symbols(symbol_count):
+    symbols = [f'{index:06d}' for index in range(1, symbol_count + 1)]
+    failed_symbol = symbols[-1]
+    adapter = SymbolScopedQuoteErrorAdapter(
+        config=BrokerConfig(provider='kis', mode='paper', configured=True, api_base_url=KIS_PAPER_API_BASE_URL),
+        token_grant=build_token_grant(), current_prices={symbol: Decimal('100') for symbol in symbols},
+        current_price_errors={failed_symbol: RuntimeError('fixture temporary quote failure')},
+    )
+    app, engine = build_test_app(
+        settings=Settings(database_url='sqlite:///:memory:', runtime_mode='paper',
+                          kis_app_key='paper-key', kis_app_secret='paper-secret', kis_account_number='12345678'),
+        broker_adapter=adapter,
+    )
+    source = KisCurrentQuoteMonitoringPriceSource(
+        settings=app.state.settings, session_factory=app.state.db_session_factory,
+        broker_adapter_factory=lambda _: adapter,
+    )
+    try:
+        first = source.get_prices(symbols=symbols, observed_at=datetime.now(UTC), settings=app.state.settings)
+        assert [price.symbol for price in first] == symbols[:-1]
+        assert {symbol for symbol, _ in adapter.current_price_calls} == set(symbols)
+        assert source.get_last_diagnostics()['missing_symbols'] == [failed_symbol]
+        adapter.current_price_errors.clear()
+        recovered = source.get_prices(symbols=symbols, observed_at=datetime.now(UTC), settings=app.state.settings)
+        assert [price.symbol for price in recovered] == symbols
+        assert source.get_last_diagnostics()['missing_symbol_count'] == 0
+        assert adapter.order_calls == []
+    finally:
+        source.close()
+        engine.dispose()

@@ -144,6 +144,32 @@ does not create trading decisions.
     - `last_success_at`
     - `last_error`
     - `last_cycle`
+
+Monitoring quote cycles bound the entire selected workset, including held positions, by
+`monitoring_max_symbols_per_cycle`. Held positions lead each complete sweep. The quote ring preserves its initial Core
+priority, removes departed symbols, and appends new symbols; DB priority changes
+do not reorder an in-progress ring. All remaining symbols rotate; a Core urgent hint can preempt at most alternating
+selections. Reconciliation refreshes the workset before selecting a batch, so it
+does not advance the cursor for discarded work. Triggered sells lead selection;
+a shared action budget reserves room for a competing BUY. When only one action
+fits, the least-recently-served symbol/side wins, with SELL priority on ties. A BUY on the same symbol as a triggered
+protective SELL intentionally waits for that protective exit; this preserves the
+existing opposite-side risk policy. Least-recently-served selection prevents a
+repeatedly blocked symbol from starving other symbols' triggers.
+
+Every cross detected from a sampled quote is passed through the existing
+DB-backed trigger evaluator, even when only a subset may dispatch. Its persisted
+trigger metadata and pending-dispatch state survive a restart. Dispatch deferral
+never substitutes an old price for current evidence: the normal freshness,
+chase limit, position, idempotency and safety checks still govern any order.
+
+`liveness.autonomous.monitoring.last_cycle.monitoring_coverage` reports
+`workset_symbol_count`, `selected_symbol_count`, `deferred_symbol_count`, and
+`missing_quote_symbol_count`. The workset includes inactive-session and passive
+symbols; deferred means not selected in this cycle, not removed from monitoring.
+Missing quotes are selected symbols without a returned price. These counts describe
+sampling coverage, not guaranteed exchange tick delivery or successful orders.
+
 - `liveness.monitoring`
   - `status` (`not_started`, `running`, `degraded`)
   - `topology` (`shared_symbol_scheduler`)

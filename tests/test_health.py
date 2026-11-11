@@ -6509,7 +6509,7 @@ def test_plan_item_exchange_loads_deferred_risk_context_from_file_db(tmp_path) -
     engine.dispose()
 
 
-def test_monitoring_cycle_preserves_all_held_symbols_past_fast_path_cap(tmp_path) -> None:
+def test_monitoring_cycle_rotates_all_held_symbols_within_fast_path_cap(tmp_path) -> None:
     class StaticMonitoringPriceSource:
         provider = "test"
 
@@ -6588,8 +6588,12 @@ def test_monitoring_cycle_preserves_all_held_symbols_past_fast_path_cap(tmp_path
         datetime(2026, 6, 8, 1, 5, tzinfo=UTC)
     )
 
-    assert payload["monitored_symbols"] == ["000001", "000002", "000003"]
-    assert price_source.calls == [["000001", "000002", "000003"]]
+    assert payload["monitored_symbols"] == ["000001", "000002"]
+    app.state.autonomous_runtime._monitoring_cycle_sync(
+        datetime(2026, 6, 8, 1, 5, 1, tzinfo=UTC)
+    )
+    assert set().union(*(set(call) for call in price_source.calls)) == {"000001", "000002", "000003"}
+    assert all(len(call) <= 2 for call in price_source.calls)
 
     engine.dispose()
 

@@ -1344,6 +1344,7 @@ def run_autonomous_monitoring_cycle(
     adapter: BrokerAdapter,
     prices: list[MonitoringPriceRequest] | None = None,
     symbols: list[str] | set[str] | None = None,
+    dispatch_symbols: list[str] | None = None,
     auth_session_factory: sessionmaker[Session] | None = None,
     now: datetime | None = None,
     quote_freshness_at: datetime | None = None,
@@ -1356,6 +1357,7 @@ def run_autonomous_monitoring_cycle(
         adapter=adapter,
         prices={price.symbol: price for price in (prices or [])},
         symbols=symbol_scope or None,
+        dispatch_symbols=dispatch_symbols,
         triggered_at=triggered_at,
         quote_freshness_at=_normalize_utc(quote_freshness_at or triggered_at),
         allow_persisted_triggered_without_price=True,
@@ -2895,6 +2897,7 @@ def _evaluate_monitoring_cycle(
     adapter: BrokerAdapter,
     prices: dict[str, MonitoringPriceRequest],
     symbols: list[str] | set[str] | None = None,
+    dispatch_symbols: list[str] | None = None,
     triggered_at: datetime,
     quote_freshness_at: datetime | None = None,
     allow_persisted_triggered_without_price: bool,
@@ -3649,11 +3652,13 @@ def _evaluate_monitoring_cycle(
 
     max_broker_actions = settings.monitoring_max_broker_actions_per_cycle
     _prioritize_sell_actions_by_symbol(actions_by_symbol)
+    dispatch_scope = set(dispatch_symbols) if dispatch_symbols is not None else None
     pending_symbols = deque(
-        _prioritized_monitoring_symbol_order(
+        symbol for symbol in _prioritized_monitoring_symbol_order(
             symbol_order=symbol_order,
             actions_by_symbol=actions_by_symbol,
         )
+        if dispatch_scope is None or symbol in dispatch_scope
     )
     if max_broker_actions <= 0:
         backlog_symbols: set[str] = set()
