@@ -898,8 +898,15 @@ def _dispatch_job(
 
     policy = job.plan_item.quantity_policy
     if isinstance(policy, dict) and policy.get('type') == 'core_sized':
-        from app.services.core_quantity import executable_core_quantity
+        from app.services.core_quantity import core_quantity_wait_until, executable_core_quantity
 
+        ready_at = core_quantity_wait_until(db=db, item=job.plan_item)
+        if ready_at is not None:
+            return _finish_job(
+                db=db, job_id=job_id, expected_locked_at=lease_locked_at,
+                status='retrying', last_error='Core quantity is not yet valid',
+                plan_item_status=_retrying_plan_item_status(job.job_type), scheduled_for=ready_at,
+            )
         if executable_core_quantity(db=db, item=job.plan_item) <= 0:
             return _finish_job(
                 db=db, job_id=job_id, expected_locked_at=lease_locked_at,
@@ -1047,20 +1054,21 @@ def _dispatch_job(
         and command.metadata.get('core_quantity_revision') != latest_policy.get('revision')
         and result.status_code >= 400
     ):
-        from app.services.core_quantity import executable_core_quantity
+        from app.services.core_quantity import core_quantity_wait_until, executable_core_quantity
         from app.services.execution_exposure import broker_order_is_provably_unsubmitted
 
         earlier_intent = db.scalar(select(BrokerOrder).where(
             BrokerOrder.mode == settings.runtime_mode, BrokerOrder.idempotency_key == command.idempotency_key,
         ))
+        ready_at = core_quantity_wait_until(db=db, item=job.plan_item)
         if (
             (earlier_intent is None or broker_order_is_provably_unsubmitted(earlier_intent))
-            and executable_core_quantity(db=db, item=job.plan_item) > 0
+            and (ready_at is not None or executable_core_quantity(db=db, item=job.plan_item) > 0)
         ):
             return _finish_job(
                 db=db, job_id=job_id, expected_locked_at=lease_locked_at,
                 status='retrying', last_error='Core quantity changed before broker intent',
-                plan_item_status='next_open_buy_retry_pending',
+                plan_item_status='next_open_buy_retry_pending', scheduled_for=ready_at,
             )
 
     order_payload = result.payload.get("order")

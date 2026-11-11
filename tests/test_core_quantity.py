@@ -357,7 +357,8 @@ def test_final_quantity_boundary_excludes_only_its_fresh_local_intent(monkeypatc
     engine.dispose()
 
 
-def test_running_next_open_job_keeps_latest_revision_claimable_when_old_command_is_rejected(monkeypatch):
+@pytest.mark.parametrize('future_calculated_at', [False, True])
+def test_running_next_open_job_keeps_latest_revision_claimable_when_old_command_is_rejected(monkeypatch, future_calculated_at):
     from datetime import timedelta
     from types import SimpleNamespace
     from app.api.schemas.execution import CoreQuantityRevisionRequest
@@ -372,7 +373,7 @@ def test_running_next_open_job_keeps_latest_revision_claimable_when_old_command_
         original = core_plan()
         accepted = client.post('/v4/execution-plans', json=original).json()
         request = revision_request(accepted, original, target=12)
-        request['calculated_at'] = (claimed_at + timedelta(seconds=1)).isoformat()
+        request['calculated_at'] = (claimed_at + timedelta(seconds=20 if future_calculated_at else 1)).isoformat()
 
         def revise_before_final_lock(*, db, command, **kwargs):
             result = core_quantity.revise_core_quantities(
@@ -400,5 +401,86 @@ def test_running_next_open_job_keeps_latest_revision_claimable_when_old_command_
             db.refresh(job)
             assert job.plan_item.status == 'next_open_buy_retry_pending'
             assert job.plan_item.quantity_policy['revision'] == 2, job.last_error
+            if future_calculated_at:
+                assert job.scheduled_for.replace(tzinfo=UTC) == claimed_at + timedelta(seconds=20)
             assert db.scalars(select(BrokerOrder)).all() == []
+    engine.dispose()
+
+
+@pytest.mark.parametrize('initial_policy', [False, True])
+def test_future_dated_core_quantity_retries_at_validity_start_then_submits_once(monkeypatch, initial_policy):
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from app.models.runtime import ExecutionJob
+    from app.services import execution_jobs
+    from app.services.broker_orders import PlaceBrokerOrderResult
+
+    clock = [datetime(2026, 9, 10, 2, tzinfo=UTC)]
+    begins_at = clock[0] + timedelta(seconds=20)
+    monkeypatch.setattr(core_quantity, 'utc_now', lambda: clock[0])
+    submitted = []
+
+    def submit(*, db, command, **kwargs):
+        submitted.append(command)
+        order = BrokerOrder(execution_plan_item_id=command.execution_plan_item_id, broker_name='kis', mode='mock', idempotency_key=command.idempotency_key, broker_order_id='future-fill', symbol=command.symbol, side='buy', quantity=command.quantity, status='filled')
+        db.add(order)
+        db.commit()
+        return PlaceBrokerOrderResult(status_code=200, payload={'order': {'broker_order_pk': order.id, 'status': 'filled'}})
+
+    monkeypatch.setattr(execution_jobs, 'place_broker_order', submit)
+    app, engine = _build_test_app()
+    with TestClient(app) as client:
+        original = core_plan()
+        if initial_policy:
+            original['items'][0]['quantity_policy']['calculated_at'] = begins_at.isoformat()
+            _refresh_material_fingerprint(original)
+        accepted = client.post('/v4/execution-plans', json=original).json()
+        if not initial_policy:
+            update = revision_request(accepted, original, target=12)
+            update['calculated_at'] = begins_at.isoformat()
+            assert client.post('/v4/execution-plans/quantities', json={'items': [update]}).json()['updated_count'] == 1
+        with app.state.db_session_factory() as db:
+            job = db.scalar(select(ExecutionJob).where(ExecutionJob.job_type == 'next_open_buy'))
+            job.status, job.locked_at, job.plan_item.status = 'running', clock[0], 'next_open_buy_dispatching'
+            db.commit()
+            assert execution_jobs._dispatch_job(settings=app.state.settings, db=db, adapter=SimpleNamespace(provider='kis'), job_id=job.id, claim_locked_at=clock[0]) == 'retrying'
+            db.refresh(job)
+            assert job.scheduled_for.replace(tzinfo=UTC) == begins_at
+            assert core_quantity.executable_core_quantity(db=db, item=job.plan_item) == 0 and submitted == []
+            clock[0] += timedelta(seconds=21)
+            job.status, job.locked_at, job.plan_item.status = 'running', clock[0], 'next_open_buy_dispatching'
+            db.commit()
+            assert execution_jobs._dispatch_job(settings=app.state.settings, db=db, adapter=SimpleNamespace(provider='kis'), job_id=job.id, claim_locked_at=clock[0]) == 'completed'
+            assert len(submitted) == 1 and submitted[0].quantity == (10 if initial_policy else 12)
+            assert submitted[0].metadata['core_quantity_revision'] == (1 if initial_policy else 2)
+            assert core_quantity.executable_core_quantity(db=db, item=job.plan_item) == 0
+    engine.dispose()
+
+
+def test_future_dated_watch_keeps_retryable_monitoring_without_early_quantity(monkeypatch):
+    from datetime import timedelta
+    from decimal import Decimal
+    from types import SimpleNamespace
+    from app.services import monitoring
+
+    clock = [datetime(2026, 9, 10, 2, tzinfo=UTC)]
+    monkeypatch.setattr(core_quantity, 'utc_now', lambda: clock[0])
+    original = core_plan()
+    original['items'][0]['intent'] = 'intraday_watch_buy'
+    original['items'][0]['trigger_price'] = '70000'
+    original['items'][0]['quantity_policy']['calculated_at'] = (clock[0] + timedelta(seconds=20)).isoformat()
+    _refresh_material_fingerprint(original)
+    app, engine = _build_test_app()
+    with TestClient(app) as client:
+        response = client.post('/v4/execution-plans', json=original)
+        assert response.status_code == 201, response.json()
+        with app.state.db_session_factory() as db:
+            entry = db.scalar(select(ExecutionPlanItem).where(ExecutionPlanItem.side == 'buy'))
+            before = entry.status
+            approval = monitoring._resolve_watch_buy_order(settings=app.state.settings, db=db, adapter=SimpleNamespace(provider='kis'), item=entry, observed_price=Decimal('70000'))
+            assert approval.quantity is None and approval.reason in monitoring.RETRYABLE_WATCH_BUY_APPROVAL_REASONS
+            assert entry.status == before and before == 'watch_monitoring_active'
+            clock[0] += timedelta(seconds=21)
+            assert core_quantity.executable_core_quantity(db=db, item=entry) == 10
+            assert entry.status == before
     engine.dispose()

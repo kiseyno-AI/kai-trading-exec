@@ -218,7 +218,7 @@ def test_blocking_quantity_cancellation_runs_independently_from_protective_monit
 
 
 @pytest.mark.parametrize(('terminal_status', 'filled_count'), [('filled', 10), ('canceled', 4)])
-@pytest.mark.parametrize('lifecycle', ['active', 'closed', 'expired', 'running', 'newer_revision', 'repair_replay', 'revoked_during_reconcile'])
+@pytest.mark.parametrize('lifecycle', ['active', 'closed', 'expired', 'running', 'newer_revision', 'repair_replay', 'revoked_during_reconcile', 'future_validity'])
 def test_upward_revision_waits_durably_for_open_buy_then_rearms_latest_remainder_once(monkeypatch, terminal_status, filled_count, lifecycle):
     from app.services import execution_jobs
 
@@ -273,6 +273,8 @@ def test_upward_revision_waits_durably_for_open_buy_then_rearms_latest_remainder
         update = revision_request(accepted, plan, target=12)
         if lifecycle == 'expired':
             update['valid_until'] = (clock[0] + timedelta(seconds=20)).isoformat()
+        if lifecycle == 'future_validity':
+            update['calculated_at'] = (clock[0] + timedelta(seconds=20)).isoformat()
         result = client.post('/v4/execution-plans/quantities', json={'items': [update]}).json()
         assert result['updated_count'] == 1
         with app.state.db_session_factory() as db:
@@ -313,12 +315,20 @@ def test_upward_revision_waits_durably_for_open_buy_then_rearms_latest_remainder
                     job.status, job.locked_at = 'running', clock[0]
                     job.plan_item.status = 'next_open_buy_dispatching'
                 db.commit()
-        clock[0] += timedelta(seconds=31)
+        clock[0] += timedelta(seconds=10 if lifecycle == 'future_validity' else 31)
         broker_status[0] = terminal_status
         with app.state.db_session_factory() as db:
             core_quantity_reductions.process_core_quantity_reductions(settings=app.state.settings, db=db, adapter=adapter, now=clock[0], krx_trading_day=lambda day: True)
             jobs = db.scalars(select(ExecutionJob).where(ExecutionJob.job_type == 'next_open_buy')).all()
             followup = db.scalar(select(ExecutionJob).where(ExecutionJob.job_type == core_quantity_reductions.JOB_TYPE))
+            if lifecycle == 'future_validity':
+                assert jobs[0].status == 'completed' and followup.status == 'retrying'
+                assert followup.scheduled_for.replace(tzinfo=UTC) == datetime(2026, 9, 10, 2, 0, 20, tzinfo=UTC)
+                assert core_quantity.executable_core_quantity(db=db, item=jobs[0].plan_item) == 0
+                clock[0] += timedelta(seconds=11)
+                core_quantity_reductions.process_core_quantity_reductions(settings=app.state.settings, db=db, adapter=adapter, now=clock[0], krx_trading_day=lambda day: True)
+                db.refresh(jobs[0])
+                db.refresh(followup)
             if lifecycle == 'revoked_during_reconcile':
                 assert jobs[0].status == 'superseded' and followup.status == 'completed'
                 assert jobs[0].plan_item.status == 'revoked'

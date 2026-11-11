@@ -76,7 +76,7 @@ def queue_core_quantity_reduction(*, db, item, now):
 def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_trading_day=None):
     from app.services.broker_auth import ensure_authenticated_broker_session
     from app.services.core_handoff_v4 import persisted_core_plan_contract_ack
-    from app.services.core_quantity import _rearm_quantity_item, executable_core_quantity
+    from app.services.core_quantity import _rearm_quantity_item, core_quantity_wait_until, executable_core_quantity
     from app.services.core_revocation_exposure import serialized_revocation_exposure
 
     now = now or utc_now()
@@ -193,10 +193,14 @@ def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_tra
                     if state['remaining_quantity'] and state['submission_uncertain']:
                         job.status, job.last_error = 'retrying', 'quantity_followup_submission_uncertain'
                         job.scheduled_for = utc_now() + timedelta(seconds=15)
-                    elif executable_core_quantity(db=db, item=item) and item.status not in {
+                    elif item.status not in {
                         'core_activation_pending', 'revoked', 'superseded', 'manual_review_required', 'contract_quarantined',
                     }:
-                        if not _rearm_quantity_item(db=db, item=item, now=utc_now()):
+                        ready_at = core_quantity_wait_until(db=db, item=item)
+                        if ready_at is not None:
+                            job.status, job.last_error = 'retrying', 'quantity_followup_not_yet_valid'
+                            job.scheduled_for = ready_at
+                        elif executable_core_quantity(db=db, item=item) and not _rearm_quantity_item(db=db, item=item, now=utc_now()):
                             job.status, job.last_error = 'retrying', 'quantity_followup_dispatch_in_flight'
                             job.scheduled_for = utc_now() + timedelta(seconds=15)
                 db.commit()

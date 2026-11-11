@@ -318,6 +318,16 @@ def executable_core_quantity(*, db: Session, item: ExecutionPlanItem, now: datet
     return 0 if state['submission_uncertain'] else state['remaining_quantity']
 
 
+def core_quantity_wait_until(*, db: Session, item: ExecutionPlanItem, now: datetime | None = None) -> datetime | None:
+    now = now or utc_now()
+    policy = _quantity_policy(item.quantity_policy)
+    if now < policy.calculated_at < policy.valid_until:
+        state = core_quantity_state(db=db, item=item)
+        if state['remaining_quantity'] and not state['submission_uncertain']:
+            return policy.calculated_at
+    return None
+
+
 def core_quantity_order_failure(*, db, item, command, exclude_order_id=None):
     if item is None or command.side != 'buy' or not is_core_sized(item.quantity_policy):
         return None
