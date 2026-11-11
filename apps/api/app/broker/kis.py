@@ -576,6 +576,8 @@ class KisBrokerAdapter(BrokerAdapter):
         if len(matches) != 1:
             raise BrokerAdapterError('cancelable order identity is ambiguous', status_code=409)
         row = matches[0]
+        if _optional_string(row.get('sll_buy_dvsn_cd')) != '02':
+            raise BrokerAdapterError('cancelable order is not positively identified as a BUY', status_code=409)
         possible = _parse_int(row.get('psbl_qty'))
         organization = _optional_string(row.get('krx_fwdg_ord_orgno')) or _optional_string(row.get('ord_gno_brno'))
         if possible is None or possible <= 0 or not organization:

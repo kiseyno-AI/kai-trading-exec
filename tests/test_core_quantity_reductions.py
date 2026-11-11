@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from app.broker.base import BrokerAdapterError
 from app.broker.kis import KisBrokerAdapter
 from app.core.config import Settings
 from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionJob, ExecutionPlan, ExecutionPlanItem
@@ -23,6 +24,7 @@ def test_kis_cancel_checks_current_cancelable_order_and_cancels_only_remaining_b
         get_response={'rt_cd': '0', 'output': [{
             'odno': 'original-1', 'pdno': '005930', 'psbl_qty': '3',
             'krx_fwdg_ord_orgno': 'branch-1', 'ord_dvsn_cd': '00',
+            'sll_buy_dvsn_cd': '02',
         }]},
     )
     adapter = KisBrokerAdapter(settings=Settings(
@@ -40,6 +42,30 @@ def test_kis_cancel_checks_current_cancelable_order_and_cancels_only_remaining_b
     assert http.calls[0]['payload']['ORD_QTY'] == '3'
     assert adapter.cancel_order('fake-token', broker_order_id='another-order', symbol='005930')['status'] == 'not_cancelable'
     assert len(http.calls) == 1
+
+
+@pytest.mark.parametrize('broker_side', ['01', None])
+def test_kis_cancel_rejects_sell_or_missing_broker_side_without_cancel_post(broker_side):
+    row = {
+        'odno': 'original-1', 'pdno': '005930', 'psbl_qty': '3',
+        'krx_fwdg_ord_orgno': 'branch-1', 'ord_dvsn_cd': '00',
+    }
+    if broker_side is not None:
+        row['sll_buy_dvsn_cd'] = broker_side
+    http = RecordingHttpClient(
+        {'rt_cd': '0', 'output': {'ODNO': 'cancel-ticket'}},
+        get_response={'rt_cd': '0', 'output': [row]},
+    )
+    adapter = KisBrokerAdapter(settings=Settings(
+        runtime_mode='live', kis_app_key='fake-key', kis_app_secret='fake-secret',
+        kis_account_number='12345678', kis_use_hashkey=False,
+    ), http_client=http)
+
+    with pytest.raises(BrokerAdapterError, match='positively identified as a BUY'):
+        adapter.cancel_order('fake-token', broker_order_id='original-1', symbol='005930')
+
+    assert len(http.get_calls) == 1
+    assert http.calls == []
 
 
 @pytest.mark.parametrize('outcome', ['success', 'unknown', 'foreign_account', 'inquiry_failure', 'temporarily_not_cancelable', 'lost_claim', 'raced_intent', 'stale_job'])
