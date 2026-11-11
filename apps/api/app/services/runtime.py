@@ -3799,6 +3799,7 @@ def build_runtime_status(
     runtime_scope: RuntimeExecutionScope | None = None,
     runtime_startup_gate: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    from app.services.core_quantity import runtime_core_quantity_account
     runtime_provider = _normalize_runtime_provider(
         getattr(broker_adapter, "provider", "kis")
     )
@@ -3815,6 +3816,10 @@ def build_runtime_status(
         ),
     )
     runtime_scope_payload = _runtime_execution_scope_payload(active_runtime_scope)
+    core_quantity_account = runtime_core_quantity_account(
+        db=db, settings=settings,
+        scope_available=runtime_provider == 'kis' and active_runtime_scope.available,
+    )
     runtime_scope_reasons = (
         []
         if active_runtime_scope.available
@@ -4110,6 +4115,7 @@ def build_runtime_status(
             "mode": safety["mode"],
             "execution_scope": runtime_scope_payload,
             "exec_agent": exec_agent_runtime_configuration(settings),
+            "core_quantity_account": core_quantity_account,
             "ready": readiness["ready"],
             "readiness": readiness,
             "safety": safety,
@@ -4186,6 +4192,7 @@ def build_runtime_status(
             "mode": safety["mode"],
             "execution_scope": runtime_scope_payload,
             "exec_agent": exec_agent_runtime_configuration(settings),
+            "core_quantity_account": core_quantity_account,
             "ready": readiness["ready"],
             "readiness": readiness,
             "safety": safety,
@@ -4252,6 +4259,7 @@ def build_runtime_status(
             "mode": safety["mode"],
             "execution_scope": runtime_scope_payload,
             "exec_agent": exec_agent_runtime_configuration(settings),
+            "core_quantity_account": core_quantity_account,
             "ready": readiness["ready"],
             "readiness": readiness,
             "safety": safety,
@@ -4467,6 +4475,7 @@ def build_runtime_status(
         "mode": safety["mode"],
         "execution_scope": runtime_scope_payload,
         "exec_agent": exec_agent_runtime_configuration(settings),
+        "core_quantity_account": core_quantity_account,
         "ready": readiness["ready"],
         "readiness": readiness,
         "safety": safety,

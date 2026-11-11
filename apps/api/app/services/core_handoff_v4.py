@@ -839,6 +839,8 @@ def _protected_entry_family_failure(
         if _nonempty_text(item.source_plan_item_id) is not None
     }
     for entry in command.items:
+        if entry.quantity_policy.get('type') == 'core_sized' and entry.quantity_policy.get('target_quantity') == 0:
+            continue
         if (
             entry.side != "buy"
             or entry.intent != "next_open_buy"
@@ -2250,6 +2252,7 @@ def list_core_execution_plans_v4(
     limit: int = 100,
     offset: int = 0,
 ) -> list[dict[str, object]]:
+    from app.services.core_quantity import account_quantity_reservations, is_core_sized, local_unacknowledged_buy_notional
     query = (
         select(ExecutionPlan)
         .where(
@@ -2267,11 +2270,14 @@ def list_core_execution_plans_v4(
         query = query.where(ExecutionPlan.external_plan_id == external_plan_id)
     query = query.offset(offset).limit(limit)
     payloads: list[dict[str, object]] = []
+    account_quantity_state = None
     for plan in db.scalars(query).all():
         contract_payload = _persisted_core_plan_intake_ack(plan)
         if contract_payload is None:
             continue
         item_states = [_core_v4_item_state(item) for item in plan.items]
+        if account_quantity_state is None and any(is_core_sized(item.quantity_policy) for item in plan.items):
+            account_quantity_state = account_quantity_reservations(db=db, settings=settings)
         payloads.append(
             {
                 "execution_plan_id": plan.id,
@@ -2283,12 +2289,17 @@ def list_core_execution_plans_v4(
                     sorted(Counter(item["status"] for item in item_states).items())
                 ),
                 "item_states": item_states,
+                **({'local_unacknowledged_buy_notional_krw': local_unacknowledged_buy_notional(db=db, plan=plan)}
+                   if any(is_core_sized(item.quantity_policy) for item in plan.items) else {}),
+                **(account_quantity_state or {}),
             }
         )
     return payloads
 
 
 def _core_v4_item_state(item: ExecutionPlanItem) -> dict[str, object]:
+    from sqlalchemy.orm import object_session
+    from app.services.core_quantity import core_quantity_state, is_core_sized
     quantity_policy = (
         item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
     )
@@ -2357,6 +2368,8 @@ def _core_v4_item_state(item: ExecutionPlanItem) -> dict[str, object]:
         ),
         "terminal": item.status in CORE_V4_OPERATIONAL_TERMINAL_STATUSES,
         "decision": decision,
+        **({'core_quantity_state': core_quantity_state(db=object_session(item), item=item)}
+           if item.side == 'buy' and is_core_sized(quantity_policy) and object_session(item) is not None else {}),
     }
 
 
@@ -2726,6 +2739,10 @@ def _quantity_policy_matches(
     if not isinstance(raw_policy, dict) or not isinstance(quantity_policy, dict):
         return False
     raw_type = raw_policy.get("type")
+    if side == "buy" and raw_type == "core_sized":
+        from app.services.core_quantity import core_quantity_policy_matches
+
+        return core_quantity_policy_matches(raw_policy=raw_policy, item=item)
     if side == "buy" and (
         raw_type != "exec_agent_sized"
         or CORE_V4_UNFULFILLED_BUY_EXECUTABLE_FIELDS.intersection(raw_policy)

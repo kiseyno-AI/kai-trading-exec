@@ -1561,6 +1561,8 @@ def _initial_plan_item_status(item: ExecutionPlanItemRequest) -> str:
     if item.intent == "next_open_buy":
         if item.trigger_price is not None or _item_has_buy_chase_or_trigger_fields(item):
             return "pending_configuration"
+        if isinstance(item.quantity_policy, dict) and item.quantity_policy.get('type') == 'core_sized':
+            return 'pending'
         if _decision_agent_name(item) == SHORT_TERM_DECIDER_NAME:
             if _short_term_exec_agent_sizing_requested(item.quantity_policy):
                 return "pending"
@@ -1599,6 +1601,8 @@ def _normalize_watch_buy_handoff_items(plan: ExecutionPlan) -> None:
 
     for item in plan.items:
         if not _is_watch_buy_plan_item(item):
+            continue
+        if isinstance(item.quantity_policy, dict) and item.quantity_policy.get("type") == "core_sized":
             continue
 
         quantity_policy = dict(item.quantity_policy or {})

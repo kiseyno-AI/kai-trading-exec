@@ -100,6 +100,7 @@ PLAN_ITEM_STATUSES = frozenset(
         "cancelled",
         "contract_quarantined",
         "core_activation_pending",
+        "core_quantity_satisfied",
         "pending",
         "pending_configuration",
         "rejected",

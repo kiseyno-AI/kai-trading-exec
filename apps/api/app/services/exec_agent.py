@@ -456,6 +456,7 @@ def apply_short_term_exec_agent_decisions(
         item
         for item in plan.items
         if _is_short_term_buy_candidate(item)
+        and not (isinstance(item.quantity_policy, dict) and item.quantity_policy.get('type') == 'core_sized')
         and (
             getattr(settings, "exec_agent_enabled", False)
             or (automation_enabled and _has_decider_output(item))

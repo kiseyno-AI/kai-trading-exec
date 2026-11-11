@@ -315,6 +315,10 @@ class BrokerAdapter(Protocol):
         request: BrokerOrderPlacementRequest,
     ) -> BrokerOrderPlacement: ...
 
+    def cancel_order(
+        self, access_token: str, *, broker_order_id: str, symbol: str, exchange: str = "KRX",
+    ) -> dict[str, Any]: ...
+
     def get_current_price(
         self,
         access_token: str,

@@ -330,6 +330,49 @@ class CoreExecutionPlanMetadataV4(BaseModel):
         return self
 
 
+class CoreSizedQuantityPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["core_sized"]
+    target_quantity: int = Field(ge=0, strict=True)
+    revision: int = Field(ge=1, strict=True)
+    calculated_at: datetime
+    valid_until: datetime
+    sizing_inputs: dict[str, Any]
+
+    @model_validator(mode="after")
+    def validate_quantity_authority(self) -> "CoreSizedQuantityPolicy":
+        if (
+            self.calculated_at.tzinfo is None or self.valid_until.tzinfo is None
+            or self.valid_until <= self.calculated_at
+        ):
+            raise ValueError("quantity authority requires ordered timezone-aware timestamps")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(self.sizing_inputs.get("price_contract_digest") or "")):
+            raise ValueError("quantity authority requires an immutable price_contract_digest")
+        if self.target_quantity > 0:
+            try:
+                entry_ceiling = Decimal(str(self.sizing_inputs.get('sizing_price')))
+            except (ValueError, ArithmeticError):
+                raise ValueError('positive Core quantity requires a finite positive sizing_price') from None
+            if not entry_ceiling.is_finite() or entry_ceiling <= 0:
+                raise ValueError('positive Core quantity requires a finite positive sizing_price')
+        return self
+
+
+class CoreQuantityRevisionItem(CoreSizedQuantityPolicy):
+    type: Literal["core_sized"] = "core_sized"
+    external_plan_id: str = Field(min_length=1, max_length=128)
+    execution_plan_id: str = Field(min_length=1, max_length=128)
+    core_item_key: str = Field(min_length=1, max_length=128)
+    decision_snapshot_id: str = Field(min_length=1, max_length=128)
+    expected_revision: int = Field(ge=1, strict=True)
+
+
+class CoreQuantityRevisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    items: list[CoreQuantityRevisionItem] = Field(min_length=1, max_length=500)
+
+
 class CoreExecutionPlanItemV4(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -380,14 +423,17 @@ class CoreExecutionPlanItemV4(BaseModel):
         if self.side == "buy" and self.intent not in {"next_open_buy", "intraday_watch_buy"}:
             raise ValueError("buy side requires an entry intent")
         if self.side == "buy":
-            if self.quantity_policy.get("type") != "exec_agent_sized":
+            policy_type = self.quantity_policy.get("type")
+            if policy_type == "core_sized":
+                CoreSizedQuantityPolicy.model_validate(self.quantity_policy)
+            elif policy_type != "exec_agent_sized":
                 raise ValueError("buy quantity_policy.type must be exec_agent_sized")
             executable_fields = sorted(
                 CORE_V4_UNFULFILLED_BUY_EXECUTABLE_FIELDS.intersection(
                     self.quantity_policy
                 )
             )
-            if executable_fields:
+            if executable_fields and policy_type != "core_sized":
                 raise ValueError(
                     "exec_agent_sized buy quantity_policy must not contain "
                     f"executable fields: {', '.join(executable_fields)}"

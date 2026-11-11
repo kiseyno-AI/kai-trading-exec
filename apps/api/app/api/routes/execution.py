@@ -14,6 +14,7 @@ from app.api.schemas.execution import (
     CoreExecutionActivationRequestV4,
     CoreExecutionPlanRequestV4,
     CoreExecutionRevocationRequestV4,
+    CoreQuantityRevisionRequest,
     ExecutionFailureStatusUpdateRequest,
     ExecutionPlanRequest,
     MonitoringEvaluationRequest,
@@ -55,6 +56,20 @@ from app.services.reconciliation import (
 from app.services.short_term_watcher import evaluate_short_term_watcher_decision
 
 router = APIRouter(tags=["execution"])
+
+
+@router.post("/v4/execution-plans/quantities")
+def revise_core_quantity_handler(
+    request: Request,
+    db: Annotated[Session, Depends(get_db_session)],
+    payload: CoreQuantityRevisionRequest = Body(...),
+) -> dict[str, object]:
+    from app.services.core_quantity import revise_core_quantities
+
+    result = revise_core_quantities(settings=get_settings(request), db=db, command=payload)
+    if result['updated_count']:
+        _invalidate_execution_runtime(request, reason='core_quantities_updated', monitoring=True, dispatch=True)
+    return result
 
 
 def _legacy_core_handoff_rejection(
