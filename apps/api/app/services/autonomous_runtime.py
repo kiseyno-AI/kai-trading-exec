@@ -430,6 +430,10 @@ class AutonomousRuntimeCoordinator:
         init=False,
     )
     _monitoring_symbol_cursor: int = field(default=0, init=False)
+    _monitoring_quote_order: list[str] = field(default_factory=list, init=False)
+    _monitoring_action_last_served: dict[tuple[str, str], int] = field(default_factory=dict, init=False)
+    _monitoring_action_sequence: int = field(default=0, init=False)
+    _monitoring_last_selection_was_urgent: bool = field(default=False, init=False)
     _last_core_book_wake: float | None = field(default=None, init=False)
     _last_core_book_wake_by_symbol: dict[str, float] = field(default_factory=dict, init=False)
     _monitoring_next_no_price_db_check_at: datetime | None = field(
@@ -1252,7 +1256,14 @@ class AutonomousRuntimeCoordinator:
         quote_symbols: list[str],
         quote_wake: MonitoringQuoteWake | None,
     ) -> list[str]:
-        position_symbols = set(snapshot.positions_by_symbol) & set(quote_symbols)
+        # Preserve initial Core priority while trigger persistence reorders subsequent DB reads.
+        current_symbols = set(quote_symbols)
+        self._monitoring_quote_order = list(dict.fromkeys([
+            *[symbol for symbol in self._monitoring_quote_order if symbol in current_symbols],
+            *quote_symbols,
+        ]))
+        quote_symbols = self._monitoring_quote_order
+        position_symbols = set(snapshot.positions_by_symbol) & current_symbols
         if quote_wake is not None:
             local_symbols = position_symbols | {item.symbol for item in snapshot.items}
             covered_passives = (
@@ -1262,8 +1273,11 @@ class AutonomousRuntimeCoordinator:
             if (
                 quote_wake.urgent_symbol in quote_symbols
                 and quote_wake.urgent_symbol in local_symbols
+                and not self._monitoring_last_selection_was_urgent
             ):
+                self._monitoring_last_selection_was_urgent = True
                 return [quote_wake.urgent_symbol]
+        self._monitoring_last_selection_was_urgent = False
         symbols, self._monitoring_symbol_cursor = _select_monitoring_symbol_batch(
             desired_symbols=quote_symbols,
             priority_symbols=position_symbols,
@@ -1271,6 +1285,24 @@ class AutonomousRuntimeCoordinator:
             cursor=self._monitoring_symbol_cursor,
         )
         return symbols
+
+    def _select_monitoring_action_symbols(self, symbols: list[str], *, side: str, limit: int) -> list[str]:
+        snapshot = self._monitoring_runtime_snapshot
+        if snapshot is not None:
+            workset = set(snapshot.symbols)
+            self._monitoring_action_last_served = {
+                key: sequence for key, sequence in self._monitoring_action_last_served.items()
+                if key[1] in workset
+            }
+        # Rank by service history rather than a batch offset: quote subsets change between cycles.
+        selected = sorted(
+            dict.fromkeys(symbols),
+            key=lambda symbol: self._monitoring_action_last_served.get((side, symbol), -1),
+        )[:limit]
+        for symbol in selected:
+            self._monitoring_action_sequence += 1
+            self._monitoring_action_last_served[(side, symbol)] = self._monitoring_action_sequence
+        return selected
 
     def _monitoring_cycle_sync(
         self, started_at: datetime, quote_wake: MonitoringQuoteWake | None = None,
@@ -1290,7 +1322,6 @@ class AutonomousRuntimeCoordinator:
             settings=self.settings,
             domestic_trading_days=self._krx_trading_days_snapshot(),
         )
-        symbols = self._select_monitoring_cycle_symbols(workset_snapshot, quote_symbols, quote_wake)
         if self.session_factory is not None and self._reconcile_monitoring_orders_if_due(
             now=started_at,
             symbols=set(authoritative_workset_symbols),
@@ -1303,7 +1334,7 @@ class AutonomousRuntimeCoordinator:
                 settings=self.settings,
                 domestic_trading_days=self._krx_trading_days_snapshot(),
             )
-            symbols = self._select_monitoring_cycle_symbols(workset_snapshot, quote_symbols, quote_wake)
+        symbols = self._select_monitoring_cycle_symbols(workset_snapshot, quote_symbols, quote_wake)
         if not symbols:
             payload = {
                 "status_code": 200,
@@ -1597,28 +1628,32 @@ class AutonomousRuntimeCoordinator:
             sell_evaluation_symbols = (
                 triggered_sell_symbols | rearmable_sell_symbols
             )
-            ordered_triggered_sell_symbols = [
-                symbol
-                for symbol in symbols
-                if symbol in sell_evaluation_symbols
-            ]
-            ordered_triggered_buy_symbols = [
-                symbol for symbol in symbols if symbol in triggered_buy_symbols
-            ][:broker_action_limit]
-            ordered_triggered_symbols = [
-                *ordered_triggered_sell_symbols,
-                *[
-                    symbol
-                    for symbol in ordered_triggered_buy_symbols
-                    if symbol not in sell_evaluation_symbols
-                ],
-            ]
-            symbols = ordered_triggered_symbols
-            prices = [
-                price
-                for price in prices
-                if price.symbol in set(ordered_triggered_symbols)
-            ]
+            sell_candidates = [symbol for symbol in symbols if symbol in sell_evaluation_symbols]
+            buy_candidates = [symbol for symbol in symbols if symbol in triggered_buy_symbols
+                and symbol not in sell_evaluation_symbols]
+            sell_limit = broker_action_limit
+            buy_limit = broker_action_limit
+            if sell_candidates and buy_candidates:
+                if broker_action_limit == 1:
+                    oldest_sell = min(self._monitoring_action_last_served.get(("sell", symbol), -1)
+                        for symbol in sell_candidates)
+                    oldest_buy = min(self._monitoring_action_last_served.get(("buy", symbol), -1)
+                        for symbol in buy_candidates)
+                    sell_limit = int(oldest_sell <= oldest_buy)
+                    buy_limit = 1 - sell_limit
+                else:
+                    sell_limit = broker_action_limit - 1
+            selected_sells = self._select_monitoring_action_symbols(
+                sell_candidates, side="sell", limit=sell_limit,
+            )
+            selected_buys = self._select_monitoring_action_symbols(
+                buy_candidates, side="buy", limit=min(buy_limit, broker_action_limit - len(selected_sells)),
+            )
+            dispatch_symbols = selected_sells + selected_buys
+            # Persist every detected cross, even when only a subset can submit this cycle.
+            symbols = [*dispatch_symbols, *[symbol for symbol in symbols
+                if symbol in db_evaluation_symbols and symbol not in dispatch_symbols]]
+            prices = [price for price in prices if price.symbol in db_evaluation_symbols]
             with self._cycle_session_factory() as db:
                 adapter = self._broker_adapter_for_cycle()
                 result = run_autonomous_monitoring_cycle(
@@ -1627,6 +1662,7 @@ class AutonomousRuntimeCoordinator:
                     adapter=adapter,
                     prices=prices,
                     symbols=symbols,
+                    dispatch_symbols=dispatch_symbols,
                     auth_session_factory=self._cycle_session_factory,
                     now=started_at,
                     quote_freshness_at=evaluated_at,
@@ -2699,6 +2735,8 @@ class AutonomousRuntimeCoordinator:
                 observed_price=observed_price,
                 triggered_at=started_at,
             )
+            if item.intent in WATCH_BUY_INTENTS and item.status in PENDING_DISPATCH_MONITORING_STATUSES:
+                triggered = True
             if item.status in AGENT_ACTIVE_MONITORING_STATUSES:
                 blocked_item_count += 1
                 outcome = "agent_pending"
@@ -2903,6 +2941,15 @@ class AutonomousRuntimeCoordinator:
         payload: dict[str, object],
     ) -> None:
         with self._lock:
+            snapshot = self._monitoring_runtime_snapshot
+            if worker_key == "monitoring" and snapshot is not None and "monitored_symbols" in payload:
+                selected_count = len(set(payload["monitored_symbols"]))
+                payload["monitoring_coverage"] = {
+                    "workset_symbol_count": len(snapshot.symbols),
+                    "selected_symbol_count": selected_count,
+                    "deferred_symbol_count": max(0, len(snapshot.symbols) - selected_count),
+                    "missing_quote_symbol_count": max(0, selected_count - int(payload.get("price_count") or 0)),
+                }
             state = self._state_for(worker_key)
             state.last_cycle = self._scope_cycle_payload(payload)
 
@@ -3689,15 +3736,16 @@ def _select_monitoring_symbol_batch(
     cursor: int,
 ) -> tuple[list[str], int]:
     limit = max(int(batch_size), 1)
-    priority = [symbol for symbol in desired_symbols if symbol in priority_symbols]
-    rotating = [symbol for symbol in desired_symbols if symbol not in priority_symbols]
-    selected = list(priority)
-    if not rotating:
-        return selected, cursor % max(len(rotating), 1)
-    start = cursor % len(rotating)
-    take = min(limit, len(rotating))
-    selected.extend(rotating[(start + offset) % len(rotating)] for offset in range(take))
-    return selected, (start + take) % len(rotating)
+    desired = list(dict.fromkeys(desired_symbols))
+    priority = [symbol for symbol in desired if symbol in priority_symbols]
+    rotating = [symbol for symbol in desired if symbol not in priority_symbols]
+    ordered = priority + rotating
+    if not ordered:
+        return [], 0
+    # Held positions lead each sweep, but cannot turn a bounded quote cycle into an unbounded one.
+    start = cursor % len(ordered)
+    take = min(limit, len(ordered))
+    return [ordered[(start + offset) % len(ordered)] for offset in range(take)], (start + take) % len(ordered)
 
 
 def _compact_cycle_payload(payload: dict[str, object] | None) -> dict[str, object] | None:

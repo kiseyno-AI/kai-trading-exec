@@ -436,7 +436,7 @@ def test_krx_symbol_filter_excludes_alpaca_symbols() -> None:
     assert _is_krx_symbol("FRTX/CVR1") is False
 
 
-def test_monitoring_symbol_batches_keep_all_positions_and_cap_only_rotating_candidates() -> None:
+def test_monitoring_symbol_batches_prioritize_positions_and_bound_each_sweep() -> None:
     desired = [
         "030000",
         "001450",
@@ -458,8 +458,9 @@ def test_monitoring_symbol_batches_keep_all_positions_and_cap_only_rotating_cand
             batch_size=3,
             cursor=cursor,
         )
-        assert batch[:2] == ["030000", "001450"]
-        assert len(batch) == 5
+        if not covered:
+            assert batch[:2] == ["030000", "001450"]
+        assert len(batch) == 3
         covered.update(batch)
 
     assert covered == set(desired)
@@ -516,7 +517,7 @@ def test_passive_quotes_do_not_displace_held_or_actionable_local_priority() -> N
     )
 
     assert batch[:2] == [local_held, local_actionable]
-    assert len(batch) == 7
+    assert len(batch) == 6
 
 
 def test_monitoring_cycle_does_not_mix_core_universe_into_active_local_work(
@@ -4352,10 +4353,16 @@ def test_fresh_monitoring_workset_rotates_without_database_access(monkeypatch) -
     first = coordinator._monitoring_cycle_sync(started_at)
     second = coordinator._monitoring_cycle_sync(started_at + timedelta(seconds=1))
 
-    assert first["monitored_symbols"] == ["005930", "000660"]
-    assert second["monitored_symbols"] == ["005930", "035420"]
-    assert selected_batches == [["005930", "000660"], ["005930", "035420"]]
-    assert maintenance_calls == [["005930", "000660"], ["005930", "035420"]]
+    third = coordinator._monitoring_cycle_sync(started_at + timedelta(seconds=2))
+    assert first["monitored_symbols"] == ["005930"]
+    assert second["monitored_symbols"] == ["000660"]
+    assert third["monitored_symbols"] == ["035420"]
+    assert selected_batches == [["005930"], ["000660"], ["035420"]]
+    assert maintenance_calls == selected_batches
+    assert first["monitoring_coverage"] == {
+        "workset_symbol_count": 3, "selected_symbol_count": 1,
+        "deferred_symbol_count": 2, "missing_quote_symbol_count": 0,
+    }
     assert coordinator._monitoring_runtime_snapshot is snapshot
 
 
@@ -5465,3 +5472,194 @@ def test_krx_monitoring_symbols_exclude_us_positions(tmp_path) -> None:
         assert symbols == ["030000", "005930"]
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize('symbol_count', [41, 100, 250])
+def test_monitoring_bounds_held_work_and_visits_the_entire_workset(symbol_count):
+    symbols = [f'{index:06d}' for index in range(symbol_count)]
+    cursor = 0
+    observed = set()
+    for _ in range((symbol_count + 5) // 6):
+        batch, cursor = _select_monitoring_symbol_batch(
+            desired_symbols=symbols, priority_symbols=set(symbols[::2]),
+            batch_size=6, cursor=cursor,
+        )
+        assert len(batch) <= 6
+        observed.update(batch)
+    assert observed == set(symbols)
+
+
+def test_repeated_urgent_quotes_do_not_starve_regular_monitoring():
+    settings = Settings(database_url='sqlite:///:memory:', monitoring_max_symbols_per_cycle=6)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings, session_factory=None, broker_adapter_factory=lambda _: None,
+    )
+    symbols = [f'{index:06d}' for index in range(100)]
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=datetime.now(UTC), symbols=symbols, positions_by_symbol={},
+        items=[CachedMonitoringItem('watch', symbols[0], 'intraday_watch_buy',
+            'watch_monitoring_active', Decimal('100'), provider='kis', exchange='KRX')],
+        filled_today_symbols=[],
+    )
+    seen = set()
+    hint = autonomous_runtime.MonitoringQuoteWake(symbols[0], frozenset())
+    for _ in range(34):
+        seen.update(coordinator._select_monitoring_cycle_symbols(snapshot, symbols, hint))
+    assert seen == set(symbols)
+
+
+@pytest.mark.parametrize('side', ['buy', 'sell'])
+def test_blocked_first_action_does_not_starve_later_triggered_symbols(monkeypatch, side):
+    settings = Settings(database_url='sqlite:///:memory:', runtime_mode='paper',
+        monitoring_max_broker_actions_per_cycle=1)
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings, session_factory=None, broker_adapter_factory=lambda _: object(),
+    )
+    now = datetime(2026, 11, 10, 1, tzinfo=UTC)
+    symbols = [f'{index:06d}' for index in range(100)]
+    is_buy = side == 'buy'
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=now, symbols=symbols,
+        positions_by_symbol={} if is_buy else {symbol: CachedMonitoringPosition(symbol, 1, 'kis', 'KRX') for symbol in symbols},
+        items=[CachedMonitoringItem(symbol, symbol, 'intraday_watch_buy' if is_buy else 'target_sell',
+            'watch_monitoring_active' if is_buy else 'target_sell_monitoring', Decimal('100'),
+            provider='kis', exchange='KRX') for symbol in symbols],
+        filled_today_symbols=[],
+    )
+    coordinator._monitoring_runtime_snapshot = snapshot
+    from contextlib import nullcontext
+    coordinator._cycle_session_factory = lambda: nullcontext(object())
+    monkeypatch.setattr(coordinator, '_load_monitoring_prices', lambda **_: [
+        MonitoringPriceRequest(symbol=symbol, price=Decimal('100'), bid=Decimal('100'), ask=Decimal('100'))
+        for symbol in symbols])
+    monkeypatch.setattr(coordinator, '_repair_post_entry_exit_monitors_for_cached_cycle', lambda **_: (0, 0))
+    monkeypatch.setattr(coordinator, '_refresh_monitoring_runtime_snapshot', lambda **_: snapshot)
+    seen = set()
+    def evaluate(**kwargs):
+        assert len(kwargs['dispatch_symbols']) <= 1
+        seen.update(kwargs['dispatch_symbols'])
+        return SimpleNamespace(status_code=200, payload={'submitted_order_count': 0, 'items': []})
+    monkeypatch.setattr(autonomous_runtime, 'run_autonomous_monitoring_cycle', evaluate)
+    for _ in symbols:
+        coordinator._monitoring_cycle_sync(now)
+    assert seen == set(symbols)
+
+
+def test_action_fairness_survives_rotating_quote_batches():
+    settings = Settings(database_url='sqlite:///:memory:')
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=settings, session_factory=None, broker_adapter_factory=lambda _: None,
+    )
+    symbols = [f'{index:06d}' for index in range(108)]
+    seen = set()
+    # Eighteen groups of six would alias a single cursor and retry the same
+    # within-group offset forever when the action budget is one.
+    for _ in range(6):
+        for start in range(0, len(symbols), 6):
+            seen.update(coordinator._select_monitoring_action_symbols(
+                symbols[start:start + 6], side='buy', limit=1))
+    assert seen == set(symbols)
+
+
+def test_reconciliation_refresh_does_not_skip_a_monitoring_batch(monkeypatch):
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=Settings(database_url='sqlite:///:memory:', runtime_mode='paper',
+            monitoring_max_symbols_per_cycle=6),
+        session_factory=None, broker_adapter_factory=lambda _: None,
+    )
+    now = datetime(2026, 11, 10, 1, tzinfo=UTC)
+    symbols = [f'{index:06d}' for index in range(100)]
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=now, symbols=symbols, positions_by_symbol={}, items=[], filled_today_symbols=[],
+    )
+    coordinator.session_factory = object()
+    coordinator._monitoring_runtime_snapshot = snapshot
+    monkeypatch.setattr(coordinator, '_ensure_monitoring_runtime_snapshot', lambda _: snapshot)
+    monkeypatch.setattr(coordinator, '_reconcile_monitoring_orders_if_due', lambda **_: True)
+    monkeypatch.setattr(coordinator, '_repair_post_entry_exit_monitors_for_cached_cycle', lambda **_: (0, 0))
+    seen = set()
+    def prices(*, symbols, **_):
+        seen.update(symbols)
+        return [MonitoringPriceRequest(symbol=symbol, price=Decimal('100')) for symbol in symbols]
+    monkeypatch.setattr(coordinator, '_load_monitoring_prices', prices)
+    for _ in range(17):
+        payload = coordinator._monitoring_cycle_sync(now)
+        assert payload['monitoring_coverage']['selected_symbol_count'] <= 6
+    assert seen == set(symbols)
+
+
+@pytest.mark.parametrize("same_symbol", [False, True])
+@pytest.mark.parametrize("groups", [1, 2])
+def test_one_action_budget_does_not_starve_buy_behind_a_blocked_sell(monkeypatch, same_symbol, groups):
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=Settings(database_url='sqlite:///:memory:', runtime_mode='paper',
+            monitoring_max_broker_actions_per_cycle=1),
+        session_factory=None, broker_adapter_factory=lambda _: object(),
+    )
+    now = datetime(2026, 11, 10, 1, tzinfo=UTC)
+    batches = []
+    items = []
+    positions = {}
+    expected = set()
+    for index in range(groups):
+        sell_symbol = f'{index * 2 + 1:06d}'
+        buy_symbol = sell_symbol if same_symbol else f'{index * 2 + 2:06d}'
+        batches.append(list(dict.fromkeys([sell_symbol, buy_symbol])))
+        positions[sell_symbol] = CachedMonitoringPosition(sell_symbol, 1, 'kis', 'KRX')
+        items.extend([
+            CachedMonitoringItem('sell-' + sell_symbol, sell_symbol, 'target_sell', 'target_sell_monitoring',
+                Decimal('100'), provider='kis', exchange='KRX'),
+            CachedMonitoringItem('buy-' + buy_symbol, buy_symbol, 'intraday_watch_buy', 'watch_monitoring_active',
+                Decimal('100'), provider='kis', exchange='KRX'),
+        ])
+        expected.update([sell_symbol, buy_symbol])
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=now, symbols=[symbol for batch in batches for symbol in batch],
+        positions_by_symbol=positions, items=items, filled_today_symbols=[],
+    )
+    coordinator._monitoring_runtime_snapshot = snapshot
+    from contextlib import nullcontext
+    coordinator._cycle_session_factory = lambda: nullcontext(object())
+    monkeypatch.setattr(coordinator, '_load_monitoring_prices', lambda **kwargs: [
+        MonitoringPriceRequest(symbol=symbol, price=Decimal('100'), bid=Decimal('100'), ask=Decimal('100'))
+        for symbol in kwargs['symbols']])
+    monkeypatch.setattr(coordinator, '_repair_post_entry_exit_monitors_for_cached_cycle', lambda **_: (0, 0))
+    monkeypatch.setattr(coordinator, '_refresh_monitoring_runtime_snapshot', lambda **_: snapshot)
+    seen = []
+    def evaluate(**kwargs):
+        assert len(kwargs['dispatch_symbols']) == 1
+        seen.append(kwargs['dispatch_symbols'][0])
+        return SimpleNamespace(status_code=200, payload={'submitted_order_count': 0, 'items': []})
+    monkeypatch.setattr(autonomous_runtime, 'run_autonomous_monitoring_cycle', evaluate)
+    for _ in range(2):
+        for batch in batches:
+            monkeypatch.setattr(coordinator, '_select_monitoring_cycle_symbols', lambda *_, batch=batch: batch)
+            coordinator._monitoring_cycle_sync(now)
+    assert set(seen) == expected
+    for symbol in positions:
+        assert ('sell', symbol) in coordinator._monitoring_action_last_served
+        if same_symbol:
+            assert ('buy', symbol) not in coordinator._monitoring_action_last_served
+
+
+def test_monitoring_coverage_survives_workset_priority_reordering():
+    symbols = [f'{index:06d}' for index in range(100)]
+    coordinator = AutonomousRuntimeCoordinator(
+        settings=Settings(database_url='sqlite:///:memory:', monitoring_max_symbols_per_cycle=6),
+        session_factory=None, broker_adapter_factory=lambda _: None,
+    )
+    snapshot = MonitoringRuntimeSnapshot(
+        loaded_at=datetime.now(UTC), symbols=symbols,
+        positions_by_symbol={symbol: CachedMonitoringPosition(symbol, 1, 'kis', 'KRX')
+            for symbol in symbols[::2]}, items=[], filled_today_symbols=[],
+    )
+    seen = set()
+    for index in range(17):
+        reordered = symbols[index:] + symbols[:index]
+        batch = coordinator._select_monitoring_cycle_symbols(snapshot, reordered, None)
+        seen.update(batch)
+    assert seen == set(symbols)
+    assert coordinator._monitoring_quote_order == symbols
+    changed = [symbols[-1], '999999']
+    coordinator._select_monitoring_cycle_symbols(snapshot, changed, None)
+    assert coordinator._monitoring_quote_order == changed

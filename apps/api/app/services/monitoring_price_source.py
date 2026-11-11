@@ -380,6 +380,7 @@ class KisCurrentQuoteMonitoringPriceSource:
                         return symbol, None, exc
 
                 quote_results: dict[str, tuple[BrokerCurrentPrice | None, Exception | None]] = {}
+                context_futures = {}
                 worker_count = min(MAX_QUOTE_WORKERS, len(unique_symbols))
                 request_timeout = max(float(settings.kis_request_timeout_seconds), 1.0)
                 wave_count = (len(unique_symbols) + worker_count - 1) // worker_count
@@ -397,6 +398,13 @@ class KisCurrentQuoteMonitoringPriceSource:
                         for future in completed_futures:
                             symbol, quote, error = future.result()
                             quote_results[symbol] = (quote, error)
+                            if quote is not None and error is None:
+                                context_futures[symbol] = self._context_executor.submit(
+                                    _fetch_live_market_context,
+                                    broker_adapter=broker_adapter,
+                                    access_token=access_token,
+                                    quote=quote,
+                                )
                     except FuturesTimeoutError:
                         batch_timed_out = True
                         for future, symbol in futures.items():
@@ -440,17 +448,16 @@ class KisCurrentQuoteMonitoringPriceSource:
                 ):
                     self.invalidate_runtime_context(reason="broker_quote_auth_rejected")
 
-                context_futures = {
-                    symbol: self._context_executor.submit(
-                        _fetch_live_market_context,
-                        broker_adapter=broker_adapter,
-                        access_token=access_token,
-                        quote=quote,
-                    )
-                    for symbol in unique_symbols
-                    for quote, error in [quote_results.get(symbol, (None, None))]
-                    if quote is not None and error is None
-                }
+                # Retried quotes also need fresh context; ready quotes already started theirs.
+                for symbol in unique_symbols:
+                    quote, error = quote_results.get(symbol, (None, None))
+                    if quote is not None and error is None and symbol not in context_futures:
+                        context_futures[symbol] = self._context_executor.submit(
+                            _fetch_live_market_context,
+                            broker_adapter=broker_adapter,
+                            access_token=access_token,
+                            quote=quote,
+                        )
 
                 for symbol in unique_symbols:
                     quote, error = quote_results.get(symbol, (None, None))

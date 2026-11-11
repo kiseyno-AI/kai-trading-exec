@@ -22289,15 +22289,21 @@ def test_autonomous_monitoring_prices_same_symbols_selected_for_evaluation() -> 
             datetime(2026, 6, 8, 0, 3, tzinfo=UTC)
         )
 
-        assert price_source.calls == [["035420", "005930", "000660"]]
-        assert payload["monitored_symbols"] == ["035420", "005930", "000660"]
+        assert price_source.calls == [["035420", "005930"]]
+        assert payload["monitored_symbols"] == ["035420", "005930"]
         assert payload["price_count"] == 2
         assert payload["evaluated_symbol_count"] == 2
         assert payload["submitted_order_count"] == 2
         assert [call.execution_plan_item_id for call in broker_adapter.order_calls] == [
-            first_item_id,
-            second_item_id,
+            first_item_id, second_item_id,
         ]
+
+        app.state.autonomous_runtime._monitoring_cycle_sync(
+            datetime(2026, 6, 8, 0, 3, 1, tzinfo=UTC)
+        )
+        assert "000660" in price_source.calls[-1]
+        assert all(len(call) <= 2 for call in price_source.calls)
+        assert len(broker_adapter.order_calls) == 2
 
         with app.state.db_session_factory() as session:
             third_item = session.get(ExecutionPlanItem, third_item_id)
