@@ -17749,7 +17749,9 @@ def _monitoring_order_idempotency_key(
 ) -> str:
     if is_watch_buy:
         if isinstance(item.quantity_policy, dict) and item.quantity_policy.get('type') == 'core_sized':
-            return f"monitoring:watch_buy:{item.id}:core:{item.quantity_policy['revision']}"
+            from app.services.core_quantity import core_quantity_idempotency_key
+
+            return core_quantity_idempotency_key(item=item, base_key=f"monitoring:watch_buy:{item.id}:core:{item.quantity_policy['revision']}")
         return f"monitoring:watch_buy:{item.id}"
     base = f"monitoring:{item.intent}:{item.id}"
     risk_context = _loaded_risk_context(item, allow_file_backed_load=True)

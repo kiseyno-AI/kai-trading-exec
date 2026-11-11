@@ -338,6 +338,38 @@ def core_quantity_order_failure(*, db, item, command, exclude_order_id=None):
     return None
 
 
+def core_quantity_idempotency_key(*, item: ExecutionPlanItem, base_key: str) -> str:
+    db = object_session(item)
+    if db is None:
+        return base_key
+    orders = db.scalars(select(BrokerOrder).where(
+        BrokerOrder.execution_plan_item_id == item.id, BrokerOrder.mode == item.plan.mode,
+        BrokerOrder.side == 'buy',
+        (BrokerOrder.idempotency_key == base_key) | BrokerOrder.idempotency_key.startswith(f'{base_key}:residual:', autoescape=True),
+    ).execution_options(populate_existing=True)).all()
+    by_key = {order.idempotency_key: order for order in orders}
+    state = core_quantity_state(db=db, item=item)
+    key = base_key
+    visited = set()
+    while key in by_key and key not in visited:
+        visited.add(key)
+        order = by_key[key]
+        next_key = f'{base_key}:residual:{order.id}'
+        # An existing pending/unknown successor keeps its identity across restarts.
+        if next_key in by_key:
+            key = next_key
+            continue
+        if (
+            order.broker_order_id and order.status in {'filled', 'canceled', 'expired'}
+            and order.last_error_classification != 'submit_outcome_unknown'
+            and order.last_error_code != 'submit_outcome_unknown'
+            and state['remaining_quantity'] and not state['submission_uncertain']
+        ):
+            return next_key
+        break
+    return key
+
+
 def revise_core_quantities(*, settings, db: Session, command: CoreQuantityRevisionRequest) -> dict:
     from app.services.core_handoff_v4 import persisted_core_plan_contract_ack
     from app.services.core_revocation_exposure import (

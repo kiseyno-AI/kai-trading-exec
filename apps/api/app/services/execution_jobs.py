@@ -1854,7 +1854,9 @@ def _adapter_for_job(
 def _place_order_idempotency_key(job: ExecutionJob) -> str:
     quantity_policy = job.plan_item.quantity_policy
     if isinstance(quantity_policy, dict) and quantity_policy.get('type') == 'core_sized':
-        return f"execution-job:{job.id}:core:{quantity_policy['revision']}"
+        from app.services.core_quantity import core_quantity_idempotency_key
+
+        return core_quantity_idempotency_key(item=job.plan_item, base_key=f"execution-job:{job.id}:core:{quantity_policy['revision']}")
     if isinstance(quantity_policy, dict):
         idempotency_key = quantity_policy.get("idempotency_key")
         if isinstance(idempotency_key, str) and idempotency_key.strip():

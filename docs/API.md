@@ -732,6 +732,8 @@ revision is accepted before that cancellation finishes. A cancellation ACK alone
 does not mean canceled; unknown submission/cancellation outcomes fence replacement
 orders. An accepted increase with an open BUY waits in the same durable job and
 resumes its latest authorized remainder only after terminal broker reconciliation.
+A remaining BUY in the same revision uses a distinct idempotent attempt bound to
+its confirmed terminal source order; pending or unknown attempts retain their key.
 A confirmed `not_cancelable` inquiry (no cancel submission) can be queried
 again. Workers validate the original account/route and their lease immediately
 before cancellation. Past-date jobs never cancel across sessions or starve today's
