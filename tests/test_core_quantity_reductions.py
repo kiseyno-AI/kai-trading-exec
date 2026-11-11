@@ -2,11 +2,12 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from datetime import timedelta
 from contextlib import contextmanager
+from copy import deepcopy
 
 import pytest
 
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import select, update as sql_update
 
 from app.broker.base import BrokerAdapterError
 from app.broker.kis import KisBrokerAdapter
@@ -162,6 +163,9 @@ def test_reduction_is_queued_then_cancelled_and_reconciled_without_selling_fills
                 assert db.get(ExecutionJob, 'stale-job').status == 'queued'
             entry = db.scalar(select(ExecutionPlanItem).where(ExecutionPlanItem.side == 'buy'))
             assert core_quantity.core_quantity_state(db=db, item=entry)['remaining_quantity'] == 2
+            next_open = db.scalar(select(ExecutionJob).where(ExecutionJob.job_type == 'next_open_buy'))
+            assert next_open.status == 'scheduled'
+            assert core_quantity.executable_core_quantity(db=db, item=entry) == 2
             orders = db.scalars(select(BrokerOrder)).all()
             assert len(orders) == 1 and orders[0].side == 'buy' and orders[0].status == 'canceled'
         assert adapter.calls == (2 if outcome == 'temporarily_not_cancelable' else 1)
@@ -210,4 +214,133 @@ def test_blocking_quantity_cancellation_runs_independently_from_protective_monit
             release.set()
             worker.join(timeout=3)
         assert errors == [] and not worker.is_alive()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(('terminal_status', 'filled_count'), [('filled', 10), ('canceled', 4)])
+@pytest.mark.parametrize('lifecycle', ['active', 'closed', 'expired', 'running', 'newer_revision', 'repair_replay', 'revoked_during_reconcile'])
+def test_upward_revision_waits_durably_for_open_buy_then_rearms_latest_remainder_once(monkeypatch, terminal_status, filled_count, lifecycle):
+    from app.services import execution_jobs
+
+    clock = [datetime(2026, 9, 10, 2, tzinfo=UTC)]
+    monkeypatch.setattr(core_quantity, 'utc_now', lambda: clock[0])
+    monkeypatch.setattr(core_quantity_reductions, 'utc_now', lambda: clock[0])
+    monkeypatch.setattr(reconciliation, '_observation_time', lambda: clock[0])
+    authenticated = lambda **kwargs: SimpleNamespace(access_token='fake')
+    monkeypatch.setattr(broker_auth, 'ensure_authenticated_broker_session', authenticated)
+    monkeypatch.setattr(reconciliation, 'ensure_authenticated_broker_session', authenticated)
+    broker_status = ['open']
+
+    def reconcile_order(access_token, broker_order_id, **kwargs):
+        return {
+            'provider': 'kis', 'broker_order_id': broker_order_id, 'symbol': '005930',
+            'status': broker_status[0], 'filled_quantity': filled_count if broker_status[0] != 'open' else 0,
+            'average_fill_price': '70000', 'observed_at': clock[0].isoformat(),
+        }
+
+    def forbidden_cancel(*args, **kwargs):
+        raise AssertionError('increased target must not cancel an already authorized BUY')
+
+    adapter = SimpleNamespace(provider='kis', reconcile_order=reconcile_order, cancel_order=forbidden_cancel)
+    if lifecycle == 'revoked_during_reconcile':
+        original_reconcile = core_quantity_reductions._reconcile_before_cancel
+
+        def reconcile_then_revoke(*, db, item, **kwargs):
+            original_reconcile(db=db, item=item, **kwargs)
+            if broker_status[0] != 'open':
+                db.execute(sql_update(ExecutionPlanItem).where(ExecutionPlanItem.id == item.id).values(status='revoked'), execution_options={'synchronize_session': False})
+                db.execute(sql_update(ExecutionJob).where(ExecutionJob.execution_plan_item_id == item.id, ExecutionJob.job_type == 'next_open_buy').values(status='superseded'), execution_options={'synchronize_session': False})
+                db.commit()
+
+        monkeypatch.setattr(core_quantity_reductions, '_reconcile_before_cancel', reconcile_then_revoke)
+    app, engine = _build_test_app()
+    with TestClient(app) as client:
+        plan = core_plan()
+        accepted = client.post('/v4/execution-plans', json=plan).json()
+        with app.state.db_session_factory() as db:
+            entry = db.scalar(select(ExecutionPlanItem).where(ExecutionPlanItem.side == 'buy'))
+            next_open = db.scalar(select(ExecutionJob).where(ExecutionJob.job_type == 'next_open_buy'))
+            next_open.status, entry.status = 'completed', 'broker_order_open'
+            original_job_id = next_open.id
+            original_raw_payload = deepcopy(entry.plan.raw_payload)
+            db.add(BrokerOrder(
+                execution_plan_item_id=entry.id, broker_name='kis', mode='mock', idempotency_key='prior-open-buy',
+                broker_order_id='source-buy', symbol='005930', side='buy', status='open', quantity=10,
+                venue='kis', asset_class='stock',
+                request_metadata={'execution_scope': _test_kis_execution_scope(app.state.settings, venue='kis')},
+            ))
+            db.commit()
+        update = revision_request(accepted, plan, target=12)
+        if lifecycle == 'expired':
+            update['valid_until'] = (clock[0] + timedelta(seconds=20)).isoformat()
+        result = client.post('/v4/execution-plans/quantities', json={'items': [update]}).json()
+        assert result['updated_count'] == 1
+        with app.state.db_session_factory() as db:
+            followup = db.scalar(select(ExecutionJob).where(ExecutionJob.job_type == core_quantity_reductions.JOB_TYPE))
+            assert followup is not None and followup.status == 'queued'
+            core_quantity_reductions.process_core_quantity_reductions(settings=app.state.settings, db=db, adapter=adapter, now=clock[0], krx_trading_day=lambda day: True)
+            db.refresh(followup)
+            assert followup.status == 'retrying'
+            assert db.get(ExecutionJob, original_job_id).status == 'completed'
+
+        if lifecycle == 'repair_replay':
+            broker_status[0] = terminal_status
+            with app.state.db_session_factory() as db:
+                db.delete(db.scalar(select(ExecutionJob).where(ExecutionJob.job_type == core_quantity_reductions.JOB_TYPE)))
+                db.commit()
+                order = db.scalar(select(BrokerOrder))
+                assert reconciliation.reconcile_broker_order(settings=app.state.settings, db=db, adapter=adapter, order=order)['status_code'] == 200
+        assert client.post('/v4/execution-plans/quantities', json={'items': [update]}).json()['unchanged_count'] == 1
+        if lifecycle == 'repair_replay':
+            with app.state.db_session_factory() as db:
+                job = db.get(ExecutionJob, original_job_id)
+                assert job.status == 'scheduled'
+                command = execution_jobs._build_place_order_request(settings=app.state.settings, db=db, adapter=adapter, job=job)
+                assert command.quantity == 12 - filled_count and command.metadata['core_quantity_revision'] == 2
+            return
+        expected_revision, expected_remaining = 2, 12 - filled_count
+        if lifecycle == 'newer_revision':
+            latest = revision_request(accepted, plan, target=11, revision=3)
+            assert client.post('/v4/execution-plans/quantities', json={'items': [latest]}).json()['updated_count'] == 1
+            expected_revision, expected_remaining = 3, 11 - filled_count
+        if lifecycle in {'closed', 'running'}:
+            with app.state.db_session_factory() as db:
+                if lifecycle == 'closed':
+                    stop = db.scalar(select(ExecutionPlanItem).where(ExecutionPlanItem.intent == 'stop_sell'))
+                    stop.status = 'stop_sell_triggered_pending_dispatch'
+                else:
+                    job = db.get(ExecutionJob, original_job_id)
+                    job.status, job.locked_at = 'running', clock[0]
+                    job.plan_item.status = 'next_open_buy_dispatching'
+                db.commit()
+        clock[0] += timedelta(seconds=31)
+        broker_status[0] = terminal_status
+        with app.state.db_session_factory() as db:
+            core_quantity_reductions.process_core_quantity_reductions(settings=app.state.settings, db=db, adapter=adapter, now=clock[0], krx_trading_day=lambda day: True)
+            jobs = db.scalars(select(ExecutionJob).where(ExecutionJob.job_type == 'next_open_buy')).all()
+            followup = db.scalar(select(ExecutionJob).where(ExecutionJob.job_type == core_quantity_reductions.JOB_TYPE))
+            if lifecycle == 'revoked_during_reconcile':
+                assert jobs[0].status == 'superseded' and followup.status == 'completed'
+                assert jobs[0].plan_item.status == 'revoked'
+                return
+            if lifecycle in {'closed', 'expired'}:
+                assert jobs[0].status == 'completed' and followup.status == 'completed'
+                assert core_quantity.executable_core_quantity(db=db, item=jobs[0].plan_item) == 0
+                return
+            if lifecycle == 'running':
+                assert jobs[0].status == 'running' and followup.status == 'retrying'
+                assert followup.last_error == 'quantity_followup_dispatch_in_flight'
+                jobs[0].status, jobs[0].locked_at = 'completed', None
+                db.commit()
+                clock[0] += timedelta(seconds=31)
+                core_quantity_reductions.process_core_quantity_reductions(settings=app.state.settings, db=db, adapter=adapter, now=clock[0], krx_trading_day=lambda day: True)
+                db.refresh(jobs[0])
+            assert len(jobs) == 1 and jobs[0].id == original_job_id and jobs[0].status == 'scheduled', followup.last_error
+            command = execution_jobs._build_place_order_request(settings=app.state.settings, db=db, adapter=adapter, job=jobs[0])
+            assert command.quantity == expected_remaining and command.metadata['core_quantity_revision'] == expected_revision
+            assert command.idempotency_key.endswith(f':core:{expected_revision}')
+            assert jobs[0].plan_item.plan.raw_payload == original_raw_payload
+            assert db.scalar(select(ExecutionJob).where(ExecutionJob.job_type == core_quantity_reductions.JOB_TYPE)).status == 'completed'
+            core_quantity_reductions.process_core_quantity_reductions(settings=app.state.settings, db=db, adapter=adapter, now=clock[0], krx_trading_day=lambda day: True)
+            assert db.get(ExecutionJob, original_job_id).status == 'scheduled'
     engine.dispose()

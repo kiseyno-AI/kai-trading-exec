@@ -40,6 +40,7 @@ def _reconcile_before_cancel(*, settings, db, adapter, item, order):
     if not isinstance(result, dict) or result.get('status_code') != 200:
         raise ValueError('quantity_cancel_reconciliation_unavailable')
     db.refresh(order)
+    db.refresh(item)
 
 
 def _owns_claim(job, claimed_at):
@@ -75,7 +76,7 @@ def queue_core_quantity_reduction(*, db, item, now):
 def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_trading_day=None):
     from app.services.broker_auth import ensure_authenticated_broker_session
     from app.services.core_handoff_v4 import persisted_core_plan_contract_ack
-    from app.services.core_quantity import _rearm_quantity_item
+    from app.services.core_quantity import _rearm_quantity_item, executable_core_quantity
     from app.services.core_revocation_exposure import serialized_revocation_exposure
 
     now = now or utc_now()
@@ -172,20 +173,33 @@ def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_tra
                 # An ACK accepts cancellation, not its final filled/canceled outcome.
                 _reconcile_before_cancel(settings=settings, db=db, adapter=adapter, item=item, order=order)
                 break
-            db.refresh(job)
-            if not _owns_claim(job, now):
-                continue
-            state = core_quantity_state(db=db, item=item)
-            if state['filled_quantity'] + state['open_quantity'] > state['target_quantity'] and state['open_quantity']:
-                job.status, job.last_error = 'retrying', 'cancel_outcome_awaiting_reconciliation'
-                job.scheduled_for = utc_now() + timedelta(seconds=15)
-            else:
-                job.status, job.last_error = 'completed', None
-                db.flush()
+            with serialized_revocation_exposure(db=db, settings=settings, items=[item]):
+                db.refresh(item, with_for_update=True)
+                db.refresh(job, with_for_update=True)
+                if not _owns_claim(job, now):
+                    continue
                 state = core_quantity_state(db=db, item=item)
-                if state['remaining_quantity'] and not state['submission_uncertain']:
-                    _rearm_quantity_item(db=db, item=item, now=utc_now())
-            db.commit()
+                if state['open_quantity']:
+                    job.status, job.last_error = 'retrying', (
+                        'cancel_outcome_awaiting_reconciliation'
+                        if state['filled_quantity'] + state['open_quantity'] > state['target_quantity']
+                        else 'quantity_followup_awaiting_open_buy'
+                    )
+                    job.scheduled_for = utc_now() + timedelta(seconds=15)
+                else:
+                    job.status, job.last_error = 'completed', None
+                    db.flush()
+                    state = core_quantity_state(db=db, item=item)
+                    if state['remaining_quantity'] and state['submission_uncertain']:
+                        job.status, job.last_error = 'retrying', 'quantity_followup_submission_uncertain'
+                        job.scheduled_for = utc_now() + timedelta(seconds=15)
+                    elif executable_core_quantity(db=db, item=item) and item.status not in {
+                        'core_activation_pending', 'revoked', 'superseded', 'manual_review_required', 'contract_quarantined',
+                    }:
+                        if not _rearm_quantity_item(db=db, item=item, now=utc_now()):
+                            job.status, job.last_error = 'retrying', 'quantity_followup_dispatch_in_flight'
+                            job.scheduled_for = utc_now() + timedelta(seconds=15)
+                db.commit()
         except Exception as exc:
             db.rollback()
             db.refresh(job)

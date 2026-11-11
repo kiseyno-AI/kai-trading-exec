@@ -730,7 +730,9 @@ existing independent dispatch worker reconciles, requests cancellation of the re
 then reconciles the final outcome before rearming any residual quantity. The
 revision is accepted before that cancellation finishes. A cancellation ACK alone
 does not mean canceled; unknown submission/cancellation outcomes fence replacement
-orders. A confirmed `not_cancelable` inquiry (no cancel submission) can be queried
+orders. An accepted increase with an open BUY waits in the same durable job and
+resumes its latest authorized remainder only after terminal broker reconciliation.
+A confirmed `not_cancelable` inquiry (no cancel submission) can be queried
 again. Workers validate the original account/route and their lease immediately
 before cancellation. Past-date jobs never cancel across sessions or starve today's
 jobs. If KIS does not support cancellation inquiry for the configured environment

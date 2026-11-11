@@ -359,8 +359,17 @@ def revise_core_quantities(*, settings, db: Session, command: CoreQuantityRevisi
                 state = core_quantity_state(db=db, item=item)
                 result.update(state)
                 if new.model_dump() == old.model_dump():
+                    if state['remaining_quantity'] and old.valid_until > utc_now() and item.status not in {
+                        'core_activation_pending', 'revoked', 'superseded', 'manual_review_required', 'contract_quarantined',
+                    }:
+                        if state['open_quantity'] or state['submission_uncertain'] or not _rearm_quantity_item(db=db, item=item, now=utc_now()):
+                            from app.services.core_quantity_reductions import queue_core_quantity_reduction
+
+                            queue_core_quantity_reduction(db=db, item=item, now=utc_now())
+                        db.commit()
+                    else:
+                        db.rollback()
                     results.append({**result, 'status': 'unchanged'})
-                    db.rollback()
                     continue
                 if old.revision != request.expected_revision or new.revision != old.revision + 1:
                     raise ValueError('quantity_revision_conflict')
@@ -403,12 +412,18 @@ def revise_core_quantities(*, settings, db: Session, command: CoreQuantityRevisi
                 db.refresh(item)
                 db.flush()
                 state = core_quantity_state(db=db, item=item)
-                if new.target_quantity < state['filled_quantity'] + state['open_quantity'] and state['open_quantity']:
+                if (
+                    (new.target_quantity < state['filled_quantity'] + state['open_quantity'] and state['open_quantity'])
+                    or (state['remaining_quantity'] and (state['open_quantity'] or state['submission_uncertain']))
+                ):
                     from app.services.core_quantity_reductions import queue_core_quantity_reduction
 
                     queue_core_quantity_reduction(db=db, item=item, now=now)
                 if state['remaining_quantity'] and not state['open_quantity'] and not state['submission_uncertain']:
-                    _rearm_quantity_item(db=db, item=item, now=now)
+                    if not _rearm_quantity_item(db=db, item=item, now=now):
+                        from app.services.core_quantity_reductions import queue_core_quantity_reduction
+
+                        queue_core_quantity_reduction(db=db, item=item, now=now)
                 db.commit()
                 result.update(state)
                 if new.target_quantity < state['filled_quantity'] + state['open_quantity']:
@@ -426,14 +441,14 @@ def revise_core_quantities(*, settings, db: Session, command: CoreQuantityRevisi
     }
 
 
-def _rearm_quantity_item(*, db: Session, item: ExecutionPlanItem, now: datetime) -> None:
+def _rearm_quantity_item(*, db: Session, item: ExecutionPlanItem, now: datetime) -> bool:
     from app.services.execution_jobs import materialize_execution_jobs
 
     # Quantity changes never grant missing activation or revive revoked authority.
-    if item.status == 'core_activation_pending':
-        return
+    if item.status in {'core_activation_pending', 'revoked', 'superseded', 'manual_review_required', 'contract_quarantined'}:
+        return False
     if now.astimezone(KST).date() != item.plan.market_date or now.astimezone(KST).time() >= time(15, 30):
-        return
+        return False
     if item.intent == 'intraday_watch_buy':
         item.status = 'watch_monitoring_pending'
     elif item.intent == 'next_open_buy':
@@ -441,10 +456,11 @@ def _rearm_quantity_item(*, db: Session, item: ExecutionPlanItem, now: datetime)
             ExecutionJob.execution_plan_item_id == item.id, ExecutionJob.job_type == 'next_open_buy',
         ).with_for_update())
         if job is not None and job.status == 'running':
-            return
+            return False
         if job is not None:
             job.status = 'scheduled'
             job.locked_at = None
             job.last_error = None
         item.status = 'pending'
         materialize_execution_jobs(item.plan, only_item_ids={item.id})
+    return True
