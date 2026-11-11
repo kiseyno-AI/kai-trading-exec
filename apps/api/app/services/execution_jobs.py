@@ -304,6 +304,7 @@ def dispatch_due_execution_jobs(
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionJob.status.in_(DISPATCHABLE_JOB_STATUSES),
+            ExecutionJob.job_type != 'core_quantity_reduction',
             ExecutionPlanItem.status.in_(CLAIMABLE_PLAN_ITEM_STATUSES),
             or_(
                 ExecutionJob.scheduled_for.is_(None),
@@ -390,6 +391,25 @@ def dispatch_due_execution_jobs(
         elif result == "failed":
             failed += 1
 
+    # Broker cancellation/reconciliation runs on this separate dispatch worker,
+    # never on the latency-sensitive protective SELL monitoring worker.
+    from app.services.core_quantity_reductions import process_core_quantity_reductions
+
+    def reduction_trading_day(market_date):
+        if market_date not in krx_calendar_state_by_date:
+            checker = getattr(adapter, 'is_krx_trading_day', None)
+            if not callable(checker):
+                return None
+            session = ensure_authenticated_broker_session(
+                settings=settings, db=db, adapter=adapter,
+                source='core_quantity_reduction', reason='verify KRX session before reducing unfilled BUY capacity',
+            )
+            krx_calendar_state_by_date[market_date] = checker(session.access_token or '', market_date=market_date)
+        return krx_calendar_state_by_date[market_date]
+
+    quantity_reduction_processed_count = process_core_quantity_reductions(
+        settings=settings, db=db, adapter=adapter, now=triggered_at, krx_trading_day=reduction_trading_day,
+    )
     next_dispatch_at = _next_dispatchable_job_at(
         settings=settings,
         db=db,
@@ -397,6 +417,15 @@ def dispatch_due_execution_jobs(
         include_buys=global_buy_block_reason is None,
         control_state=control_state,
     )
+    pending_quantity_reduction = db.scalar(select(ExecutionJob.id).join(ExecutionJob.plan_item).join(ExecutionPlan).where(
+        ExecutionPlan.mode == settings.runtime_mode,
+        ExecutionPlan.market_date == triggered_at.astimezone(ZoneInfo(settings.market_timezone)).date(),
+        ExecutionJob.job_type == 'core_quantity_reduction',
+        ExecutionJob.status.in_(['queued', 'retrying', 'running']),
+    ).limit(1))
+    if pending_quantity_reduction is not None:
+        reduction_retry_at = triggered_at + timedelta(seconds=15)
+        next_dispatch_at = min(next_dispatch_at, reduction_retry_at) if next_dispatch_at is not None else reduction_retry_at
     if "hourly_plan_risk_off" in blocked_buy_reasons:
         buy_retry_after_at = hourly_risk_off_retry_after_at(
             settings=settings,
@@ -445,6 +474,7 @@ def dispatch_due_execution_jobs(
             "completed_job_count": completed,
             "retrying_job_count": retrying,
             "failed_job_count": failed,
+            "quantity_reduction_processed_count": quantity_reduction_processed_count,
             "jobs": serialized_jobs,
             "safety": safety,
             "next_dispatch_at": _serialize_datetime(next_dispatch_at),
@@ -582,6 +612,7 @@ def _converge_retrying_jobs_from_committed_order_truth(
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionJob.status == "retrying",
+            ExecutionJob.job_type != 'core_quantity_reduction',
             ~ExecutionPlanItem.status.in_(CLAIMABLE_PLAN_ITEM_STATUSES),
         )
         .order_by(ExecutionJob.created_at.asc(), ExecutionJob.id.asc())
@@ -654,6 +685,7 @@ def _recover_stale_running_jobs(
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionJob.status == "running",
+            ExecutionJob.job_type != 'core_quantity_reduction',
         )
         .order_by(ExecutionJob.locked_at.asc(), ExecutionJob.created_at.asc())
     ).all()
@@ -864,6 +896,16 @@ def _dispatch_job(
     dispatch_reference_at = _normalize_utc(claim_locked_at)
     lease_locked_at = dispatch_reference_at
 
+    policy = job.plan_item.quantity_policy
+    if isinstance(policy, dict) and policy.get('type') == 'core_sized':
+        from app.services.core_quantity import executable_core_quantity
+
+        if executable_core_quantity(db=db, item=job.plan_item) <= 0:
+            return _finish_job(
+                db=db, job_id=job_id, expected_locked_at=lease_locked_at,
+                status='completed', last_error=None, plan_item_status='core_quantity_satisfied',
+            )
+
     effective_adapter = _adapter_for_job(settings=settings, adapter=adapter, job=job)
     try:
         command = _build_place_order_request(
@@ -994,6 +1036,32 @@ def _dispatch_job(
     if renewed_lease is None:
         return "superseded"
     lease_locked_at = renewed_lease
+
+    # A newer Core quantity can invalidate a command before any broker intent exists.
+    # Keep the same durable job claimable rather than waiting for the next 2-hour refresh.
+    db.refresh(job.plan_item, attribute_names=['quantity_policy'])
+    latest_policy = job.plan_item.quantity_policy
+    if (
+        job.job_type == NEXT_OPEN_BUY_JOB_TYPE
+        and isinstance(latest_policy, dict) and latest_policy.get('type') == 'core_sized'
+        and command.metadata.get('core_quantity_revision') != latest_policy.get('revision')
+        and result.status_code >= 400
+    ):
+        from app.services.core_quantity import executable_core_quantity
+        from app.services.execution_exposure import broker_order_is_provably_unsubmitted
+
+        earlier_intent = db.scalar(select(BrokerOrder).where(
+            BrokerOrder.mode == settings.runtime_mode, BrokerOrder.idempotency_key == command.idempotency_key,
+        ))
+        if (
+            (earlier_intent is None or broker_order_is_provably_unsubmitted(earlier_intent))
+            and executable_core_quantity(db=db, item=job.plan_item) > 0
+        ):
+            return _finish_job(
+                db=db, job_id=job_id, expected_locked_at=lease_locked_at,
+                status='retrying', last_error='Core quantity changed before broker intent',
+                plan_item_status='next_open_buy_retry_pending',
+            )
 
     order_payload = result.payload.get("order")
     order_status = None
@@ -1539,6 +1607,10 @@ def _build_place_order_request(
     if is_legacy_unverified_exec_agent_sizing(plan_item.quantity_policy):
         raise ValueError("unverified_exec_agent_sizing")
     quantity = _next_open_buy_quantity(plan_item)
+    if isinstance(plan_item.quantity_policy, dict) and plan_item.quantity_policy.get('type') == 'core_sized':
+        from app.services.core_quantity import executable_core_quantity
+
+        quantity = executable_core_quantity(db=db, item=plan_item) or None
     if quantity is None:
         raise ValueError("next_open_buy job requires quantity_policy.kind='shares' with a positive integer quantity")
     exchange = _plan_item_exchange(plan_item)
@@ -1555,6 +1627,11 @@ def _build_place_order_request(
         limit_price=plan_item.limit_price,
         time_in_force=plan_item.time_in_force or "day",
         exchange=exchange,
+        metadata=(
+            {'core_quantity_revision': plan_item.quantity_policy['revision']}
+            if isinstance(plan_item.quantity_policy, dict) and plan_item.quantity_policy.get('type') == 'core_sized'
+            else {}
+        ),
     )
 
 
@@ -1768,6 +1845,8 @@ def _adapter_for_job(
 
 def _place_order_idempotency_key(job: ExecutionJob) -> str:
     quantity_policy = job.plan_item.quantity_policy
+    if isinstance(quantity_policy, dict) and quantity_policy.get('type') == 'core_sized':
+        return f"execution-job:{job.id}:core:{quantity_policy['revision']}"
     if isinstance(quantity_policy, dict):
         idempotency_key = quantity_policy.get("idempotency_key")
         if isinstance(idempotency_key, str) and idempotency_key.strip():
@@ -1827,6 +1906,9 @@ def _next_open_buy_quantity(plan_item: ExecutionPlanItem) -> int | None:
 
     if is_delegated_exec_agent_sizing_policy(quantity_policy):
         return None
+
+    if quantity_policy.get("type") == "core_sized":
+        return _parse_positive_int(quantity_policy.get("target_quantity"))
 
     kind = quantity_policy.get("kind") or quantity_policy.get("type")
     if kind in {"shares", "fixed_quantity"}:
@@ -1979,6 +2061,7 @@ def _next_dispatchable_job_at(
         .where(
             ExecutionPlan.mode == settings.runtime_mode,
             ExecutionJob.status.in_(DISPATCHABLE_JOB_STATUSES),
+            ExecutionJob.job_type != 'core_quantity_reduction',
             ExecutionPlanItem.status.in_(CLAIMABLE_PLAN_ITEM_STATUSES),
         )
     )

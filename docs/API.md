@@ -44,6 +44,16 @@ Current foundation response includes:
 - `exec_agent.trigger_time` / `exec_agent.watch_sizing`
   - each reports the configured flag and the effective state after the global
     agent gate; `reason_codes` makes an intentionally disabled agent explicit
+- `core_quantity_account`: `as_of` UTC, `account_submission_uncertain`,
+  `account_local_unacknowledged_buy_notional_krw`, and `limits`
+  (`max_symbol_budget_krw`, `max_total_budget_krw`, `risk_fraction`,
+  `max_symbol_fraction`). Limits are decimal strings from the active Exec
+  configuration. The account aggregate includes prior-date local BUY intents
+  for the exact active KIS domestic-stock account. It excludes broker-visible
+  acknowledged orders from the additional cash reservation. Core reads this
+  once per account, including before the first plan exists; do not sum it across
+  plans. Unavailable account/schema evidence returns uncertainty and a null
+  notional, requiring Core to freeze increases.
 - `broker.provider`
 - `broker.status`
 - `broker.configured`
@@ -651,7 +661,8 @@ still open remain nonterminal until broker truth reaches a terminal state.
 This is the only Core delegation endpoint. It requires the exact v4 request metadata and `delegated_final_full_cost_gate_recheck_v1` capability. The executable capability is currently limited to canonical KIS/stock/KRX/KRW plans. USD or US-equity delegated sizing returns 422 with `unsupported_us_equity_exec_agent_sizing` before plan or job persistence. Each supported entry family contains one buy, one linked target sell, and one linked stop sell. Intake is all-or-none: items remain non-claimable while persisted contract proof is checked, then the complete family is activated in the same commit. The response is accepted only when it includes exact contract metadata, counts, and a one-to-one accepted acknowledgement with durable IDs for every `core_item_key`.
 
 Both request timestamps must be timezone-aware and equal. A buy
-`quantity_policy` must be exactly `type=exec_agent_sized`; executable aliases
+`quantity_policy` supports `type=core_sized` below and the compatibility
+`type=exec_agent_sized`; executable aliases on `exec_agent_sized`
 (`kind`, `quantity`, `planned_quantity`, and `computed_quantity`) are rejected
 rather than treated as a delegated share count. Future-market-date plans are
 durable but dormant: they cannot enter the monitoring universe, supersede a
@@ -666,6 +677,77 @@ trigger direction, trigger price, chase limit, and linked target and stop.
 remains eligible. Each triggered family can submit its own buy order when its
 execution checks pass. Deduplication applies within a lane, while account cash
 and aggregate symbol exposure limits apply across both lanes.
+
+Core-owned deterministic sizing uses this BUY policy:
+
+```json
+{
+  "type": "core_sized",
+  "target_quantity": 12,
+  "revision": 1,
+  "calculated_at": "2026-11-11T23:00:00Z",
+  "valid_until": "2026-11-12T06:30:00Z",
+  "sizing_inputs": {
+    "price_contract_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sizing_price": "70000"
+  }
+}
+```
+
+The target is cumulative lifetime BUY fills for the exact entry item, including
+fills on canceled, expired, and rejected orders. Detailed and broker-reported
+fill evidence are reconciled conservatively; open unfilled orders reserve the
+remaining quota. SELL fills never replenish BUY authority. Targets/revisions
+are strict integers; positive targets require a positive finite `sizing_price`.
+The original sizing price and any original chase limit form an immutable entry
+ceiling. Fresh executable ask, stop/target geometry, spread/cost/reward-risk,
+cash/exposure, duplicate orders, pause/kill, hourly risk-off, and exact account
+checks still apply. Exec does not invoke sizing/trigger agents or tighten/rebase
+Core prices for this entry family. Existing max-holding/time-exit controls remain.
+
+### `POST /v4/execution-plans/quantities`
+
+Refresh only remaining BUY authority; this endpoint never places or cancels an
+order synchronously and cannot change price fields. Send `{"items": [...]}`
+(1–500 items), each containing the full `core_sized` policy above plus
+`external_plan_id`, `execution_plan_id`, `core_item_key`, `decision_snapshot_id`,
+and `expected_revision`. The new revision must be exactly the previous revision
+plus one. Target date, UTC-aware validity, original `price_contract_digest`, and
+original `sizing_price` are pinned. Unknown fields (including prices) are rejected.
+
+HTTP 200 returns `updated_count`, `unchanged_count`, `failed_count`, and per-item
+`items[]` with exact identifiers, `status` (`updated`, `unchanged`, `blocked`,
+`conflict`), optional `reason_code`, and current quantity state:
+`revision`, `target_quantity`, `filled_quantity`, `open_quantity`,
+`remaining_quantity`, `submission_uncertain`, `entry_closed`. Semantic item errors do not block
+independent items. Exact replay of an accepted revision is unchanged even after
+expiry; a lost response therefore does not require a new target. Revision writes
+use durable compare-and-swap plus an audit proof bound to the original plan.
+
+A reduction preserves all fills. Excess open BUY orders produce
+`reduction_deferred_open_orders`: a durable `core_quantity_reduction` job in the
+existing independent dispatch worker reconciles, requests cancellation of the remaining BUY,
+then reconciles the final outcome before rearming any residual quantity. The
+revision is accepted before that cancellation finishes. A cancellation ACK alone
+does not mean canceled; unknown submission/cancellation outcomes fence replacement
+orders. A confirmed `not_cancelable` inquiry (no cancel submission) can be queried
+again. Workers validate the original account/route and their lease immediately
+before cancellation. Past-date jobs never cancel across sessions or starve today's
+jobs. If KIS does not support cancellation inquiry for the configured environment
+(including unsupported paper inquiry), reduction remains pending with a reason;
+Exec never guesses cancellation eligibility. No filled position is sold to meet a reduced target. An increase never
+reopens an expired session or grants missing activation. Once a protective exit
+or holding-period exit starts for a family, `entry_closed=true` and its remaining
+BUY capacity stays zero; a future decision needs a new entry family. The last
+locked broker-call check revalidates current target, revision, lifetime fills,
+other reservations, and exit state after account/quote I/O.
+
+`GET /v4/execution-plans` exposes the same `core_quantity_state` on each
+Core-sized BUY `item_states[]`. Each plan also exposes
+`local_unacknowledged_buy_notional_krw` and the account-wide
+`account_submission_uncertain` / `account_local_unacknowledged_buy_notional_krw`.
+Use account totals once, rather than summing repeated account fields or subtracting
+normal broker-visible pending orders twice from the broker's net orderable cash.
 
 `POST /v4/execution-plans/revocations` atomically fences the exact submitted items. With no committed order or exposure, entry and exits are revoked. Any order that is not conclusively local pre-submission rejected/failed requires manual review; the stale buy and its lease remain non-claimable while protective target/stop exits are preserved. Every result has an exact per-item acknowledgement. Persisted pre-v4 plans marked as Core-originated are reconciled before job claims and direct order placement. When immutable item identity and entry/exit linkage remain exact, only the invalid entry family is fenced and independent verified or retryable siblings remain unchanged. Corrupt counts, duplicate identities, malformed linkage, or another globally ambiguous intake mapping trigger the conservative plan-wide fallback that fences every buy. Sell protection is retained in either case.
 

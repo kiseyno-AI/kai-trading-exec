@@ -251,6 +251,7 @@ DYNAMIC_WATCH_BUY_APPROVAL_REASONS = frozenset(
 )
 RETRYABLE_WATCH_BUY_APPROVAL_REASONS = frozenset(
     {
+        "core_quantity_exhausted",
         "account_snapshot_unavailable",
         "exec_agent_sizing_pending",
         "invalid_stop_distance",
@@ -8577,6 +8578,8 @@ def _repair_unprotected_stop_coverage(
     symbols: set[str] | None = None,
     triggered_at: datetime,
 ) -> tuple[list[ProtectiveStopCoverageIssue], int]:
+    from app.services.core_quantity import core_owned_entry_family
+
     positions = {
         symbol: position
         for symbol, position in positions_by_symbol.items()
@@ -8738,6 +8741,7 @@ def _repair_unprotected_stop_coverage(
             and average_price > 0
             and repair_trigger_price >= average_price
             and latest_item.status in RETRYABLE_PROTECTIVE_STOP_STATUSES
+            and not core_owned_entry_family(latest_item)
         ):
             repair_trigger_price = (
                 average_price * (Decimal("1") - settings.exec_agent_stop_loss_pct)
@@ -10995,6 +10999,8 @@ def _maintain_post_entry_exit_monitors(
                 entry_item=entry_item,
                 entry_price=entry_price,
             )
+            if initial_stop is None:
+                continue
             stop_item, stop_maintenance_count = _ensure_post_entry_stop_monitor(
                 db=db,
                 entry_item=entry_item,
@@ -11044,6 +11050,10 @@ def _maintain_post_entry_exit_monitors(
                     )
                 )
 
+            from app.services.core_quantity import core_owned_entry_family
+
+            if core_owned_entry_family(entry_item):
+                continue
             review = _post_entry_review_state(
                 settings=settings,
                 entry_price=entry_price,
@@ -12089,8 +12099,10 @@ def _post_entry_initial_stop_price(
     settings: Settings,
     entry_item: ExecutionPlanItem,
     entry_price: Decimal,
-) -> Decimal:
+) -> Decimal | None:
     upstream_stop = _watch_buy_stop_price(entry_item)
+    if isinstance(entry_item.quantity_policy, dict) and entry_item.quantity_policy.get('type') == 'core_sized':
+        return upstream_stop
     hard_stop = (entry_price * (Decimal("1") - settings.exec_agent_stop_loss_pct)).quantize(
         Decimal("0.0001"),
         rounding=ROUND_DOWN,
@@ -12279,6 +12291,10 @@ def _sync_post_entry_share_quantity(
     item: ExecutionPlanItem,
     quantity: int,
 ) -> bool:
+    from app.services.core_quantity import core_owned_entry_family
+
+    if item.side == 'sell' and core_owned_entry_family(item):
+        return False
     current = item.quantity_policy
     if not _quantity_policy_supported(current):
         updated: dict[str, object] = {"kind": "shares", "quantity": quantity}
@@ -12472,7 +12488,10 @@ def _ensure_post_entry_target_monitor(
     triggered_at: datetime,
 ) -> tuple[ExecutionPlanItem | None, int]:
     target_price = _watch_buy_target_price(entry_item)
-    if target_price is None or target_price <= entry_price:
+    core_owned = isinstance(entry_item.quantity_policy, dict) and entry_item.quantity_policy.get('type') == 'core_sized'
+    if core_owned and target_price is None:
+        return None, 0
+    if not core_owned and (target_price is None or target_price <= entry_price):
         target_price = (
             entry_price * (Decimal("1") + settings.exec_agent_first_take_profit_pct)
         ).quantize(
@@ -14179,6 +14198,15 @@ def _resolve_watch_buy_order(
         if requested_quantity is not None
         else _parse_buy_quantity(item.quantity_policy)
     )
+    if isinstance(item.quantity_policy, dict) and item.quantity_policy.get('type') == 'core_sized':
+        from app.services.core_quantity import executable_core_quantity
+
+        quantity = executable_core_quantity(db=db, item=item)
+        if quantity <= 0:
+            return WatchBuyOrderApproval(
+                quantity=None, reason='core_quantity_exhausted',
+                message='Core quantity authority is exhausted, expired, or awaiting broker truth',
+            )
     if quantity is None and isinstance(decision, dict):
         quantity = _parse_positive_int(
             decision.get("approved_quantity") or decision.get("quantity")
@@ -14293,6 +14321,17 @@ def _resolve_watch_buy_order(
     )
     if pre_submit_guard is not None:
         return pre_submit_guard
+    if isinstance(item.quantity_policy, dict) and item.quantity_policy.get('type') == 'core_sized':
+        from app.services.core_quantity import executable_core_quantity
+
+        remaining = executable_core_quantity(db=db, item=item)
+        if remaining <= 0:
+            return WatchBuyOrderApproval(
+                quantity=None, reason='core_quantity_exhausted',
+                message='Core quantity authority is exhausted, expired, or awaiting broker truth',
+            )
+        # Exec enforces live account/order fences; it does not rescore or rewrite Core's size/stop.
+        return WatchBuyOrderApproval(quantity=remaining)
     effective_stop = effective_stop_price(
         settings=settings,
         entry_price=entry_price,
@@ -15011,6 +15050,8 @@ def _apply_watch_buy_effective_stop(
 def _parse_buy_quantity(quantity_policy: dict[str, object] | None) -> int | None:
     if not isinstance(quantity_policy, dict):
         return None
+    if quantity_policy.get('type') == 'core_sized':
+        return _parse_positive_int(quantity_policy.get('target_quantity'))
     if quantity_policy.get("kind") != "shares":
         return None
     return _parse_positive_int(quantity_policy.get("quantity"))
@@ -15234,6 +15275,10 @@ def _watch_buy_confidence(item: ExecutionPlanItem) -> Decimal | None:
 
 
 def _watch_buy_stop_price(item: ExecutionPlanItem) -> Decimal | None:
+    if isinstance(item.quantity_policy, dict) and item.quantity_policy.get('type') == 'core_sized':
+        from app.services.core_quantity import core_price_contract_level
+
+        return core_price_contract_level(item, 'stop_sell')
     return _first_positive_decimal_from_item(
         item,
         (
@@ -15247,6 +15292,10 @@ def _watch_buy_stop_price(item: ExecutionPlanItem) -> Decimal | None:
 
 
 def _watch_buy_target_price(item: ExecutionPlanItem) -> Decimal | None:
+    if isinstance(item.quantity_policy, dict) and item.quantity_policy.get('type') == 'core_sized':
+        from app.services.core_quantity import core_price_contract_level
+
+        return core_price_contract_level(item, 'target_sell')
     return _first_positive_decimal_from_item(
         item,
         (
@@ -15569,7 +15618,11 @@ def _watch_buy_pre_submit_lane_guard(
                         "existing symbol inventory lacks exact decision-lane ownership"
                     ),
                 )
-            if inventory_lane == candidate_lane:
+            if inventory_lane == candidate_lane and not (
+                isinstance(item.quantity_policy, dict)
+                and item.quantity_policy.get('type') == 'core_sized'
+                and inventory.entry_item.id == item.id
+            ):
                 return Decimal("0"), WatchBuyOrderApproval(
                     quantity=None,
                     reason="same_lane_existing_holding",
@@ -16452,6 +16505,10 @@ def _rearm_stop_after_partial_take_profit(
     submitted_quantity: int,
     recorded_at: datetime,
 ) -> None:
+    from app.services.core_quantity import core_owned_entry_family
+
+    if core_owned_entry_family(item):
+        return
     if item.intent != "target_sell" or remaining_quantity is None or remaining_quantity <= 0:
         return
     exit_rule = _exit_rule(item)
@@ -17691,6 +17748,8 @@ def _monitoring_order_idempotency_key(
     retry_source_order_pk: str | None,
 ) -> str:
     if is_watch_buy:
+        if isinstance(item.quantity_policy, dict) and item.quantity_policy.get('type') == 'core_sized':
+            return f"monitoring:watch_buy:{item.id}:core:{item.quantity_policy['revision']}"
         return f"monitoring:watch_buy:{item.id}"
     base = f"monitoring:{item.intent}:{item.id}"
     risk_context = _loaded_risk_context(item, allow_file_backed_load=True)
@@ -17736,6 +17795,8 @@ def _monitoring_order_metadata(
         "order_purpose": "protective_stop" if item.intent == "stop_sell" else item.intent,
         "route_now": triggered_at.isoformat(),
     }
+    if isinstance(item.quantity_policy, dict) and item.quantity_policy.get('type') == 'core_sized':
+        metadata['core_quantity_revision'] = item.quantity_policy['revision']
     strategy_family_identity = _strategy_entry_family_identity(item)
     if strategy_family_identity is not None:
         metadata[STRATEGY_ENTRY_FAMILY_METADATA_KEY] = strategy_family_identity

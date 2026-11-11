@@ -1,0 +1,187 @@
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from datetime import timedelta
+from contextlib import contextmanager
+
+import pytest
+
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+
+from app.broker.kis import KisBrokerAdapter
+from app.core.config import Settings
+from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionJob, ExecutionPlan, ExecutionPlanItem
+from app.services import broker_auth, core_quantity, core_quantity_reductions, reconciliation, core_revocation_exposure
+from test_broker_auth import RecordingHttpClient, _test_kis_execution_scope
+from test_core_handoff_v4 import _build_test_app
+from test_core_quantity import core_plan, revision_request
+
+
+def test_kis_cancel_checks_current_cancelable_order_and_cancels_only_remaining_buy():
+    http = RecordingHttpClient(
+        {'rt_cd': '0', 'output': {'ODNO': 'cancel-ticket'}},
+        get_response={'rt_cd': '0', 'output': [{
+            'odno': 'original-1', 'pdno': '005930', 'psbl_qty': '3',
+            'krx_fwdg_ord_orgno': 'branch-1', 'ord_dvsn_cd': '00',
+        }]},
+    )
+    adapter = KisBrokerAdapter(settings=Settings(
+        runtime_mode='live', kis_app_key='fake-key', kis_app_secret='fake-secret',
+        kis_account_number='12345678', kis_use_hashkey=False,
+    ), http_client=http)
+    result = adapter.cancel_order('fake-token', broker_order_id='original-1', symbol='005930')
+    assert result['status'] == 'accepted'
+    assert len(http.get_calls) == len(http.calls) == 1
+    assert http.get_calls[0]['headers']['tr_id'] == 'TTTC0084R'
+    assert http.calls[0]['headers']['tr_id'] == 'TTTC0013U'
+    assert http.calls[0]['payload']['ORGN_ODNO'] == 'original-1'
+    assert http.calls[0]['payload']['RVSE_CNCL_DVSN_CD'] == '02'
+    assert http.calls[0]['payload']['QTY_ALL_ORD_YN'] == 'Y'
+    assert http.calls[0]['payload']['ORD_QTY'] == '3'
+    assert adapter.cancel_order('fake-token', broker_order_id='another-order', symbol='005930')['status'] == 'not_cancelable'
+    assert len(http.calls) == 1
+
+
+@pytest.mark.parametrize('outcome', ['success', 'unknown', 'foreign_account', 'inquiry_failure', 'temporarily_not_cancelable', 'lost_claim', 'raced_intent', 'stale_job'])
+def test_reduction_is_queued_then_cancelled_and_reconciled_without_selling_fills(monkeypatch, outcome):
+    now = datetime(2026, 9, 10, 2, tzinfo=UTC)
+    monkeypatch.setattr(core_quantity, 'utc_now', lambda: now)
+    monkeypatch.setattr(core_quantity_reductions, 'utc_now', lambda: now)
+    monkeypatch.setattr(broker_auth, 'ensure_authenticated_broker_session', lambda **kwargs: SimpleNamespace(access_token='fake'))
+    adapter = SimpleNamespace(provider='kis', cancelled=False, calls=0)
+
+    def reconcile(*, order, db, **kwargs):
+        if outcome == 'inquiry_failure':
+            return {'status_code': 503}
+        if adapter.cancelled:
+            order.status = 'canceled'
+            order.response_metadata = {'filled_quantity': 4}
+            db.commit()
+        return {'status_code': 200}
+
+    def cancel(*args, **kwargs):
+        adapter.calls += 1
+        if outcome == 'unknown':
+            raise TimeoutError('lost response')
+        if outcome == 'temporarily_not_cancelable' and adapter.calls == 1:
+            return {'status': 'not_cancelable'}
+        adapter.cancelled = True
+        assert kwargs['broker_order_id'] == 'source-buy'
+        return {'status': 'accepted'}
+
+    adapter.cancel_order = cancel
+    monkeypatch.setattr(reconciliation, 'reconcile_broker_order', reconcile)
+    app, engine = _build_test_app()
+    with TestClient(app) as client:
+        plan = core_plan()
+        accepted = client.post('/v4/execution-plans', json=plan).json()
+        with app.state.db_session_factory() as db:
+            entry = db.scalar(select(ExecutionPlanItem).where(ExecutionPlanItem.side == 'buy'))
+            db.add(BrokerOrder(
+                execution_plan_item_id=entry.id, broker_name='kis', mode='mock', idempotency_key='old-buy',
+                broker_order_id='source-buy', symbol='005930', side='buy', status='partially_filled', quantity=10,
+                venue='kis', asset_class='stock',
+                request_metadata={'execution_scope': _test_kis_execution_scope(app.state.settings, venue='kis')},
+                response_metadata={'filled_quantity': 4},
+            ))
+            db.commit()
+        result = client.post('/v4/execution-plans/quantities', json={'items': [revision_request(accepted, plan, target=6)]}).json()
+        assert result['updated_count'] == 1
+        assert adapter.calls == 0
+        if outcome == 'foreign_account':
+            app.state.settings = app.state.settings.model_copy(update={'kis_account_number': '99999999'})
+        if outcome in {'lost_claim', 'raced_intent'}:
+            original_lock = core_revocation_exposure.serialized_revocation_exposure
+
+            @contextmanager
+            def racing_lock(*, db, **kwargs):
+                with original_lock(db=db, **kwargs) as acquired:
+                    if outcome == 'lost_claim':
+                        job = db.scalar(select(ExecutionJob).where(ExecutionJob.job_type == core_quantity_reductions.JOB_TYPE))
+                        job.locked_at = now + timedelta(seconds=1)
+                    else:
+                        order = db.scalar(select(BrokerOrder))
+                        db.add(BrokerOrderEvent(
+                            broker_order_pk=order.id, event_type=core_quantity_reductions.CANCEL_INTENT,
+                            event_source='another-worker', normalized_status='cancel_pending', observed_at=now,
+                        ))
+                    db.commit()
+                    yield acquired
+
+            monkeypatch.setattr(core_revocation_exposure, 'serialized_revocation_exposure', racing_lock)
+        with app.state.db_session_factory() as db:
+            if outcome == 'stale_job':
+                stale = ExecutionPlanItem(
+                    id='stale-entry', symbol='005930', side='buy', intent='next_open_buy',
+                    plan=ExecutionPlan(external_plan_id='yesterday', source='test', mode='mock', market_date=now.date() - timedelta(days=1)),
+                    quantity_policy=plan['items'][0]['quantity_policy'],
+                )
+                db.add(ExecutionJob(id='stale-job', plan_item=stale, job_type=core_quantity_reductions.JOB_TYPE, status='queued', scheduled_for=now - timedelta(days=1)))
+                db.commit()
+            core_quantity_reductions.process_core_quantity_reductions(settings=app.state.settings, db=db, adapter=adapter, now=now, krx_trading_day=lambda day: True)
+            job = db.scalar(select(ExecutionJob).where(ExecutionJob.job_type == core_quantity_reductions.JOB_TYPE, ExecutionJob.id != 'stale-job'))
+            if outcome == 'lost_claim':
+                assert job.status == 'running' and adapter.calls == 0
+                return
+            if outcome not in {'success', 'stale_job'}:
+                assert job.status == 'retrying'
+                core_quantity_reductions.process_core_quantity_reductions(settings=app.state.settings, db=db, adapter=adapter, now=now + timedelta(seconds=31), krx_trading_day=lambda day: True)
+                db.refresh(job)
+                if outcome != 'temporarily_not_cancelable':
+                    assert job.status == 'retrying'
+                    assert adapter.calls == (1 if outcome == 'unknown' else 0)
+                    return
+            assert job.status == 'completed'
+            if outcome == 'stale_job':
+                assert db.get(ExecutionJob, 'stale-job').status == 'queued'
+            entry = db.scalar(select(ExecutionPlanItem).where(ExecutionPlanItem.side == 'buy'))
+            assert core_quantity.core_quantity_state(db=db, item=entry)['remaining_quantity'] == 2
+            orders = db.scalars(select(BrokerOrder)).all()
+            assert len(orders) == 1 and orders[0].side == 'buy' and orders[0].status == 'canceled'
+        assert adapter.calls == (2 if outcome == 'temporarily_not_cancelable' else 1)
+    engine.dispose()
+
+
+def test_blocking_quantity_cancellation_runs_independently_from_protective_monitoring(monkeypatch):
+    from threading import Event, Thread
+    from app.services import execution_jobs, monitoring
+
+    started, release = Event(), Event()
+    now = datetime(2026, 9, 10, 2, tzinfo=UTC)
+
+    def blocked_cancel(**kwargs):
+        started.set()
+        assert release.wait(timeout=3)
+        return 0
+
+    monkeypatch.setattr(core_quantity_reductions, 'process_core_quantity_reductions', blocked_cancel)
+    app, engine = _build_test_app()
+    adapter = SimpleNamespace(provider='kis')
+    errors = []
+    with TestClient(app) as client:
+        assert client.post('/controls/resume').status_code == 200
+
+        def dispatch():
+            try:
+                with app.state.db_session_factory() as db:
+                    execution_jobs.dispatch_due_execution_jobs(settings=app.state.settings, db=db, adapter=adapter, now=now)
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = Thread(target=dispatch)
+        worker.start()
+        try:
+            assert started.wait(timeout=2)
+            with app.state.db_session_factory() as db:
+                result = monitoring._evaluate_monitoring_cycle(
+                    settings=app.state.settings, db=db, adapter=adapter,
+                    prices={}, triggered_at=now, allow_persisted_triggered_without_price=False,
+                    update_checkpoint_if_idle=False,
+                )
+                assert result.status_code == 200
+            assert worker.is_alive()
+        finally:
+            release.set()
+            worker.join(timeout=3)
+        assert errors == [] and not worker.is_alive()
+    engine.dispose()

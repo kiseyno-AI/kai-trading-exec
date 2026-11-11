@@ -4359,6 +4359,18 @@ def _place_broker_order_serialized(
                 ),
                 preserve_plan_item_status=True,
             )
+        from app.services.core_quantity import core_quantity_order_failure
+
+        immediate_quantity_failure = core_quantity_order_failure(
+            db=db, item=plan_item, command=routed_command, exclude_order_id=order.id,
+        )
+        if immediate_quantity_failure is not None:
+            return _persist_runtime_safety_fence(
+                settings=settings, db=db, order=order, plan_item=plan_item,
+                command=routed_command, control_state=control_state,
+                block_reason_override='core_quantity_authority_changed',
+                message_override=immediate_quantity_failure,
+            )
         immediate_next_open_window_failure = (
             _automated_next_open_submission_window_failure(
                 settings=settings,
@@ -6840,7 +6852,18 @@ def _validate_plan_item(
         if isinstance(plan_item.quantity_policy, dict)
         else {}
     )
+    core_quantity_matches = False
+    if command.side == 'buy' and quantity_policy.get('type') == 'core_sized':
+        from sqlalchemy.orm import object_session
+        from app.services.core_quantity import core_quantity_order_failure
+
+        quantity_db = object_session(plan_item)
+        core_quantity_matches = quantity_db is not None and core_quantity_order_failure(db=quantity_db, item=plan_item, command=command) is None
+        if not core_quantity_matches:
+            return 'Core cumulative buy quantity authority changed, exhausted, or expired'
     expected_quantity = _plan_item_fixed_quantity(quantity_policy)
+    if core_quantity_matches:
+        expected_quantity = command.quantity
     expected_base_quantity = getattr(plan_item, "base_quantity", None)
     expected_quote_notional = getattr(plan_item, "quote_notional", None)
     expected_quantity_precision = getattr(plan_item, "quantity_precision", None)
@@ -7792,6 +7815,13 @@ def _automated_kis_buy_market_evidence_failure(
         executable_ask,
         command.limit_price or executable_ask,
     )
+    core_sized = plan_item is not None and isinstance(plan_item.quantity_policy, dict) and plan_item.quantity_policy.get('type') == 'core_sized'
+    if core_sized:
+        from app.services.core_quantity import core_entry_price_ceiling
+
+        ceiling = core_entry_price_ceiling(plan_item)
+        if ceiling is None or execution_reference > ceiling:
+            return ('live_buy_core_entry_ceiling_exceeded', 'executable entry exceeds immutable Core sizing/chase price')
     if plan_item is not None and is_watch_buy_intent(plan_item.intent):
         target = _first_positive_plan_item_price(
             plan_item,
@@ -7804,6 +7834,11 @@ def _automated_kis_buy_market_evidence_failure(
             plan_item=plan_item,
             execution_reference=execution_reference,
         )
+        if core_sized:
+            from app.services.core_quantity import core_price_contract_level
+
+            target = core_price_contract_level(plan_item, 'target_sell')
+            stop = core_price_contract_level(plan_item, 'stop_sell')
         if target is None:
             return (
                 "live_buy_target_missing",
@@ -7894,6 +7929,13 @@ def _final_watch_buy_entry_signal_failure(
     plan_item: ExecutionPlanItem | None,
     executable_ask: Decimal,
 ) -> tuple[str, str] | None:
+    if plan_item is not None and isinstance(plan_item.quantity_policy, dict) and plan_item.quantity_policy.get('type') == 'core_sized' and plan_item.intent == 'next_open_buy':
+        from app.services.core_quantity import core_entry_price_ceiling
+
+        ceiling = core_entry_price_ceiling(plan_item)
+        if ceiling is None or executable_ask > ceiling:
+            return ('live_buy_core_entry_ceiling_exceeded', 'executable entry exceeds immutable Core sizing/chase price')
+        return None
     if plan_item is None or not is_short_term_watch_buy_intent(plan_item.intent):
         return None
     chase_limit = _first_positive_plan_item_price(
@@ -8224,6 +8266,8 @@ def _final_watch_buy_effective_stop(
         )
     if baseline is None:
         return None
+    if policy.get('type') == 'core_sized':
+        return baseline
     return effective_stop_price(
         settings=settings,
         entry_price=execution_reference,
@@ -11689,8 +11733,13 @@ def _automated_buy_lane_inventory_failure(
     lane_remaining = sum(
         (
             quantity
-            for (_family_key, lane), quantity in ledger.family_balances.items()
-            if lane == candidate_lane
+            for (family_key, lane), quantity in ledger.family_balances.items()
+            if lane == candidate_lane and not (
+                plan_item is not None
+                and isinstance(plan_item.quantity_policy, dict)
+                and plan_item.quantity_policy.get('type') == 'core_sized'
+                and family_key == candidate_identity['entry_family_key']
+            )
         ),
         Decimal("0"),
     )

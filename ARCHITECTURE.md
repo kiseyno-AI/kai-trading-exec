@@ -31,6 +31,7 @@ That includes:
 
 ### In `kai-trading-core`
 - produce candidate actions and execution plans
+- calculate deterministic cumulative BUY targets before open and refresh quantities every two hours; keep original decision prices unchanged
 - decide whether automation is enabled
 - expose dashboard-facing aggregated views
 - request runtime status from exec service
@@ -38,6 +39,7 @@ That includes:
 
 ### In `kai-trading-exec`
 - validate and accept execution plans
+- execute `core_sized` quantity revisions using lifetime fills and open-order reservations, without agent sizing or price adjustment; keep `exec_agent_sized` only for compatibility
 - schedule next-open and intraday execution jobs
 - place, amend, cancel orders
 - watch open orders / fills / positions continuously
@@ -59,6 +61,8 @@ That includes:
 - `POST /broker/session/authenticate`
 - `POST /broker/session/revoke`
 - `POST /execution-plans`
+- `POST /v4/execution-plans`
+- `POST /v4/execution-plans/quantities`
 - `POST /orders`
 - `GET /orders`
 - `GET /executions`
@@ -93,6 +97,7 @@ That includes:
    - tracks open orders, fills, target/stop triggers, and stale states
    - multiplexes many symbols through a shared scheduler instead of one OS worker per symbol
    - applies bounded broker-action capacity and explicit backlog reporting
+   - drains durable quantity-reduction jobs using the existing job table on the independent dispatch worker: account-bound BUY cancellation followed by broker reconciliation; never sells filled shares to resize a target
 
 5. **reconciliation worker**
    - periodic truth sync against broker APIs

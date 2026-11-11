@@ -56,6 +56,8 @@ KIS_TOKEN_PATH = "/oauth2/tokenP"
 KIS_REVOKE_PATH = "/oauth2/revokeP"
 KIS_HASHKEY_PATH = "/uapi/hashkey"
 KIS_ORDER_CASH_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
+KIS_CANCELABLE_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
+KIS_ORDER_CANCEL_PATH = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 KIS_CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
 KIS_BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
 KIS_OPEN_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
@@ -549,6 +551,55 @@ class KisBrokerAdapter(BrokerAdapter):
             response_payload=body,
             message=_optional_string(body.get("msg1")),
         )
+
+    def cancel_order(
+        self, access_token: str, *, broker_order_id: str, symbol: str, exchange: str = "KRX",
+    ) -> dict[str, Any]:
+        """Cancel only a freshly verified domestic BUY remainder, never filled shares."""
+        config = self._configured()
+        if exchange != 'KRX' or not broker_order_id or not self.settings.kis_account_number:
+            raise BrokerAdapterError('domestic cancellation requires exact KRX order/account identity', status_code=422)
+        inquiry = _get_domestic_paginated_json(
+            http_client=self.http_client, url=f'{config.api_base_url}{KIS_CANCELABLE_ORDERS_PATH}',
+            headers=self.build_headers(access_token, transaction_id='TTTC0084R'),
+            params={
+                'CANO': self.settings.kis_account_number,
+                'ACNT_PRDT_CD': self.settings.kis_account_product_code,
+                'INQR_DVSN_1': '0', 'INQR_DVSN_2': '2', 'CTX_AREA_FK100': '', 'CTX_AREA_NK100': '',
+            }, timeout_seconds=self.settings.kis_request_timeout_seconds, row_keys=('output',),
+        )
+        matches = [row for row in _payload_rows(inquiry.payload.get('output'))
+                   if str(row.get('odno') or '').strip() == broker_order_id
+                   and str(row.get('pdno') or '').strip().upper() == symbol]
+        if not matches:
+            return {'status': 'not_cancelable', 'broker_order_id': broker_order_id}
+        if len(matches) != 1:
+            raise BrokerAdapterError('cancelable order identity is ambiguous', status_code=409)
+        row = matches[0]
+        possible = _parse_int(row.get('psbl_qty'))
+        organization = _optional_string(row.get('krx_fwdg_ord_orgno')) or _optional_string(row.get('ord_gno_brno'))
+        if possible is None or possible <= 0 or not organization:
+            return {'status': 'not_cancelable', 'broker_order_id': broker_order_id}
+        request_payload = {
+            'CANO': self.settings.kis_account_number,
+            'ACNT_PRDT_CD': self.settings.kis_account_product_code,
+            'KRX_FWDG_ORD_ORGNO': organization, 'ORGN_ODNO': broker_order_id,
+            'ORD_DVSN': str(row.get('ord_dvsn_cd') or row.get('ord_dvsn') or '00'),
+            'RVSE_CNCL_DVSN_CD': '02', 'ORD_QTY': str(possible), 'ORD_UNPR': '0',
+            'QTY_ALL_ORD_YN': 'Y', 'EXCG_ID_DVSN_CD': 'KRX',
+        }
+        tr_id = 'TTTC0013U' if self.settings.runtime_mode == 'live' else 'VTTC0013U'
+        response = self.http_client.post_json(
+            url=f'{config.api_base_url}{KIS_ORDER_CANCEL_PATH}',
+            headers=self.build_headers(access_token, transaction_id=tr_id, hashkey=self._issue_hashkey(access_token, request_payload)),
+            payload=request_payload, timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        _require_kis_business_success(response.payload, context='Core quantity reduction cancel')
+        return {
+            'status': 'accepted', 'broker_order_id': broker_order_id,
+            'requested_cancel_quantity': possible, 'observed_at': datetime.now(UTC).isoformat(),
+            'response_payload': _safe_error_payload(response.payload),
+        }
 
     def _place_us_equity_order(
         self,

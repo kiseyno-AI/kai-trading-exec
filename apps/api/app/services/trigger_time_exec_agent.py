@@ -243,6 +243,10 @@ def trigger_time_decision_geometry_error(
 
 
 def trigger_time_exec_agent_enabled(*, settings: Settings, item: ExecutionPlanItem) -> bool:
+    from app.services.core_quantity import core_owned_entry_family
+
+    if core_owned_entry_family(item):
+        return False
     if not getattr(settings, "exec_agent_enabled", False):
         return False
     if not getattr(settings, "exec_agent_trigger_time_enabled", True):

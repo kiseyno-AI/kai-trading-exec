@@ -3196,7 +3196,7 @@ def _normalize_monitoring_prices(raw_prices: object) -> list[MonitoringPriceRequ
 
 
 def _dispatch_payload_changed_runtime_state(payload: dict[str, object]) -> bool:
-    for key in ("completed_job_count", "retrying_job_count", "failed_job_count"):
+    for key in ("completed_job_count", "retrying_job_count", "failed_job_count", "quantity_reduction_processed_count"):
         value = payload.get(key)
         if isinstance(value, int) and value > 0:
             return True
