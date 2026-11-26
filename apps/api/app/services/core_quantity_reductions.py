@@ -2,7 +2,7 @@
 
 from datetime import UTC, timedelta
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, case, or_, select, update
 from sqlalchemy.orm import selectinload
 
 from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionJob, ExecutionPlan, ExecutionPlanItem
@@ -108,7 +108,11 @@ def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_tra
         ExecutionJob.job_type == JOB_TYPE,
         ExecutionJob.status.in_(['queued', 'retrying', 'running']),
         ExecutionJob.scheduled_for <= now,
-    ).options(selectinload(ExecutionJob.plan_item)).order_by(ExecutionJob.scheduled_for, ExecutionJob.id).limit(1)
+    ).options(selectinload(ExecutionJob.plan_item)).order_by(
+        # Closed-rule reconciliation remains eligible when an older agent job
+        # is held by its trading-session guard; keep the single-job bound.
+        case((closed_rule, 0), else_=1), ExecutionJob.scheduled_for, ExecutionJob.id,
+    ).limit(1)
     jobs = db.scalars(query).all()
     for job in jobs:
         item = job.plan_item

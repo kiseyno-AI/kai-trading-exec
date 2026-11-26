@@ -384,3 +384,55 @@ def test_rule_closure_survives_saturated_risk_compaction_and_invalidates_cached_
     coordinator._monitoring_cycle_sync_guarded(now)
     assert coordinator._dispatch_next_db_check_at is None
     assert coordinator._dispatch_schedule_generation == generation + 1
+
+
+@pytest.mark.parametrize('holiday', [False, True])
+@pytest.mark.parametrize('broker_terminal', [False, True])
+def test_closed_rule_reconciliation_is_not_hidden_by_older_ineligible_agent_job(partial_rule, holiday, broker_terminal):
+    env = partial_rule
+    original = core_plan()
+    original['plan_id'] = 'older-agent-plan'
+    original['items'][0]['core_item_key'] = 'older-agent-entry'
+    for item in original['items'][1:]:
+        item['core_item_key'] = f"older-agent-{item['intent']}"
+        item['quantity_policy']['linked_entry_item_key'] = 'older-agent-entry'
+    for item in original['items']:
+        item['source_plan_item_id'] = item['core_item_key']
+    _refresh_material_fingerprint(original)
+    response = env.client.post('/v4/execution-plans', json=original)
+    assert response.status_code == 201, response.text
+    with env.app.state.db_session_factory() as db:
+        entry = db.scalar(select(ExecutionPlanItem).where(ExecutionPlanItem.source_plan_item_id == 'older-agent-entry'))
+        entry.status = 'core_activation_pending'
+        for job in entry.jobs:
+            job.status = 'completed'
+        job = ExecutionJob(plan_item=entry, job_type='core_quantity_reduction', status='queued', scheduled_for=env.clock[0])
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        ordinary_id = job.id
+        ordinary_state = (job.status, job.attempts, job.scheduled_for, job.last_error)
+    env.clock[0] = datetime(2026, 9, 10, 2, tzinfo=UTC) if holiday else datetime(2026, 9, 10, 6, 31, tzinfo=UTC)
+    env.adapter.is_krx_trading_day = lambda *args, **kwargs: not holiday
+    env.broker.canceled = broker_terminal
+    response = env.client.post('/execution-jobs/dispatch')
+    assert response.status_code == 200, response.text
+    assert response.json()['quantity_reduction_processed_count'] == 1, response.text
+    env.clock[0] += timedelta(seconds=31)
+    assert env.client.post('/execution-jobs/dispatch').status_code == 200
+    with env.app.state.db_session_factory() as db:
+        ordinary = db.get(ExecutionJob, ordinary_id)
+        assert (ordinary.status, ordinary.attempts, ordinary.scheduled_for, ordinary.last_error) == ordinary_state
+        entry = db.get(ExecutionPlanItem, env.entry_id)
+        state = core_quantity.core_quantity_state(db=db, item=entry)
+        job = db.scalar(select(ExecutionJob).where(
+            ExecutionJob.execution_plan_item_id == env.entry_id, ExecutionJob.job_type == 'core_quantity_reduction'))
+        assert state['entry_closed'] and state['remaining_quantity'] == 0
+        assert state['filled_quantity'] == 4
+        if broker_terminal:
+            assert db.get(BrokerOrder, 'partial-rule-buy').status == 'canceled'
+            assert state['open_quantity'] == 0 and job.status == 'completed'
+        else:
+            assert state['open_quantity'] == 6 and state['submission_uncertain'] is True
+            assert job.status == 'retrying' and job.last_error == 'rule_cancel_market_session_closed'
+    assert env.broker.cancel_calls == [] and env.adapter.order_calls == []
