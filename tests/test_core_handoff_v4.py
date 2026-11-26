@@ -1021,6 +1021,8 @@ def test_v4_intake_requires_exact_contract_and_returns_one_to_one_durable_ack() 
         {
             "core_item_key": item["core_item_key"],
             "execution_plan_item_id": ack["execution_plan_item_id"],
+            "side": item["side"],
+            "intent": item["intent"],
             "status": status,
             "updated_at": readback.json()[0]["item_states"][index]["updated_at"],
             "terminal": False,

@@ -601,6 +601,7 @@ Every plan object includes:
 - `item_states[]`, ordered by the original plan item index
   - `core_item_key`
   - `execution_plan_item_id`
+  - `side` and `intent`, for every agent and rule item, including generated exits
   - `status`
   - `updated_at`
   - `terminal`

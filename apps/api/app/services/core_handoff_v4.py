@@ -2420,6 +2420,8 @@ def _core_v4_item_state(item: ExecutionPlanItem) -> dict[str, object]:
     return {
         "core_item_key": item.source_plan_item_id,
         "execution_plan_item_id": item.id,
+        "side": item.side,
+        "intent": item.intent,
         "status": item.status,
         "updated_at": (
             item.updated_at.isoformat()

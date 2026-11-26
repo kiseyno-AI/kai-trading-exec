@@ -168,6 +168,8 @@ def test_rule_uses_existing_mock_broker_and_restores_exact_timed_family_after_re
         assert len(readback) == 1 and readback[0]['contract_ack']['rule_origin'] == original['rule_origin']
         state = next(row for row in readback[0]['item_states'] if row['core_item_key'] == original['items'][0]['core_item_key'])
         assert state['core_activation_state']['status'] == 'activated'
+        timer_state = next(row for row in readback[0]['item_states'] if row['intent'] == 'max_holding_close_sell')
+        assert timer_state['side'] == 'sell'
         with app.state.db_session_factory() as db:
             timer = db.scalar(select(ExecutionPlanItem).where(ExecutionPlanItem.intent == 'max_holding_close_sell'))
             assert timer is not None and plan_item_entry_family_key(timer) == family
@@ -372,6 +374,26 @@ def test_actual_core_builder_fixture_is_accepted_and_readable_in_paper_runtime()
     engine.dispose()
 
 
+@pytest.mark.parametrize('rule_origin', [False, True])
+def test_v4_readback_identifies_buy_and_protective_sell_states(rule_origin):
+    payload = rule_plan() if rule_origin else core_plan()
+    app, engine = _build_test_app()
+    with TestClient(app) as client:
+        response = client.post('/v4/execution-plans', json=payload)
+        assert response.status_code == 201, response.text
+        accepted = response.json()
+        row = client.get('/v4/execution-plans', params={'external_plan_id': payload['plan_id']}).json()[0]
+        states = {state['execution_plan_item_id']: state for state in row['item_states']}
+        for item, ack in zip(payload['items'], accepted['item_acks'], strict=True):
+            state = states[ack['execution_plan_item_id']]
+            assert state['side'] == item['side']
+            assert state['intent'] == item['intent']
+        assert row['contract_ack']['dispatch_material_fingerprint'] == payload['metadata']['dispatch_material_fingerprint']
+        if not rule_origin:
+            assert 'rule_origin' not in row and 'origin_type' not in row
+    engine.dispose()
+
+
 def test_rule_cash_only_capacity_caps_cost_quantity_and_unacknowledged_reservations(monkeypatch):
     now = datetime.fromisoformat('2026-11-27T00:01:00+00:00')
     monkeypatch.setattr(rule_execution, 'utc_now', lambda: now)
@@ -426,3 +448,57 @@ def test_cached_rule_deadline_never_falls_back_to_session_date():
         triggered_at=datetime.fromisoformat('2026-09-10T06:20:00+00:00'))
     assert not _cached_monitoring_item_triggered(item=replace(item, close_exit_at=None), observed_price=None,
         triggered_at=datetime.fromisoformat('2026-09-10T06:20:00+00:00'))
+
+
+@pytest.mark.parametrize('runtime_mode', ['mock', 'paper'])
+def test_legacy_import_cannot_grant_rule_buy_authority(monkeypatch, runtime_mode):
+    from app.api.routes import execution as execution_routes
+
+    now = datetime.fromisoformat('2026-09-10T00:01:00+00:00')
+    monkeypatch.setattr(core_quantity, 'utc_now', lambda: now)
+    monkeypatch.setattr(rule_execution, 'utc_now', lambda: now)
+    monkeypatch.setattr(execution_routes, 'dispatch_due_execution_jobs',
+                        lambda **kwargs: execution_jobs.dispatch_due_execution_jobs(**kwargs, now=now))
+    _use_historical_broker_boundary(monkeypatch)
+    settings = Settings(database_url='sqlite:///:memory:', runtime_mode=runtime_mode, krx_us_rebound_enabled=True,
+                        account_drawdown_gate_enabled=False, kis_account_number='12345678',
+                        kis_account_product_code='01',
+                        account_drawdown_recovery_scope_secret='rule-test-account-scope-secret-32-bytes')
+    app, engine = _build_test_app(settings=settings)
+    original = rule_plan()
+    legacy = {key: deepcopy(original[key]) for key in ('plan_id', 'market_date', 'requested_at', 'items')}
+    legacy.update(plan_id='legacy-rule-import', source='manual-feed')
+    legacy['items'][0]['quantity_policy']['sizing_inputs']['cash_per_share'] = '70350'
+    for item in legacy['items']:
+        item['risk_context']['rule_origin'] = item.pop('rule_origin')
+    adapter = StubBrokerAdapter(
+        config=BrokerConfig(provider='kis', mode=runtime_mode, configured=True, api_base_url='https://mock.invalid'),
+        token_grant=build_token_grant(), order_placement=build_order_placement(broker_order_id='legacy-rule-buy'),
+        account_snapshot=BrokerAccountSnapshot(available_cash=Decimal('10000000'), buying_power=Decimal('10000000'),
+            total_asset_value=Decimal('10000000'), previous_total_asset_value=Decimal('10000000'),
+            observed_at=now, holdings_complete=True),
+    )
+    adapter.get_live_market_context = lambda *args, **kwargs: BrokerLiveMarketContext(
+        symbol='005930', exchange='KRX', observed_at=now, bid=Decimal('69990'), ask=Decimal('70000'),
+        freshness_source='kis_exchange_orderbook_time', normal_ordering_available=True,
+    )
+    adapter.get_domestic_cash_capacity = lambda **kwargs: DomesticCashCapacity(
+        provider='kis', runtime_mode=runtime_mode, account_reference='KIS:12345678-01',
+        symbol=kwargs['symbol'], exchange='KRX', currency='KRW', requested_price=kwargs['limit_price'],
+        quantity_calculation_price=kwargs['limit_price'], orderable_cash_krw=Decimal('9000000'),
+        no_misu_buying_amount_krw=Decimal('9000000'), no_misu_buying_quantity=100,
+        received_at=now, capacity_id='a' * 64,
+    )
+    app.state.broker_adapter_factory = lambda _settings: adapter
+    with TestClient(app) as client:
+        response = client.post('/execution-plans', json=legacy)
+        assert response.status_code == 201, response.text
+        assert client.post('/controls/resume').status_code == 200
+        response = client.post('/execution-jobs/dispatch')
+        assert response.status_code == 200, response.text
+        assert not adapter.order_calls and response.json()['completed_job_count'] == 0, response.text
+        with app.state.db_session_factory() as db:
+            assert db.scalars(select(BrokerOrder)).all() == []
+            entry = db.scalar(select(ExecutionPlanItem).where(ExecutionPlanItem.side == 'buy'))
+            assert rule_execution.rule_entry_block_reason(settings=settings, db=db, plan_item=entry, now=now) == 'rule_v4_contract_unproven'
+    engine.dispose()

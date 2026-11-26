@@ -145,6 +145,22 @@ def rule_entry_block_reason(
     deadline = rule_close_exit_at(plan_item)
     if origin is None or deadline is None:
         return 'rule_origin_or_deadline_unproven'
+    from app.services.core_handoff_v4 import persisted_core_plan_contract_ack
+
+    plan = plan_item.plan
+    proof = (
+        persisted_core_plan_contract_ack(plan)
+        if plan is not None and plan.source == 'kai-trading-core'
+        and isinstance(raw, dict) and raw.get('origin_type') == 'rule'
+        else None
+    )
+    if (
+        proof is None or proof.get('origin_type') != 'rule' or proof.get('rule_origin') != origin
+        or not any(ack['execution_plan_item_id'] == plan_item.id
+                   and ack['core_item_key'] == plan_item.source_plan_item_id
+                   for ack in proof['item_acks'])
+    ):
+        return 'rule_v4_contract_unproven'
     if now.tzinfo is None or now.utcoffset() is None or now >= deadline:
         return 'rule_entry_deadline_passed'
     scope = plan_item_inventory_scope_key(plan_item)

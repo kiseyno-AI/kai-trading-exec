@@ -44,6 +44,10 @@ symbol/setup, one BUY, one linked target, and one linked stop, all KIS/KRX/KRW.
 The BUY policy must be `core_sized`; its immutable `price_contract_digest`,
 revision CAS, lifetime fills, open reservations and uncertainty fences apply.
 No agent roundtrip or fabricated confidence/snapshot is required or allowed.
+Every rule BUY boundary requires the current persisted strict Core-v4 rule
+contract and its exact durable item binding. Embedding `risk_context.rule_origin`
+in a legacy/manual import grants no rule execution authority. Protective SELL
+handling remains independent of this entry-only proof.
 
 Every item must include identical timezone-aware `close_exit_at` and
 `risk_context.rule_session`:
