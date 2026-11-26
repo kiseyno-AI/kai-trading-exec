@@ -1,0 +1,265 @@
+{
+  "plan_id": "rule-rebound:53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d",
+  "source": "kai-trading-core",
+  "mode": "paper",
+  "market_date": "2026-11-27",
+  "strategy_run_id": null,
+  "requested_at": "2026-11-27T08:00:00+09:00",
+  "items": [
+    {
+      "core_item_key": "rule-rebound:53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d:entry",
+      "source_plan_item_id": "rule-rebound:53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d:entry",
+      "agent_name": null,
+      "decision_agent_name": null,
+      "symbol": "069500",
+      "asset_class": "stock",
+      "market": "KRX",
+      "exchange": "KRX",
+      "currency": "KRW",
+      "broker": "kis",
+      "provider": "kis",
+      "venue": "kis",
+      "session_policy": {
+        "session": "regular",
+        "timezone": "Asia/Seoul",
+        "allow_extended_hours": false
+      },
+      "side": "buy",
+      "intent": "intraday_watch_buy",
+      "handoff_intent": "intraday_watch_buy",
+      "quantity_policy": {
+        "type": "core_sized",
+        "target_quantity": 19,
+        "revision": 1,
+        "calculated_at": "2026-11-27T08:00:00+09:00",
+        "valid_until": "2026-11-27T09:10:00+09:00",
+        "sizing_inputs": {
+          "sizing_price": "10050",
+          "cash_per_share": "10100.25",
+          "risk_per_share": "300.25",
+          "residual_cash_krw": "200000",
+          "reasons": [],
+          "quantity_limits": [
+            [
+              "residual_cash",
+              19
+            ],
+            [
+              "buying_power",
+              39
+            ],
+            [
+              "account_buy_limit",
+              39
+            ],
+            [
+              "trade_limit",
+              297
+            ],
+            [
+              "symbol_limit",
+              19
+            ],
+            [
+              "strategy_limit",
+              495
+            ],
+            [
+              "liquidity_limit",
+              990
+            ],
+            [
+              "loss_limit",
+              33
+            ],
+            [
+              "broker_cash_only_quantity",
+              40
+            ]
+          ],
+          "price_contract_digest": "bc4a9a6bc922f4ff6ff87fde1232a8b0eab0c2847c1df9bddd1d275672891757",
+          "execution_policy_hash": "6facff287b264a5d31559521d9ce02b5c42b21a4f5138f70664ae24977437385"
+        }
+      },
+      "limit_price": "10050",
+      "trigger_price": "10000",
+      "time_in_force": "day",
+      "risk_context": {
+        "instrument_subtype": "etf",
+        "execution_policy_hash": "6facff287b264a5d31559521d9ce02b5c42b21a4f5138f70664ae24977437385",
+        "rule_session": {
+          "calendar_status": "authoritative",
+          "calendar_source": "exchange_calendars.XKRX:test",
+          "session_close_at": "2026-11-27T15:30:00+09:00",
+          "close_buffer_seconds": 600
+        },
+        "_core_activation": {
+          "schema_version": "core_execution_activation_binding_v1",
+          "mode": "core_confirmed",
+          "authority_generation_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      },
+      "decision_snapshot_id": null,
+      "rule_origin": {
+        "schema_version": "rule_origin.v1",
+        "strategy_id": "krx_us_rebound",
+        "strategy_lane": "krx_us_rebound",
+        "rule_version": "exploratory_v1",
+        "run_id": "run-test",
+        "evaluation_id": "6f76273c6f95d15324335f4db24ac76d69611776d69367b96cb87c7fbbbd3fa0",
+        "input_manifest_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "config_hash": "1a0478eda27772df9c413a6f1baa4d12c734ea7a88ae3a8b514e1e9df2b42994",
+        "input_hash": "265efe03b74c972aa8d9667d5410f1e5f67e33c278c698012c14b68c7183853a",
+        "target_trade_date": "2026-11-27",
+        "setup_id": "53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d"
+      },
+      "close_exit_at": "2026-11-27T15:20:00+09:00"
+    },
+    {
+      "core_item_key": "rule-rebound:53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d:target_sell",
+      "source_plan_item_id": "rule-rebound:53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d:target_sell",
+      "agent_name": null,
+      "decision_agent_name": null,
+      "symbol": "069500",
+      "asset_class": "stock",
+      "market": "KRX",
+      "exchange": "KRX",
+      "currency": "KRW",
+      "broker": "kis",
+      "provider": "kis",
+      "venue": "kis",
+      "session_policy": {
+        "session": "regular",
+        "timezone": "Asia/Seoul",
+        "allow_extended_hours": false
+      },
+      "side": "sell",
+      "intent": "target_sell",
+      "quantity_policy": {
+        "type": "position_exit_from_entry",
+        "linked_entry_item_key": "rule-rebound:53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d:entry"
+      },
+      "limit_price": null,
+      "trigger_price": "10500",
+      "time_in_force": "day",
+      "risk_context": {
+        "instrument_subtype": "etf",
+        "execution_policy_hash": "6facff287b264a5d31559521d9ce02b5c42b21a4f5138f70664ae24977437385",
+        "rule_session": {
+          "calendar_status": "authoritative",
+          "calendar_source": "exchange_calendars.XKRX:test",
+          "session_close_at": "2026-11-27T15:30:00+09:00",
+          "close_buffer_seconds": 600
+        },
+        "_core_activation": {
+          "schema_version": "core_execution_activation_binding_v1",
+          "mode": "core_confirmed",
+          "authority_generation_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      },
+      "decision_snapshot_id": null,
+      "rule_origin": {
+        "schema_version": "rule_origin.v1",
+        "strategy_id": "krx_us_rebound",
+        "strategy_lane": "krx_us_rebound",
+        "rule_version": "exploratory_v1",
+        "run_id": "run-test",
+        "evaluation_id": "6f76273c6f95d15324335f4db24ac76d69611776d69367b96cb87c7fbbbd3fa0",
+        "input_manifest_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "config_hash": "1a0478eda27772df9c413a6f1baa4d12c734ea7a88ae3a8b514e1e9df2b42994",
+        "input_hash": "265efe03b74c972aa8d9667d5410f1e5f67e33c278c698012c14b68c7183853a",
+        "target_trade_date": "2026-11-27",
+        "setup_id": "53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d"
+      },
+      "close_exit_at": "2026-11-27T15:20:00+09:00"
+    },
+    {
+      "core_item_key": "rule-rebound:53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d:stop_sell",
+      "source_plan_item_id": "rule-rebound:53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d:stop_sell",
+      "agent_name": null,
+      "decision_agent_name": null,
+      "symbol": "069500",
+      "asset_class": "stock",
+      "market": "KRX",
+      "exchange": "KRX",
+      "currency": "KRW",
+      "broker": "kis",
+      "provider": "kis",
+      "venue": "kis",
+      "session_policy": {
+        "session": "regular",
+        "timezone": "Asia/Seoul",
+        "allow_extended_hours": false
+      },
+      "side": "sell",
+      "intent": "stop_sell",
+      "quantity_policy": {
+        "type": "position_exit_from_entry",
+        "linked_entry_item_key": "rule-rebound:53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d:entry"
+      },
+      "limit_price": null,
+      "trigger_price": "9800",
+      "time_in_force": "day",
+      "risk_context": {
+        "instrument_subtype": "etf",
+        "execution_policy_hash": "6facff287b264a5d31559521d9ce02b5c42b21a4f5138f70664ae24977437385",
+        "rule_session": {
+          "calendar_status": "authoritative",
+          "calendar_source": "exchange_calendars.XKRX:test",
+          "session_close_at": "2026-11-27T15:30:00+09:00",
+          "close_buffer_seconds": 600
+        },
+        "_core_activation": {
+          "schema_version": "core_execution_activation_binding_v1",
+          "mode": "core_confirmed",
+          "authority_generation_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      },
+      "decision_snapshot_id": null,
+      "rule_origin": {
+        "schema_version": "rule_origin.v1",
+        "strategy_id": "krx_us_rebound",
+        "strategy_lane": "krx_us_rebound",
+        "rule_version": "exploratory_v1",
+        "run_id": "run-test",
+        "evaluation_id": "6f76273c6f95d15324335f4db24ac76d69611776d69367b96cb87c7fbbbd3fa0",
+        "input_manifest_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "config_hash": "1a0478eda27772df9c413a6f1baa4d12c734ea7a88ae3a8b514e1e9df2b42994",
+        "input_hash": "265efe03b74c972aa8d9667d5410f1e5f67e33c278c698012c14b68c7183853a",
+        "target_trade_date": "2026-11-27",
+        "setup_id": "53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d"
+      },
+      "close_exit_at": "2026-11-27T15:20:00+09:00"
+    }
+  ],
+  "metadata": {
+    "schema_version": "signal_decider_exec_plan_v4",
+    "contract_version": "execution_handoff_contract_v4",
+    "required_capability": "delegated_final_full_cost_gate_recheck_v1",
+    "agent_name": null,
+    "decision_agent_name": null,
+    "trigger": "rule_rebound_prepare",
+    "requested_at": "2026-11-27T08:00:00+09:00",
+    "account_reference": "KIS:12345678-01",
+    "account_label": null,
+    "source_market_date": "2026-11-26",
+    "target_trade_date": "2026-11-27",
+    "dispatch_batch_type": "initial",
+    "dispatch_batch_key": null,
+    "dispatch_material_fingerprint": "3f1c25f505d2a83b939f146e7ff4c63726674127d53096a5ae7d59e26d0ba44a"
+  },
+  "origin_type": "rule",
+  "rule_origin": {
+    "schema_version": "rule_origin.v1",
+    "strategy_id": "krx_us_rebound",
+    "strategy_lane": "krx_us_rebound",
+    "rule_version": "exploratory_v1",
+    "run_id": "run-test",
+    "evaluation_id": "6f76273c6f95d15324335f4db24ac76d69611776d69367b96cb87c7fbbbd3fa0",
+    "input_manifest_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "config_hash": "1a0478eda27772df9c413a6f1baa4d12c734ea7a88ae3a8b514e1e9df2b42994",
+    "input_hash": "265efe03b74c972aa8d9667d5410f1e5f67e33c278c698012c14b68c7183853a",
+    "target_trade_date": "2026-11-27",
+    "setup_id": "53bb83b1295eac4f2bfad65cef76e3d4fa8157937c702f36879a2a186895845d"
+  }
+}

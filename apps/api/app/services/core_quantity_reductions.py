@@ -2,15 +2,23 @@
 
 from datetime import UTC, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, case, or_, select, update
 from sqlalchemy.orm import selectinload
 
-from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionJob, ExecutionPlan
+from app.models.runtime import BrokerOrder, BrokerOrderEvent, ExecutionJob, ExecutionPlan, ExecutionPlanItem
 from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
 from app.services.core_quantity import KST, core_quantity_state, utc_now
+from app.services.plan_item_identity import rule_origin_for_plan_item
 
 JOB_TYPE = 'core_quantity_reduction'
 CANCEL_INTENT = 'core_quantity_cancel_requested'
+
+
+def _needs_cancellation(*, item, state):
+    return state['open_quantity'] > 0 and (
+        state['entry_closed'] and rule_origin_for_plan_item(item) is not None
+        or state['filled_quantity'] + state['open_quantity'] > state['target_quantity']
+    )
 
 
 def _assert_cancel_scope(*, settings, adapter, item, order):
@@ -30,6 +38,12 @@ def _assert_cancel_scope(*, settings, adapter, item, order):
         ) is not None
     ):
         raise ValueError('quantity_cancel_account_route_mismatch')
+    if rule_origin_for_plan_item(item) is not None:
+        from app.services.broker_orders import _strategy_entry_family_identity, _validated_order_strategy_family_identity
+
+        family, error = _validated_order_strategy_family_identity(order)
+        if error is not None or order.execution_plan_item_id != item.id or family != _strategy_entry_family_identity(item):
+            raise ValueError('quantity_cancel_rule_family_mismatch')
 
 
 def _reconcile_before_cancel(*, settings, db, adapter, item, order):
@@ -63,41 +77,55 @@ def _has_unresolved_cancel(*, db, order):
     return any(event.event_type == CANCEL_INTENT and event.id not in never_submitted for event in events)
 
 
-def queue_core_quantity_reduction(*, db, item, now):
+def queue_core_quantity_reduction(*, db, item, now, nowait=False):
     job = db.scalar(select(ExecutionJob).where(
         ExecutionJob.execution_plan_item_id == item.id, ExecutionJob.job_type == JOB_TYPE,
-    ).with_for_update())
+    ).with_for_update(nowait=nowait))
     if job is None:
         db.add(ExecutionJob(plan_item=item, job_type=JOB_TYPE, status='queued', scheduled_for=now))
     elif job.status != 'running':
         job.status, job.scheduled_for, job.last_error = 'queued', now, None
 
 
-def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_trading_day=None):
+def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_trading_day=None, rule_only=False):
     from app.services.broker_auth import ensure_authenticated_broker_session
     from app.services.core_handoff_v4 import persisted_core_plan_contract_ack
-    from app.services.core_quantity import _rearm_quantity_item, core_quantity_wait_until, executable_core_quantity
+    from app.services.core_quantity import _rearm_quantity_item, core_quantity_wait_until, executable_core_quantity, maintain_rule_entry_closures
     from app.services.core_revocation_exposure import serialized_revocation_exposure
 
     now = now or utc_now()
+    maintain_rule_entry_closures(settings=settings, db=db, now=now, commit_rule_caller_state=True)
     processed_jobs = 0
-    jobs = db.scalars(select(ExecutionJob).join(ExecutionJob.plan_item).join(ExecutionPlan).where(
+    closed_rule = and_(
+        ExecutionPlan.source == 'kai-trading-core',
+        ExecutionPlan.raw_payload['origin_type'].as_string() == 'rule',
+        ExecutionPlanItem.risk_context['_rule_entry_closed']['schema_version'].as_string() == 'rule_entry_closed_v1',
+    )
+    query = select(ExecutionJob).join(ExecutionJob.plan_item).join(ExecutionPlan).where(
         ExecutionPlan.mode == settings.runtime_mode,
-        ExecutionPlan.market_date == now.astimezone(KST).date(),
+        closed_rule if rule_only else or_(ExecutionPlan.market_date == now.astimezone(KST).date(), closed_rule),
         ExecutionJob.job_type == JOB_TYPE,
         ExecutionJob.status.in_(['queued', 'retrying', 'running']),
         ExecutionJob.scheduled_for <= now,
-    ).options(selectinload(ExecutionJob.plan_item)).order_by(ExecutionJob.scheduled_for, ExecutionJob.id).limit(1)).all()
+    ).options(selectinload(ExecutionJob.plan_item)).order_by(
+        # Closed-rule reconciliation remains eligible when an older agent job
+        # is held by its trading-session guard; keep the single-job bound.
+        case((closed_rule, 0), else_=1), ExecutionJob.scheduled_for, ExecutionJob.id,
+    ).limit(1)
+    jobs = db.scalars(query).all()
     for job in jobs:
         item = job.plan_item
         local = now.astimezone(KST)
-        if local.date() != item.plan.market_date or not (9 <= local.hour < 16) or (local.hour == 15 and local.minute >= 30):
-            continue
-        try:
-            if krx_trading_day is None or krx_trading_day(item.plan.market_date) is not True:
+        is_closed_rule = rule_origin_for_plan_item(item) is not None and '_rule_entry_closed' in (item.risk_context or {})
+        in_session = 9 <= local.hour < 16 and not (local.hour == 15 and local.minute >= 30)
+        if not is_closed_rule:
+            if local.date() != item.plan.market_date or not in_session:
                 continue
-        except Exception:
-            continue
+            try:
+                if krx_trading_day is None or krx_trading_day(item.plan.market_date) is not True:
+                    continue
+            except Exception:
+                continue
         if job.status == 'running' and job.locked_at is not None:
             locked = job.locked_at.replace(tzinfo=now.tzinfo) if job.locked_at.tzinfo is None else job.locked_at
             if now - locked < timedelta(seconds=60):
@@ -124,7 +152,7 @@ def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_tra
             for order in orders:
                 _reconcile_before_cancel(settings=settings, db=db, adapter=adapter, item=item, order=order)
                 state = core_quantity_state(db=db, item=item)
-                if state['filled_quantity'] + state['open_quantity'] <= state['target_quantity']:
+                if not _needs_cancellation(item=item, state=state):
                     break
                 if order.status not in CAPITAL_RESERVING_ORDER_STATUSES:
                     continue
@@ -133,6 +161,11 @@ def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_tra
                 # Never repeat a possibly accepted cancellation after restart or lost ACK.
                 if _has_unresolved_cancel(db=db, order=order):
                     raise ValueError('cancel_outcome_awaiting_reconciliation')
+                if is_closed_rule:
+                    # Prior-session/closed-market recovery may read broker truth;
+                    # a new cancellation still requires today's proven session.
+                    if not in_session or krx_trading_day is None or krx_trading_day(local.date()) is not True:
+                        raise ValueError('rule_cancel_market_session_closed')
                 cancel = getattr(adapter, 'cancel_order', None)
                 if not callable(cancel):
                     raise ValueError('quantity_cancel_provider_unsupported')
@@ -150,13 +183,17 @@ def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_tra
                         raise ValueError('cancel_outcome_awaiting_reconciliation')
                     _assert_cancel_scope(settings=settings, adapter=adapter, item=item, order=order)
                     state = core_quantity_state(db=db, item=item)
-                    if state['filled_quantity'] + state['open_quantity'] <= state['target_quantity']:
+                    if not _needs_cancellation(item=item, state=state):
                         break
                     order.status = 'cancel_pending'
                     intent = BrokerOrderEvent(
                         broker_order_pk=order.id, event_type=CANCEL_INTENT, event_source=JOB_TYPE,
                         normalized_status='cancel_pending', observed_at=now,
-                        payload={'revision': item.quantity_policy['revision'], 'target_quantity': state['target_quantity']},
+                        payload={
+                            'revision': item.quantity_policy['revision'], 'target_quantity': state['target_quantity'],
+                            **({'entry_closure': item.risk_context['_rule_entry_closed'],
+                                'effective_cancellation_threshold': state['filled_quantity']} if is_closed_rule else {}),
+                        },
                     )
                     db.add(intent)
                     db.commit()
@@ -182,7 +219,7 @@ def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_tra
                 if state['open_quantity']:
                     job.status, job.last_error = 'retrying', (
                         'cancel_outcome_awaiting_reconciliation'
-                        if state['filled_quantity'] + state['open_quantity'] > state['target_quantity']
+                        if _needs_cancellation(item=item, state=state)
                         else 'quantity_followup_awaiting_open_buy'
                     )
                     job.scheduled_for = utc_now() + timedelta(seconds=15)
@@ -190,7 +227,7 @@ def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_tra
                     job.status, job.last_error = 'completed', None
                     db.flush()
                     state = core_quantity_state(db=db, item=item)
-                    if state['remaining_quantity'] and state['submission_uncertain']:
+                    if (state['remaining_quantity'] or state['entry_closed'] and rule_origin_for_plan_item(item) is not None) and state['submission_uncertain']:
                         job.status, job.last_error = 'retrying', 'quantity_followup_submission_uncertain'
                         job.scheduled_for = utc_now() + timedelta(seconds=15)
                     elif item.status not in {

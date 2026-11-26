@@ -24,6 +24,10 @@ DEFAULT_DROP_KEYS = frozenset(
 )
 
 PLAN_ITEM_SUBMISSION_RISK_KEYS = (
+    "rule_origin",
+    "rule_session",
+    "close_exit_at",
+    "_rule_entry_closed",
     # Retained sell rows can be authorized by a newer plan than their immutable
     # operational FK. This bounded snapshot must survive saturated legacy
     # contexts or later placement can fall back to a hybrid old parent.

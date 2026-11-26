@@ -275,7 +275,31 @@ def dispatch_due_execution_jobs(
         triggered_at=triggered_at,
     )
     safety = runtime_safety_payload(control_state, settings=settings, now=triggered_at)
+    from app.services.core_quantity import maintain_rule_entry_closures, next_rule_entry_maintenance_at
+    from app.services.core_quantity_reductions import process_core_quantity_reductions
+
+    krx_calendar_state_by_date: dict[date, bool | None] = {}
+
+    def reduction_trading_day(market_date):
+        if market_date not in krx_calendar_state_by_date:
+            checker = getattr(adapter, 'is_krx_trading_day', None)
+            if not callable(checker):
+                return None
+            session = ensure_authenticated_broker_session(
+                settings=settings, db=db, adapter=adapter,
+                source='core_quantity_reduction', reason='verify KRX session before reducing unfilled BUY capacity',
+            )
+            krx_calendar_state_by_date[market_date] = checker(session.access_token or '', market_date=market_date)
+        return krx_calendar_state_by_date[market_date]
+
+    maintain_rule_entry_closures(settings=settings, db=db, now=triggered_at, commit_rule_caller_state=True)
     if not automated_order_submission_allowed(control_state):
+        # Entry controls cannot strand a closed rule's already-submitted BUY.
+        reduction_count = process_core_quantity_reductions(
+            settings=settings, db=db, adapter=adapter, now=triggered_at,
+            krx_trading_day=reduction_trading_day, rule_only=True,
+        )
+        rule_maintenance_at = next_rule_entry_maintenance_at(settings=settings, db=db, now=triggered_at)
         return DispatchExecutionJobsResult(
             status_code=200,
             payload={
@@ -288,7 +312,8 @@ def dispatch_due_execution_jobs(
                 "failed_job_count": 0,
                 "jobs": [],
                 "safety": safety,
-                "next_dispatch_at": None,
+                "quantity_reduction_processed_count": reduction_count,
+                "next_dispatch_at": rule_maintenance_at.isoformat() if rule_maintenance_at is not None else None,
             },
         )
 
@@ -324,7 +349,6 @@ def dispatch_due_execution_jobs(
     blocked_buy_job_count = 0
     blocked_buy_reasons: set[str] = set()
     serialized_jobs: list[dict[str, object]] = []
-    krx_calendar_state_by_date: dict[date, bool | None] = {}
     # Pause and kill-switch are operational controls that apply to every BUY
     # route.  KRX market observations are deliberately evaluated per job so a
     # KRX-only fence cannot hide a due/future KIS-US or crypto job.
@@ -393,20 +417,6 @@ def dispatch_due_execution_jobs(
 
     # Broker cancellation/reconciliation runs on this separate dispatch worker,
     # never on the latency-sensitive protective SELL monitoring worker.
-    from app.services.core_quantity_reductions import process_core_quantity_reductions
-
-    def reduction_trading_day(market_date):
-        if market_date not in krx_calendar_state_by_date:
-            checker = getattr(adapter, 'is_krx_trading_day', None)
-            if not callable(checker):
-                return None
-            session = ensure_authenticated_broker_session(
-                settings=settings, db=db, adapter=adapter,
-                source='core_quantity_reduction', reason='verify KRX session before reducing unfilled BUY capacity',
-            )
-            krx_calendar_state_by_date[market_date] = checker(session.access_token or '', market_date=market_date)
-        return krx_calendar_state_by_date[market_date]
-
     quantity_reduction_processed_count = process_core_quantity_reductions(
         settings=settings, db=db, adapter=adapter, now=triggered_at, krx_trading_day=reduction_trading_day,
     )
@@ -426,6 +436,9 @@ def dispatch_due_execution_jobs(
     if pending_quantity_reduction is not None:
         reduction_retry_at = triggered_at + timedelta(seconds=15)
         next_dispatch_at = min(next_dispatch_at, reduction_retry_at) if next_dispatch_at is not None else reduction_retry_at
+    rule_maintenance_at = next_rule_entry_maintenance_at(settings=settings, db=db, now=triggered_at)
+    if rule_maintenance_at is not None:
+        next_dispatch_at = min(next_dispatch_at, rule_maintenance_at) if next_dispatch_at is not None else rule_maintenance_at
     if "hourly_plan_risk_off" in blocked_buy_reasons:
         buy_retry_after_at = hourly_risk_off_retry_after_at(
             settings=settings,

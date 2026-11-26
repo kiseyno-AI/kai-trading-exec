@@ -37,6 +37,7 @@ class Settings(BaseModel):
     api_port: int = Field(default=8010, ge=1, le=65535)
     api_bearer_token: str | None = Field(default=None, repr=False)
     automation_enabled: bool = False
+    krx_us_rebound_enabled: bool = False
     autonomous_runtime_enabled: bool = False
     dispatch_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
     monitoring_loop_interval_seconds: float = Field(default=1.0, gt=0, le=3600)
@@ -527,6 +528,7 @@ _ENV_FIELDS = {
     "API_HOST": "api_host",
     "API_PORT": "api_port",
     "AUTOMATION_ENABLED": "automation_enabled",
+    "KRX_US_REBOUND_ENABLED": "krx_us_rebound_enabled",
     "AUTONOMOUS_RUNTIME_ENABLED": "autonomous_runtime_enabled",
     "DISPATCH_LOOP_INTERVAL_SECONDS": "dispatch_loop_interval_seconds",
     "MONITORING_LOOP_INTERVAL_SECONDS": "monitoring_loop_interval_seconds",

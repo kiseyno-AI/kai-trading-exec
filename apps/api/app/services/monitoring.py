@@ -107,8 +107,11 @@ from app.services.broker_orders import (
     place_broker_order,
 )
 from app.services.json_compaction import compact_json_object, json_payload_hash
+from app.services.rule_execution import rule_close_exit_at
 from app.services.plan_item_identity import (
     plan_item_decision_agent_name,
+    plan_item_strategy_lane,
+    rule_origin_for_plan_item,
     plan_item_entry_family_key,
     plan_item_inventory_scope_key,
     resolve_plan_item_entry_family_key,
@@ -676,10 +679,10 @@ def _sell_replan_scope_may_overlap(
         return False
 
     incumbent_lane = _normalized_decision_lane(
-        plan_item_decision_agent_name(incumbent)
+        plan_item_strategy_lane(incumbent)
     )
     replanned_lane = _normalized_decision_lane(
-        plan_item_decision_agent_name(replanned)
+        plan_item_strategy_lane(replanned)
     )
     return not (
         incumbent_lane is not None
@@ -701,6 +704,7 @@ def _update_existing_sell_monitors_from_replanned_items(
             item.side == "sell"
             and item.intent in SELL_MONITORED_INTENTS
             and item.source_plan_item_id
+            and rule_origin_for_plan_item(item) is None
             and _replanned_sell_plan_is_effective(
                 plan=plan,
                 item=item,
@@ -811,7 +815,7 @@ def _update_existing_sell_monitors_from_replanned_items(
             continue
         route_key = _sell_monitor_route_key(existing)
         decision_lane = _normalized_decision_lane(
-            plan_item_decision_agent_name(existing)
+            plan_item_strategy_lane(existing)
         )
         if route_key is None or decision_lane is None:
             continue
@@ -869,7 +873,7 @@ def _update_existing_sell_monitors_from_replanned_items(
             continue
         route_key = _sell_monitor_route_key(replanned)
         decision_lane = _normalized_decision_lane(
-            plan_item_decision_agent_name(replanned)
+            plan_item_strategy_lane(replanned)
         )
         if route_key is None or decision_lane is None:
             continue
@@ -1693,6 +1697,11 @@ def _authorize_protective_stop_submission(
         if has_decision_snapshot or has_decision_run
         else "unavailable"
     )
+    rule_origin = rule_origin_for_plan_item(item)
+    if "rule_origin" in (item.risk_context or {}):
+        if rule_origin is None and failure_reason is None:
+            failure_reason = "protective_stop_rule_lineage_unproven"
+        strategy_lineage_status = "complete" if rule_origin is not None else "partial"
     authorization = {
         "schema_version": "protective_stop_reauthorization_v1",
         "authorization_id": new_id(),
@@ -1703,6 +1712,7 @@ def _authorize_protective_stop_submission(
         "strategy_decision_lineage_status": strategy_lineage_status,
         "decision_run_id": item.decision_run_id,
         "decision_snapshot_id": item.decision_snapshot_id,
+        **({"rule_origin": rule_origin} if rule_origin is not None else {}),
         "position": {
             "position_id": position.id if position is not None else None,
             "quantity": position.quantity if position is not None else None,
@@ -3925,7 +3935,7 @@ def _evaluate_monitoring_cycle(
             if quantity is None:
                 entry_family_key = plan_item_entry_family_key(action.item)
                 decision_lane = _normalized_decision_lane(
-                    plan_item_decision_agent_name(action.item)
+                    plan_item_strategy_lane(action.item)
                 )
                 if (entry_family_key is None) != (decision_lane is None):
                     prior_status = action.item.status
@@ -4557,6 +4567,7 @@ def _evaluate_monitoring_cycle(
             details=checkpoint_details,
         )
     _log_cycle_step("checkpoint_update")
+    rule_entry_closure_count = db.info.pop('rule_entry_closure_count', 0)
     return EvaluateMonitoringResult(
         status_code=200,
         payload={
@@ -4567,6 +4578,7 @@ def _evaluate_monitoring_cycle(
             "submitted_order_count": submitted_order_count,
             "blocked_item_count": blocked_item_count,
             "deferred_item_count": deferred_item_count,
+            **({'rule_entry_closure_count': rule_entry_closure_count} if rule_entry_closure_count else {}),
             "evaluated_symbol_count": checkpoint_details["evaluated_symbol_count"],
             "triggered_symbol_count": checkpoint_details["triggered_symbol_count"],
             "rearmed_sell_monitor_count": checkpoint_details[
@@ -5040,7 +5052,7 @@ def _active_watch_route_key(
         asset_class = str(raw_asset_class).strip().lower()
     exchange = _plan_item_exchange(item) or ("KRX" if is_krx_equity else "")
     decision_agent_name = str(
-        plan_item_decision_agent_name(item) or "unknown"
+        plan_item_strategy_lane(item) or "unknown"
     ).strip().casefold()
     # Each decision lane owns at most one simultaneous new-buy authority for a
     # route and symbol. Distinct lanes may intentionally build independent
@@ -7343,7 +7355,10 @@ def _load_monitored_items(
         )
     decision_lane_expression = func.lower(
         func.trim(
-            func.coalesce(ExecutionPlanItem.decision_agent_name, "unknown")
+            func.coalesce(
+                ExecutionPlanItem.risk_context["rule_origin"]["strategy_lane"].as_string(),
+                ExecutionPlanItem.decision_agent_name, "unknown",
+            )
         )
     )
     latest_plan_candidates = (
@@ -7588,7 +7603,7 @@ def _canonicalize_loaded_sell_monitors(
         family_key = plan_item_entry_family_key(item)
         route_key = _sell_monitor_route_key(item)
         decision_lane = _normalized_decision_lane(
-            plan_item_decision_agent_name(item)
+            plan_item_strategy_lane(item)
         )
         if family_key is None or decision_lane is None or route_key is None:
             # Unlinked legacy protection is intentionally retained; symbol-only
@@ -7613,7 +7628,7 @@ def _canonicalize_loaded_sell_monitors(
         family_key = plan_item_entry_family_key(item)
         route_key = _sell_monitor_route_key(item)
         decision_lane = _normalized_decision_lane(
-            plan_item_decision_agent_name(item)
+            plan_item_strategy_lane(item)
         )
         if family_key is None or decision_lane is None or route_key is None:
             retained.append(item)
@@ -8771,7 +8786,9 @@ def _repair_unprotected_stop_coverage(
                 time_in_force=latest_item.time_in_force,
                 risk_context=dict(latest_item.risk_context or {}),
                 decision_agent_name=(
-                    latest_item.decision_agent_name or "post-entry-monitor-repair"
+                    latest_item.decision_agent_name
+                    if rule_origin_for_plan_item(latest_item) is not None
+                    else latest_item.decision_agent_name or "post-entry-monitor-repair"
                 ),
                 decision_snapshot_id=latest_item.decision_snapshot_id,
                 decision_run_id=latest_item.decision_run_id,
@@ -9663,6 +9680,10 @@ def _fixed_shares_quantity_policy(
     """Materialize shares without detaching the exit from its authority."""
 
     prior_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    if rule_origin_for_plan_item(item) is not None and _quantity_policy_requires_position_exit(prior_policy):
+        # Rule exits remain linked to current family inventory; rewriting the
+        # immutable Core policy would invalidate cancellation/protection proof.
+        return dict(prior_policy)
     policy: dict[str, object] = {
         "kind": "shares",
         "quantity": quantity,
@@ -10621,11 +10642,12 @@ def _plan_item_family_inventory_key(item: ExecutionPlanItem) -> str | None:
     if family_key is None:
         return None
     decision_lane = _normalized_decision_lane(
-        plan_item_decision_agent_name(item)
+        plan_item_strategy_lane(item)
     )
     if decision_lane is None:
         return None
-    return f"{len(family_key)}:{family_key}:agent:{decision_lane}"
+    origin_kind = "rule" if rule_origin_for_plan_item(item) is not None else "agent"
+    return f"{len(family_key)}:{family_key}:{origin_kind}:{decision_lane}"
 
 
 def _plan_item_family_route_inventory_key(
@@ -10787,7 +10809,7 @@ def _post_entry_family_inventories(
             continue
         entry_family_key = plan_item_entry_family_key(item)
         decision_lane = _normalized_decision_lane(
-            plan_item_decision_agent_name(item)
+            plan_item_strategy_lane(item)
         )
         family_key = _plan_item_family_inventory_key(item)
         route_key = _sell_monitor_route_key(item)
@@ -12124,9 +12146,11 @@ def _post_entry_max_holding_sessions(
     entry_item: ExecutionPlanItem,
 ) -> int | None:
     risk_context = _loaded_risk_context(entry_item)
+    if "rule_origin" in risk_context:
+        return 1 if rule_close_exit_at(entry_item) is not None else None
     policy = risk_context.get("max_holding_close_policy")
     decision_lane = _normalized_decision_lane(
-        plan_item_decision_agent_name(entry_item)
+        plan_item_strategy_lane(entry_item)
     )
     configured_default = settings.exec_agent_max_holding_trading_sessions
     if decision_lane == SIGNAL_DECIDER_NAME:
@@ -12732,6 +12756,15 @@ def _ensure_post_entry_max_holding_monitor(
             else "weekday_calendar"
         ),
     }
+    rule_deadline = rule_close_exit_at(entry_item)
+    if rule_deadline is not None:
+        deadline_context.update(
+            close_exit_at=entry_item.risk_context['close_exit_at'],
+            close_exit_date=entry_item.risk_context['rule_origin']['target_trade_date'],
+            close_exit_date_status="authoritative",
+            close_exit_date_source="core_authoritative_session_close_minus_buffer",
+            close_exit_calendar_policy="explicit_aware_rule_deadline",
+        )
     if exchange in KRX_EXCHANGES:
         deadline_context.update(
             {
@@ -13041,7 +13074,10 @@ def _inherited_kis_account_route_context(
     )
     if binding is None:
         return {}
-    return {KIS_ACCOUNT_ROUTE_BINDING_KEY: binding}
+    inherited = {KIS_ACCOUNT_ROUTE_BINDING_KEY: binding}
+    if rule_origin_for_plan_item(entry_item) is not None:
+        inherited.update({key: entry_item.risk_context[key] for key in ("rule_origin", "rule_session", "close_exit_at")})
+    return inherited
 
 
 def _derived_source_plan_item_id(entry_item: ExecutionPlanItem, suffix: str) -> str | None:
@@ -14038,6 +14074,9 @@ def _parse_decimal(value: object) -> Decimal | None:
 
 def _max_holding_exit_due(*, item: ExecutionPlanItem, triggered_at: datetime) -> bool:
     risk_context = _loaded_risk_context(item)
+    if "rule_origin" in risk_context:
+        deadline = rule_close_exit_at(item)
+        return bool(deadline is not None and triggered_at.tzinfo is not None and triggered_at >= deadline)
     raw_close_exit_date = risk_context.get("close_exit_date")
     if not isinstance(raw_close_exit_date, str):
         return False
@@ -15567,7 +15606,7 @@ def _watch_buy_pre_submit_lane_guard(
     """Recheck lane duplication and aggregate exposure at broker-submit time."""
 
     candidate_lane = _normalized_decision_lane(
-        plan_item_decision_agent_name(item)
+        plan_item_strategy_lane(item)
     )
     snapshot_quantity = _snapshot_symbol_quantity(
         snapshot=snapshot,
@@ -15608,7 +15647,7 @@ def _watch_buy_pre_submit_lane_guard(
             )
         for inventory in inventories:
             inventory_lane = _normalized_decision_lane(
-                plan_item_decision_agent_name(inventory.entry_item)
+                plan_item_strategy_lane(inventory.entry_item)
             )
             if inventory_lane is None:
                 return Decimal("0"), WatchBuyOrderApproval(
@@ -15693,6 +15732,10 @@ def _watch_buy_pre_submit_lane_guard(
                         if order.plan_item is not None and scope_status == "active"
                         else None
                     ),
+                    "strategy_lane": (
+                        plan_item_strategy_lane(order.plan_item)
+                        if order.plan_item is not None and scope_status == "active" else None
+                    ),
                     "broker_order_pk": order.id,
                     "scope_status": scope_status,
                 },
@@ -15765,8 +15808,8 @@ def _broker_open_orders_share_identity(
 ) -> bool:
     left_payload = left.payload if isinstance(left.payload, dict) else {}
     right_payload = right.payload if isinstance(right.payload, dict) else {}
-    left_lane = _normalized_decision_lane(left_payload.get("decision_agent_name"))
-    right_lane = _normalized_decision_lane(right_payload.get("decision_agent_name"))
+    left_lane = _normalized_decision_lane(left_payload.get("strategy_lane") or left_payload.get("decision_agent_name"))
+    right_lane = _normalized_decision_lane(right_payload.get("strategy_lane") or right_payload.get("decision_agent_name"))
     return bool(
         (left.broker_order_id and left.broker_order_id == right.broker_order_id)
         or (
@@ -16121,7 +16164,7 @@ def _sell_remaining_quantity(
     symbol_remaining = remaining_quantities_by_symbol.get(item.symbol)
     entry_family_key = plan_item_entry_family_key(item)
     decision_lane = _normalized_decision_lane(
-        plan_item_decision_agent_name(item)
+        plan_item_strategy_lane(item)
     )
     family_key = _plan_item_family_inventory_key(item)
     family_route_key = _plan_item_family_route_inventory_key(item)
@@ -17598,6 +17641,8 @@ def _place_monitoring_order(
         )
         or {}
     )
+    if item.side == 'sell' and rule_origin_for_plan_item(item) is not None:
+        item.status = _pending_dispatch_status(item.intent)
     is_watch_buy = _is_watch_buy_item(item)
     limit_price = (
         limit_price_override
@@ -17729,6 +17774,19 @@ def _place_monitoring_order(
         return _plan_item_state_changed_result(side=order_request.side)
     set_committed_value(item, "status", item.status)
     set_committed_value(item, "risk_context", item.risk_context)
+    if item.side == 'sell' and rule_origin_for_plan_item(item) is not None:
+        from app.services.core_quantity import maintain_rule_entry_closures
+
+        # Publish the guarded rule SELL intent even when its BUY is already
+        # closed/flat and therefore absent from maintenance candidates.
+        db.commit()
+        closed = maintain_rule_entry_closures(
+            settings=settings, db=db, now=triggered_at, execution_plan_id=item.execution_plan_id,
+        )
+        if closed:
+            # The closure and cancel debt survive even if the SELL is deferred
+            # by the still-open BUY or its broker response is lost.
+            db.info['rule_entry_closure_count'] = db.info.get('rule_entry_closure_count', 0) + closed
     return place_broker_order(
         settings=settings,
         db=db,

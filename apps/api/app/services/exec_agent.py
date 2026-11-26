@@ -43,6 +43,7 @@ from app.services.live_market_context import load_live_market_regime_context, me
 from app.services.json_compaction import json_payload_hash
 from app.services.plan_item_identity import (
     plan_item_decision_agent_name,
+    plan_item_strategy_lane,
     plan_item_entry_family_key,
     serialize_plan_item_source_identity,
 )
@@ -3636,13 +3637,13 @@ def _has_duplicate_open_buy_order(
     source_identity = serialize_plan_item_source_identity(item)
     source_candidate_id = source_identity.get("source_plan_item_id")
     candidate_lane = _normalized_decision_lane(
-        plan_item_decision_agent_name(item)
+        plan_item_strategy_lane(item)
     )
     lanes_by_broker_order_id: dict[str, set[str]] = {}
     lanes_by_idempotency_key: dict[str, set[str]] = {}
     for order in open_orders:
         payload = order.payload if isinstance(order.payload, dict) else {}
-        lane = _normalized_decision_lane(payload.get("decision_agent_name"))
+        lane = _normalized_decision_lane(payload.get("strategy_lane") or payload.get("decision_agent_name"))
         if lane is None:
             continue
         if order.broker_order_id:
@@ -3681,7 +3682,7 @@ def _has_duplicate_open_buy_order(
             continue
         if order.idempotency_key == idempotency_key:
             return True
-        order_lane = _normalized_decision_lane(payload.get("decision_agent_name"))
+        order_lane = _normalized_decision_lane(payload.get("strategy_lane") or payload.get("decision_agent_name"))
         if order_lane is None and order.broker_order_id:
             order_lane = attributed_lanes_by_broker_order_id.get(order.broker_order_id)
         if order_lane is None and order.idempotency_key:

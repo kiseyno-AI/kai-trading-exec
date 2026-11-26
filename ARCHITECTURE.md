@@ -137,6 +137,15 @@ lineage fails closed instead of borrowing another family's position. Signal
 entries have no implicit time exit, while short-term entries are capped at three
 inclusive holding sessions (the fill session is session one).
 
+The optional `krx_us_rebound` rule lane uses a separate typed v4 origin with
+real run/evaluation/input identifiers and null agent provenance. It yields to
+potential original-lane entries and owned holdings, preserves session ownership
+across rule versions, and uses only cumulative Core sizing. Filled rule families
+receive an explicit aware close-relative exit, checked consistently in the
+cache and durable monitor. The independent entry flag defaults off; protective
+exits remain available when entries are disabled. See
+[the rule contract](docs/RULE_ORIGIN_CONTRACT.md).
+
 ### Core-owned truth
 - signal-decider decisions
 - factor/screening data

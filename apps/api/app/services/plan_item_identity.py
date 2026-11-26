@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import date
+import hashlib
+import json
 from typing import Any
 
 from sqlalchemy import inspect as sa_inspect
@@ -63,6 +65,40 @@ def plan_item_decision_agent_name(plan_item: ExecutionPlanItem) -> str | None:
     return _first_string_value(plan_item=plan_item, keys=_DECISION_AGENT_KEYS)
 
 
+def rule_origin_for_plan_item(plan_item: ExecutionPlanItem) -> dict[str, Any] | None:
+    from pydantic import ValidationError
+    from app.api.schemas.execution import CoreRuleOriginV1
+
+    risk = plan_item.risk_context
+    if not isinstance(risk, dict) or "rule_origin" not in risk:
+        return None
+    try:
+        origin = CoreRuleOriginV1.model_validate(risk["rule_origin"]).model_dump(mode="json")
+    except ValidationError:
+        return None
+    if origin != risk["rule_origin"] or any((
+        plan_item.decision_agent_name, plan_item.decision_snapshot_id, plan_item.decision_run_id,
+    )):
+        return None
+    return origin
+
+
+def plan_item_strategy_lane(plan_item: ExecutionPlanItem) -> str | None:
+    risk = plan_item.risk_context
+    if isinstance(risk, dict) and "rule_origin" in risk:
+        origin = rule_origin_for_plan_item(plan_item)
+        return origin["strategy_lane"] if origin is not None else None
+    return plan_item_decision_agent_name(plan_item)
+
+
+def plan_item_origin_matches(plan_item: ExecutionPlanItem, binding: object) -> bool:
+    origin = rule_origin_for_plan_item(plan_item)
+    requested = getattr(binding, "rule_origin", None)
+    if requested is not None:
+        return origin is not None and origin == requested.model_dump(mode="json")
+    return origin is None and not (isinstance(plan_item.risk_context, dict) and "rule_origin" in plan_item.risk_context)
+
+
 def plan_item_decision_run_id(plan_item: ExecutionPlanItem) -> str | None:
     if plan_item.decision_run_id:
         return plan_item.decision_run_id
@@ -106,6 +142,30 @@ def resolve_plan_item_entry_family_key(
     session: Session | None = None,
 ) -> tuple[str | None, str | None]:
     """Resolve one family only when every comparable lineage claim agrees."""
+    risk = plan_item.risk_context if isinstance(plan_item.risk_context, dict) else {}
+    if "rule_origin" in risk:
+        origin = rule_origin_for_plan_item(plan_item)
+        route = plan_item_execution_route_key(plan_item)
+        if origin is None or route is None:
+            return None, "entry_family_unavailable"
+        if plan_item.side != "buy":
+            source_claims: set[str] = set()
+            execution_claims: set[str] = set()
+            for payload in (plan_item.quantity_policy, risk):
+                sources, executions = _entry_family_claims_from_payload(payload)
+                source_claims.update(sources)
+                execution_claims.update(executions)
+            if len(source_claims) > 1 or len(execution_claims) > 1 or not (source_claims or execution_claims):
+                return None, "entry_family_ambiguous"
+            plan = plan_item.plan
+            entries = [candidate for candidate in (plan.items if plan is not None else ())
+                       if candidate.side == "buy" and candidate.symbol == plan_item.symbol
+                       and (not source_claims or candidate.source_plan_item_id in source_claims)
+                       and (not execution_claims or candidate.id in execution_claims)]
+            if len(entries) != 1 or rule_origin_for_plan_item(entries[0]) != origin:
+                return None, "entry_family_ambiguous"
+        material = [route, origin["strategy_lane"], origin["target_trade_date"], plan_item.symbol, origin["setup_id"]]
+        return "rule:" + hashlib.sha256(json.dumps(material, separators=(",", ":")).encode()).hexdigest(), None
     if plan_item.side == "buy":
         source_key = plan_item_source_plan_item_id(plan_item)
         if source_key is not None:
@@ -166,7 +226,7 @@ def select_plan_item_family_members(
     candidate_list = list(candidates)
     anchor_key = plan_item_entry_family_key(anchor)
     anchor_lane = _normalized_decision_lane(
-        plan_item_decision_agent_name(anchor)
+        plan_item_strategy_lane(anchor)
     )
     if (anchor_key is None) != (anchor_lane is None):
         return []
@@ -176,7 +236,7 @@ def select_plan_item_family_members(
             for candidate in candidate_list
             if plan_item_entry_family_key(candidate) == anchor_key
             and _normalized_decision_lane(
-                plan_item_decision_agent_name(candidate)
+                plan_item_strategy_lane(candidate)
             )
             == anchor_lane
         ]
@@ -185,7 +245,7 @@ def select_plan_item_family_members(
     candidate_identities = [
         (
             plan_item_entry_family_key(candidate),
-            _normalized_decision_lane(plan_item_decision_agent_name(candidate)),
+            _normalized_decision_lane(plan_item_strategy_lane(candidate)),
         )
         for candidate in candidate_list
     ]

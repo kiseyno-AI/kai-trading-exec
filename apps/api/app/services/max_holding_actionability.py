@@ -17,6 +17,7 @@ from app.services.position_identity import (
     build_position_identity,
     position_identity_from_columns,
 )
+from app.services.rule_execution import rule_close_exit_at
 from app.services.runtime_transitions import (
     ACTIVE_SELL_MONITORING_STATUSES,
     SELL_AGENT_ACTIVE_STATUSES,
@@ -84,6 +85,11 @@ def max_holding_actionability_summary(
     due: list[tuple[ExecutionPlanItem, str]] = []
     for item in items:
         context = item.risk_context if isinstance(item.risk_context, dict) else {}
+        if "rule_origin" in context:
+            deadline = rule_close_exit_at(item)
+            if deadline is not None and reference_at >= deadline:
+                due.append((item, deadline.date().isoformat()))
+            continue
         close_date = context.get("close_exit_date")
         if not isinstance(close_date, str):
             continue

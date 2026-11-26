@@ -1825,7 +1825,7 @@ def _plan_item_risk_context(item: ExecutionPlanItemRequest) -> dict[str, object]
     risk_context = dict(item.risk_context) if isinstance(item.risk_context, dict) else item.risk_context
     normalized = dict(risk_context or {})
     extras = item.model_extra or {}
-    for key in ("market", "exchange", "currency", "broker", "session_policy"):
+    for key in ("market", "exchange", "currency", "broker", "session_policy", "rule_origin", "close_exit_at"):
         value = extras.get(key)
         if value is not None and key not in normalized:
             normalized[key] = _json_scalar(value)

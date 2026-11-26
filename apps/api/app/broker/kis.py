@@ -9,6 +9,7 @@ from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 from typing import Any, Callable, Protocol
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
@@ -33,6 +34,7 @@ from app.broker.base import (
     BrokerReconnectHandle,
     BrokerTokenGrant,
     BrokerTokenRevocation,
+    DomesticCashCapacity,
     NormalizedBrokerOrderStatus,
 )
 from app.core.config import Settings
@@ -44,6 +46,7 @@ from app.broker.error_safety import (
     safe_broker_error_message,
     sanitize_broker_error_payload,
 )
+from app.services.execution_semantics import is_canonical_krx_short_code
 
 KIS_PROVIDER = "kis"
 KIS_DOMESTIC_EXCHANGES = frozenset({"KRX", "KOSPI", "KOSDAQ", "NXT", "SOR"})
@@ -60,6 +63,7 @@ KIS_CANCELABLE_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsec
 KIS_ORDER_CANCEL_PATH = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 KIS_CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
 KIS_BALANCE_PATH = "/uapi/domestic-stock/v1/trading/inquire-balance"
+KIS_DOMESTIC_CASH_CAPACITY_PATH = "/uapi/domestic-stock/v1/trading/inquire-psbl-order"
 KIS_OPEN_ORDERS_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 KIS_DAILY_CCLD_PATH = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 KIS_ASKING_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
@@ -1535,6 +1539,130 @@ class KisBrokerAdapter(BrokerAdapter):
                 },
             },
             freshness_source="kis_exchange_intraday_minute_time",
+        )
+
+    def get_domestic_cash_capacity(
+        self,
+        *,
+        access_token: str,
+        symbol: str,
+        limit_price: Decimal,
+        exchange: str = "KRX",
+    ) -> DomesticCashCapacity:
+        """Read conditional limit-order capacity, not settled cash or a fill guarantee."""
+        config = self._configured()
+        account_number = (self.settings.kis_account_number or "").strip()
+        product_code = self.settings.kis_account_product_code.strip()
+        if (
+            self.settings.runtime_broker_provider != self.provider
+            or exchange != "KRX"
+            or not isinstance(symbol, str)
+            or symbol != symbol.strip()
+            or not is_canonical_krx_short_code(symbol)
+            or not isinstance(limit_price, Decimal)
+            or not limit_price.is_finite()
+            or limit_price <= 0
+            or re.fullmatch(r"[0-9]{8}", account_number) is None
+            or re.fullmatch(r"[0-9]{2}", product_code) is None
+            or not isinstance(access_token, str)
+            or not access_token
+            or any(character.isspace() for character in access_token)
+        ):
+            raise BrokerAdapterError(
+                "KIS domestic cash capacity requires a configured KIS/KRX account, symbol and price",
+                status_code=422,
+                classification=BrokerErrorClassification.VALIDATION,
+            )
+        params = {
+            "CANO": account_number,
+            "ACNT_PRDT_CD": product_code,
+            "PDNO": symbol,
+            "ORD_UNPR": format(limit_price, "f"),
+            "ORD_DVSN": "00",
+            "CMA_EVLU_AMT_ICLD_YN": "N",
+            "OVRS_ICLD_YN": "N",
+        }
+        response = self.http_client.get_json(
+            url=f"{config.api_base_url}{KIS_DOMESTIC_CASH_CAPACITY_PATH}",
+            headers=self.build_headers(
+                access_token,
+                transaction_id=(
+                    "TTTC8908R" if self.settings.runtime_mode == "live" else "VTTC8908R"
+                ),
+            ),
+            params=params,
+            timeout_seconds=self.settings.kis_request_timeout_seconds,
+        )
+        received_at = datetime.now(UTC)
+        if response.status_code != 200:
+            raise _http_error(
+                status_code=response.status_code,
+                headers=response.headers,
+                raw_body=json.dumps(response.payload),
+            )
+        _require_kis_business_success(response.payload, context="domestic cash capacity")
+        continuation = str(
+            response.headers.get("tr_cont") or response.headers.get("TR_CONT") or ""
+        ).strip().upper()
+        if continuation not in {"", "D", "E"}:
+            raise BrokerAdapterError(
+                "KIS domestic cash capacity response has unsupported continuation",
+                status_code=502,
+                code="kis_cash_capacity_invalid",
+            )
+        output = response.payload.get("output")
+        fields = ("ord_psbl_cash", "nrcvb_buy_amt", "nrcvb_buy_qty", "psbl_qty_calc_unpr")
+        values = {
+            key: _parse_decimal(output.get(key)) if isinstance(output, dict) else None
+            for key in fields
+        }
+        if any(value is None or value < 0 for value in values.values()):
+            raise BrokerAdapterError(
+                "KIS domestic cash capacity response is missing valid nonnegative amounts",
+                status_code=502,
+                code="kis_cash_capacity_invalid",
+            )
+        cash, amount, quantity, calculation_price = (values[key] for key in fields)
+        assert (
+            cash is not None and amount is not None
+            and quantity is not None and calculation_price is not None
+        )
+        if (
+            quantity != quantity.to_integral_value()
+            or (quantity > 0 and calculation_price <= 0)
+        ):
+            raise BrokerAdapterError(
+                "KIS domestic cash capacity response has an invalid quantity or calculation price",
+                status_code=502,
+                code="kis_cash_capacity_invalid",
+            )
+        account_reference = f"KIS:{account_number}-{product_code}"
+        identity = {
+            "provider": self.provider,
+            "runtime_mode": self.settings.runtime_mode,
+            "account_reference": account_reference,
+            "exchange": exchange,
+            "currency": "KRW",
+            "request": params,
+            "output": {key: output[key] for key in fields},
+            "received_at": received_at.isoformat(),
+        }
+        return DomesticCashCapacity(
+            provider=self.provider,
+            runtime_mode=self.settings.runtime_mode,
+            account_reference=account_reference,
+            symbol=symbol,
+            exchange=exchange,
+            currency="KRW",
+            requested_price=limit_price,
+            quantity_calculation_price=calculation_price,
+            orderable_cash_krw=cash,
+            no_misu_buying_amount_krw=amount,
+            no_misu_buying_quantity=int(quantity),
+            received_at=received_at,
+            capacity_id=sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
         )
 
     def get_account_snapshot(

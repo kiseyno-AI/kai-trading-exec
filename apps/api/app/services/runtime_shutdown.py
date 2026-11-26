@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 
 _ResultT = TypeVar("_ResultT")
+COMMIT_GUARDED_SESSION_FACTORY_INFO_KEY = 'runtime_commit_guarded_session_factory'
 
 
 class RuntimeCycleStopped(asyncio.CancelledError):
@@ -222,6 +223,7 @@ class CommitGuardedSessionFactory:
 
     def __call__(self, *args: object, **kwargs: object) -> Session:
         session = self._factory(*args, **kwargs)
+        session.info[COMMIT_GUARDED_SESSION_FACTORY_INFO_KEY] = self
 
         def check_before_commit(current_session: Session) -> None:
             if current_session.info.get(self._lease_key) is True:

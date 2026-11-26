@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 import hmac
 from typing import Any
@@ -26,6 +27,8 @@ from app.api.schemas.execution import (
     CORE_EXECUTION_REVOCATION_SCHEMA_VERSION,
     CoreExecutionActivationRequestV4,
     CoreExecutionPlanRequestV4,
+    CoreRuleExecutionPlanRequestV4,
+    parse_core_execution_plan_v4,
     CoreExecutionRevocationRequestV4,
     ExecutionPlanRequest,
     _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY,
@@ -60,6 +63,7 @@ from app.services.exec_agent_approval import (
     persisted_verified_watch_sizing_provenance,
 )
 from app.services.json_compaction import compact_json_object, json_payload_hash
+from app.services.plan_item_identity import plan_item_origin_matches, plan_item_entry_family_key, rule_origin_for_plan_item
 
 
 ENTRY_INTENTS = frozenset({"next_open_buy", "intraday_watch_buy"})
@@ -194,6 +198,16 @@ def create_core_execution_plan_v4(
     adapter: BrokerAdapter,
     command: CoreExecutionPlanRequestV4,
 ) -> CreateExecutionPlanResult:
+    if isinstance(command, CoreRuleExecutionPlanRequestV4) and (
+        settings.runtime_broker_provider != "kis" or adapter.provider != "kis"
+    ):
+        return CreateExecutionPlanResult(status_code=422, payload={
+            "plan_id": command.plan_id, "accepted_item_count": 0,
+            "rejected_item_count": len(command.items), "validation_failures": [{
+                "field": "provider", "message": "rule origin requires the KIS runtime provider",
+                "reason_code": "unsupported_rule_runtime_provider",
+            }], "persisted_execution_item_ids": [],
+        })
     if command.mode != settings.runtime_mode:
         return CreateExecutionPlanResult(
             status_code=409,
@@ -211,6 +225,26 @@ def create_core_execution_plan_v4(
                 "runtime": {"mode": settings.runtime_mode},
             },
         )
+
+    if isinstance(command, CoreRuleExecutionPlanRequestV4):
+        existing = db.scalar(select(ExecutionPlan).where(
+            ExecutionPlan.external_plan_id == command.plan_id,
+            ExecutionPlan.mode == settings.runtime_mode,
+        ).options(selectinload(ExecutionPlan.items)))
+        if existing is not None:
+            ack = _persisted_core_plan_intake_ack(existing)
+            if (ack is not None and ack.get("rule_origin") == command.rule_origin.model_dump(mode="json")
+                and ack["contract_ack"]["dispatch_material_fingerprint"] == command.metadata.dispatch_material_fingerprint):
+                return CreateExecutionPlanResult(status_code=201, payload={**ack, "idempotent_replay": True})
+        from app.services.rule_execution import rule_registration_conflict_reason
+
+        conflict = rule_registration_conflict_reason(settings=settings, db=db, command=command)
+        if conflict is not None:
+            return CreateExecutionPlanResult(status_code=409, payload={
+                "plan_id": command.plan_id, "reason_code": conflict,
+                "accepted_item_count": 0, "rejected_item_count": len(command.items),
+                "persisted_execution_item_ids": [],
+            })
 
     duplicate_delta_plan_id = _duplicate_delta_batch_plan_id(
         db=db,
@@ -249,6 +283,10 @@ def create_core_execution_plan_v4(
         )
 
     legacy_command = ExecutionPlanRequest.model_validate(command.model_dump(mode="json"))
+    if isinstance(command, CoreRuleExecutionPlanRequestV4):
+        # SQLite drops offsets, so store the instant in UTC while preserving
+        # the submitted offset in the immutable strict wire payload.
+        legacy_command.requested_at = command.requested_at.astimezone(UTC)
     # Monitoring materialization may update an older sell row in place before
     # the strict v4 persistence binder runs. Bind the two plan-level decision
     # fields up front so that row never receives a hybrid of new material and
@@ -588,7 +626,7 @@ def activate_core_execution_plan_v4(
             execution_plan_id=plan.id,
         )
 
-    stored_command = CoreExecutionPlanRequestV4.model_validate(
+    stored_command = parse_core_execution_plan_v4(
         plan.raw_payload,
         context={
             _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
@@ -613,6 +651,8 @@ def activate_core_execution_plan_v4(
         )
 
     requested_by_key = {item.core_item_key: item for item in command.items}
+    if isinstance(stored_command, CoreRuleExecutionPlanRequestV4):
+        locked_items = [item for item in locked_items if item.plan_item_index < len(stored_command.items)]
     locked_by_key = {
         str(item.source_plan_item_id): item
         for item in locked_items
@@ -625,6 +665,7 @@ def activate_core_execution_plan_v4(
             locked_by_key[key].id == request.execution_plan_item_id
             and locked_by_key[key].decision_snapshot_id
             == request.decision_snapshot_id
+            and plan_item_origin_matches(locked_by_key[key], request)
             for key, request in requested_by_key.items()
         )
     )
@@ -687,6 +728,19 @@ def activate_core_execution_plan_v4(
             reason_code="activation_state_not_pending",
             execution_plan_id=plan.id,
         )
+
+    if isinstance(stored_command, CoreRuleExecutionPlanRequestV4):
+        from app.services.rule_execution import rule_entry_block_reason, utc_now
+
+        checked_at = utc_now()
+        entry = next(item for item in locked_items if item.side == "buy")
+        reason = rule_entry_block_reason(settings=settings, db=db, plan_item=entry, now=checked_at, lock=True)
+        cutoff = datetime.combine(stored_command.market_date, time(8, 40), tzinfo=ZoneInfo("Asia/Seoul"))
+        if reason is None and checked_at >= cutoff:
+            reason = "rule_activation_cutoff_passed"
+        if reason is not None:
+            db.rollback()
+            return _activation_failure(command=command, status_code=409, reason_code=reason, execution_plan_id=plan.id)
 
     activated_at = datetime.now(UTC)
     for item in buy_items:
@@ -787,6 +841,8 @@ def _activation_success(
                 "capability": CORE_EXECUTION_ACTIVATION_CAPABILITY,
                 "plan_id": command.plan_id,
                 "status": "activated",
+                **({"origin_type": "rule", "rule_origin": command.items[0].rule_origin.model_dump(mode="json")}
+                   if getattr(command, "origin_type", None) == "rule" else {}),
                 "dispatch_material_fingerprint": (
                     command.dispatch_material_fingerprint
                 ),
@@ -799,6 +855,8 @@ def _activation_success(
                     "core_item_key": item.core_item_key,
                     "execution_plan_item_id": item.execution_plan_item_id,
                     "decision_snapshot_id": item.decision_snapshot_id,
+                    **({"rule_origin": item.rule_origin.model_dump(mode="json")}
+                       if getattr(command, "origin_type", None) == "rule" else {}),
                     "status": "activated",
                     "execution_plan_id": execution_plan_id,
                 }
@@ -924,7 +982,7 @@ def _strict_server_normalized_core_payload(
         strict_item["quantity_policy"] = dict(normalized_policy)
 
     try:
-        validated = CoreExecutionPlanRequestV4.model_validate(
+        validated = parse_core_execution_plan_v4(
             strict_payload,
             context={
                 _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
@@ -1191,7 +1249,7 @@ def _unproven_core_buy_item_ids(plan: ExecutionPlan) -> set[str] | None:
     if _persisted_core_plan_intake_ack(plan) is None:
         return None
     try:
-        command = CoreExecutionPlanRequestV4.model_validate(
+        command = parse_core_execution_plan_v4(
             plan.raw_payload,
             context={
                 _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
@@ -1532,7 +1590,7 @@ def _raw_core_items_by_key(plan: ExecutionPlan) -> dict[str, Any]:
     if not isinstance(plan.raw_payload, dict):
         return {}
     try:
-        command = CoreExecutionPlanRequestV4.model_validate(
+        command = parse_core_execution_plan_v4(
             plan.raw_payload,
             context={
                 _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
@@ -2033,6 +2091,8 @@ def _normalize_safe_legacy_watch_authority(
     settings: Settings | None = None,
 ) -> set[str]:
     """Canonicalize narrowly proven pre-fix watch outcomes item by item."""
+    if isinstance(plan.raw_payload, dict) and plan.raw_payload.get('origin_type') == 'rule':
+        return set()
     locked_items = db.scalars(
         select(ExecutionPlanItem)
         .where(ExecutionPlanItem.execution_plan_id == plan.id)
@@ -2044,7 +2104,7 @@ def _normalize_safe_legacy_watch_authority(
     if _persisted_core_plan_intake_ack(plan) is None:
         return set()
     try:
-        command = CoreExecutionPlanRequestV4.model_validate(
+        command = parse_core_execution_plan_v4(
             plan.raw_payload,
             context={
                 _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
@@ -2052,7 +2112,6 @@ def _normalize_safe_legacy_watch_authority(
         )
     except ValidationError:
         return set()
-
     from app.services.watch_exec_agent_sizing import (
         _canonical_terminal_rejection,
         finalize_completed_no_trade_plan,
@@ -2289,6 +2348,8 @@ def list_core_execution_plans_v4(
                     sorted(Counter(item["status"] for item in item_states).items())
                 ),
                 "item_states": item_states,
+                **({"rule_contract": plan.raw_payload}
+                   if isinstance(plan.raw_payload, dict) and plan.raw_payload.get("origin_type") == "rule" else {}),
                 **({'local_unacknowledged_buy_notional_krw': local_unacknowledged_buy_notional(db=db, plan=plan)}
                    if any(is_core_sized(item.quantity_policy) for item in plan.items) else {}),
                 **(account_quantity_state or {}),
@@ -2360,6 +2421,8 @@ def _core_v4_item_state(item: ExecutionPlanItem) -> dict[str, object]:
     return {
         "core_item_key": item.source_plan_item_id,
         "execution_plan_item_id": item.id,
+        "side": item.side,
+        "intent": item.intent,
         "status": item.status,
         "updated_at": (
             item.updated_at.isoformat()
@@ -2368,6 +2431,16 @@ def _core_v4_item_state(item: ExecutionPlanItem) -> dict[str, object]:
         ),
         "terminal": item.status in CORE_V4_OPERATIONAL_TERMINAL_STATUSES,
         "decision": decision,
+        **({
+            "rule_origin": rule_origin_for_plan_item(item),
+            "close_exit_at": risk_context.get("close_exit_at"),
+            "decision_agent_name": item.decision_agent_name,
+            "decision_snapshot_id": item.decision_snapshot_id,
+            "decision_run_id": item.decision_run_id,
+            "core_activation_state": _core_activation_state(item),
+            "limit_price": str(item.limit_price) if item.limit_price is not None else None,
+            "trigger_price": str(item.trigger_price) if item.trigger_price is not None else None,
+        } if "rule_origin" in risk_context else {}),
         **({'core_quantity_state': core_quantity_state(db=object_session(item), item=item)}
            if item.side == 'buy' and is_core_sized(quantity_policy) and object_session(item) is not None else {}),
     }
@@ -2470,7 +2543,7 @@ def _persisted_core_plan_ack(
     if not isinstance(plan.raw_payload, dict):
         return None
     try:
-        command = CoreExecutionPlanRequestV4.model_validate(
+        command = parse_core_execution_plan_v4(
             plan.raw_payload,
             context={
                 _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
@@ -2484,6 +2557,29 @@ def _persisted_core_plan_ack(
     payload_sha256 = json_payload_hash(plan.raw_payload)
     raw_keys: list[str] = []
     persisted_items = list(plan.items)
+    if isinstance(command, CoreRuleExecutionPlanRequestV4):
+        extras = [item for item in persisted_items if item.plan_item_index >= len(command.items)]
+        entry = next((item for item in persisted_items if item.side == "buy"), None)
+        for item in extras:
+            risk = item.risk_context if isinstance(item.risk_context, dict) else {}
+            raw_exit = next((raw for raw in command.items if raw.intent == item.intent and raw.side == "sell"), None)
+            protected_price_matches = (
+                item.intent == "max_holding_close_sell" and item.trigger_price is None
+                or raw_exit is not None and item.trigger_price == raw_exit.trigger_price and item.limit_price == raw_exit.limit_price
+            )
+            if not (
+                entry is not None and item.intent in {"max_holding_close_sell", "stop_sell", "target_sell"} and item.side == "sell"
+                and protected_price_matches
+                and item.symbol == entry.symbol and rule_origin_for_plan_item(item) == command.rule_origin.model_dump(mode="json")
+                and (item.provider, item.venue, item.asset_class) == (entry.provider, entry.venue, entry.asset_class)
+                and plan_item_entry_family_key(item) == plan_item_entry_family_key(entry)
+                and risk.get("post_entry_managed") is True
+                and isinstance(risk.get("entry_context"), dict)
+                and risk["entry_context"].get("execution_plan_item_id") == entry.id
+                and risk.get("close_exit_at") == entry.risk_context.get("close_exit_at")
+            ):
+                return None
+        persisted_items = [item for item in persisted_items if item not in extras]
     if len(persisted_items) != len(command.items):
         return None
     persisted_by_source_key: dict[str, ExecutionPlanItem] = {}
@@ -2531,12 +2627,16 @@ def _persisted_core_plan_ack(
         "execution_plan_id": plan.id,
         "accepted_item_count": len(raw_keys),
         "rejected_item_count": 0,
+        **({"origin_type": "rule", "rule_origin": command.rule_origin.model_dump(mode="json")}
+           if isinstance(command, CoreRuleExecutionPlanRequestV4) else {}),
         "contract_ack": {
             "schema_version": CORE_EXECUTION_PLAN_ACK_SCHEMA_VERSION,
             "contract_version": CORE_EXECUTION_HANDOFF_CONTRACT_VERSION,
             "capability": CORE_EXECUTION_PLAN_CAPABILITY,
             "plan_id": plan.external_plan_id,
             "status": "accepted",
+            **({"origin_type": "rule", "rule_origin": command.rule_origin.model_dump(mode="json")}
+               if isinstance(command, CoreRuleExecutionPlanRequestV4) else {}),
             "dispatch_material_fingerprint": (
                 command.metadata.dispatch_material_fingerprint
             ),
@@ -2547,6 +2647,8 @@ def _persisted_core_plan_ack(
                 "status": "accepted",
                 "execution_plan_id": plan.id,
                 "execution_plan_item_id": persisted_by_key[key].id,
+                **({"rule_origin": command.rule_origin.model_dump(mode="json")}
+                   if isinstance(command, CoreRuleExecutionPlanRequestV4) else {}),
             }
             for key in raw_keys
         ],
@@ -2577,6 +2679,7 @@ def _persisted_item_intake_identity_matches(
         and item.decision_agent_name == raw_item.decision_agent_name
         and item.decision_snapshot_id == raw_item.decision_snapshot_id
         and item.decision_run_id == plan.strategy_run_id
+        and plan_item_origin_matches(item, raw_item)
         and item.source_market_date == expected_source_market_date
         and item.time_in_force == raw_item.time_in_force
         and _persisted_contract_binding_matches(
@@ -2633,6 +2736,7 @@ def _persisted_item_identity_matches(
         and item.decision_agent_name == raw_item.decision_agent_name
         and item.decision_snapshot_id == raw_item.decision_snapshot_id
         and item.decision_run_id == plan.strategy_run_id
+        and plan_item_origin_matches(item, raw_item)
         and item.source_market_date == expected_source_market_date
         and item.time_in_force == raw_item.time_in_force
         and _limit_price_matches(
@@ -3422,6 +3526,7 @@ def revoke_core_execution_plan_v4(
         and all(
             locked_by_key[key].id == request.execution_plan_item_id
             and locked_by_key[key].decision_snapshot_id == request.decision_snapshot_id
+            and plan_item_origin_matches(locked_by_key[key], request)
             for key, request in requested_by_key.items()
         )
     )
@@ -3580,6 +3685,8 @@ def _revoke_locked_core_execution_plan_v4(
                 ),
                 "execution_plan_id": plan.id,
                 "execution_plan_item_id": locked_by_key[request.core_item_key].id,
+                **({"rule_origin": request.rule_origin.model_dump(mode="json"), "decision_snapshot_id": None}
+                   if getattr(command, "origin_type", None) == "rule" else {}),
             }
             for request in command.items
         ]
@@ -3591,6 +3698,7 @@ def _revoke_locked_core_execution_plan_v4(
                 "contract_ack": _revocation_contract_ack(
                     plan_id=command.plan_id,
                     status="manual_review_required",
+                    command=command,
                 ),
                 "item_acks": item_acks,
                 "revoked_item_count": 0,
@@ -3615,6 +3723,7 @@ def _revoke_locked_core_execution_plan_v4(
                         "prior_status": prior_status,
                         "replacement_decision_snapshot_id": command.replacement_decision_snapshot_id,
                         "replacement_action": command.replacement_action,
+                        **_rule_revocation_provenance(command),
                     },
                     payload={
                         "contract_version": command.contract_version,
@@ -3640,6 +3749,7 @@ def _revoke_locked_core_execution_plan_v4(
             "contract_ack": _revocation_contract_ack(
                 plan_id=command.plan_id,
                 status="revoked",
+                command=command,
             ),
             "item_acks": _revocation_item_acks(
                 command=command,
@@ -3689,7 +3799,7 @@ def _request_covers_persisted_intake_family(
     requested_keys: set[str],
 ) -> bool:
     try:
-        command = CoreExecutionPlanRequestV4.model_validate(
+        command = parse_core_execution_plan_v4(
             plan.raw_payload,
             context={
                 _SKIP_DISPATCH_MATERIAL_FINGERPRINT_CONTEXT_KEY: True,
@@ -3735,6 +3845,7 @@ def _audit_revocation_manual_review(
                     "current_status": item.status,
                     "replacement_decision_snapshot_id": command.replacement_decision_snapshot_id,
                     "replacement_action": command.replacement_action,
+                    **_rule_revocation_provenance(command),
                 },
                 payload={
                     "contract_version": command.contract_version,
@@ -3762,6 +3873,7 @@ def _revocation_failure(
             "contract_ack": _revocation_contract_ack(
                 plan_id=command.plan_id,
                 status=status,
+                command=command,
             ),
             "item_acks": _revocation_item_acks(
                 command=command,
@@ -3779,13 +3891,23 @@ def _revocation_failure(
     )
 
 
-def _revocation_contract_ack(*, plan_id: str, status: str) -> dict[str, object]:
+def _rule_revocation_provenance(command) -> dict[str, object]:
+    if getattr(command, "origin_type", None) != "rule":
+        return {}
+    return {
+        "origin_type": "rule", "rule_origin": command.items[0].rule_origin.model_dump(mode="json"),
+        "replacement_rule_origin": command.replacement_rule_origin.model_dump(mode="json"),
+    }
+
+
+def _revocation_contract_ack(*, plan_id: str, status: str, command=None) -> dict[str, object]:
     return {
         "schema_version": CORE_EXECUTION_REVOCATION_SCHEMA_VERSION,
         "contract_version": CORE_EXECUTION_HANDOFF_CONTRACT_VERSION,
         "capability": CORE_EXECUTION_REVOCATION_CAPABILITY,
         "plan_id": plan_id,
         "status": status,
+        **_rule_revocation_provenance(command),
     }
 
 
@@ -3806,6 +3928,8 @@ def _revocation_item_acks(
                 if request.core_item_key in persisted_items
                 else request.execution_plan_item_id
             ),
+            **({"rule_origin": request.rule_origin.model_dump(mode="json"), "decision_snapshot_id": None}
+               if getattr(command, "origin_type", None) == "rule" else {}),
         }
         for request in command.items
     ]

@@ -4,6 +4,7 @@ from datetime import date
 from typing import Any
 
 from app.models.runtime import BrokerOrder, ExecutionPlanItem
+from app.services.plan_item_identity import rule_origin_for_plan_item
 
 
 EXECUTION_DECISION_LINEAGE_VERSION = "execution-decision-lineage-v1"
@@ -112,6 +113,9 @@ def decision_lineage_for_plan_item(
         "decision_run_id": plan_item.decision_run_id,
         "source_market_date": _date_text(plan_item.source_market_date),
     }
+    origin = rule_origin_for_plan_item(plan_item)
+    if origin is not None:
+        lineage.update(origin_type="rule", rule_origin=origin)
     if _lineage_identity_is_complete(lineage):
         lineage["status"] = "complete"
     return lineage
@@ -271,12 +275,29 @@ def _metadata_lineage_assessment(
         "decision_run_id": _optional_text(raw.get("decision_run_id")),
         "source_market_date": _date_text(raw.get("source_market_date")),
     }
+    if "origin_type" in raw or "rule_origin" in raw:
+        normalized.update(origin_type=raw.get("origin_type"), rule_origin=raw.get("rule_origin"))
     if raw_status == "complete" and not _lineage_identity_is_complete(normalized):
         normalized["status"] = "partial"
     return {"status": normalized["status"], "lineage": normalized}
 
 
 def _lineage_identity_is_complete(lineage: dict[str, object]) -> bool:
+    if "origin_type" in lineage or "rule_origin" in lineage:
+        from pydantic import ValidationError
+        from app.api.schemas.execution import CoreRuleOriginV1
+
+        try:
+            origin = CoreRuleOriginV1.model_validate(lineage.get("rule_origin")).model_dump(mode="json")
+        except ValidationError:
+            return False
+        agent_fields = {"strategy_run_id", "decision_agent_name", "decision_snapshot_id", "decision_run_id"}
+        return bool(
+            lineage.get("origin_type") == "rule" and lineage.get("rule_origin") == origin
+            and origin['target_trade_date'] == lineage.get('target_market_date')
+            and not any(lineage.get(field) is not None for field in agent_fields)
+            and all(_optional_text(lineage.get(field)) for field in _COMPLETE_LINEAGE_FIELDS if field not in agent_fields)
+        )
     return bool(
         all(_optional_text(lineage.get(field)) for field in _COMPLETE_LINEAGE_FIELDS)
         and lineage.get("decision_run_id") == lineage.get("strategy_run_id")
