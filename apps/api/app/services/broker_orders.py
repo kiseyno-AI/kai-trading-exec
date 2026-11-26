@@ -114,6 +114,7 @@ from app.services.core_buy_authority import (
     core_buy_authority_block_reason,
     project_plan_item_for_core_buy_authority,
 )
+from app.services.rule_execution import rule_entry_block_reason
 from app.services.fill_idempotency import (
     dedupe_execution_fills,
     execution_fill_idempotency_key,
@@ -160,6 +161,8 @@ from app.services.order_intent_serialization import (
 )
 from app.services.plan_item_identity import (
     plan_item_decision_agent_name,
+    plan_item_strategy_lane,
+    rule_origin_for_plan_item,
     plan_item_entry_family_key,
     plan_item_execution_route_key,
     plan_item_inventory_scope_key,
@@ -406,7 +409,7 @@ def _strategy_entry_family_identity(
         return None
     family_key = plan_item_entry_family_key(plan_item)
     decision_lane = _normalized_strategy_lane(
-        plan_item_decision_agent_name(plan_item)
+        plan_item_strategy_lane(plan_item)
     )
     if family_key is None or decision_lane is None:
         return None
@@ -1212,12 +1215,17 @@ def _place_broker_order_serialized(
         return _account_route_blocked_result(account_route_mismatch)
 
     scoped_authority_reason = (
-        core_buy_authority_block_reason(
+        (core_buy_authority_block_reason(
             settings=settings,
             db=db,
             plan_item=plan_item,
             now=observed_at,
-        )
+        ) or rule_entry_block_reason(
+            settings=settings,
+            db=db,
+            plan_item=plan_item,
+            now=observed_at,
+        ))
         if command.side == "buy"
         and _is_new_buy_order(command=command, plan_item=plan_item)
         else None
@@ -2978,13 +2986,19 @@ def _place_broker_order_serialized(
             )
         authority_checked_at = boundary_checked_at
         scoped_authority_reason = (
-            core_buy_authority_block_reason(
+            (core_buy_authority_block_reason(
                 settings=settings,
                 db=db,
                 plan_item=plan_item,
                 now=authority_checked_at,
                 lock=True,
-            )
+            ) or rule_entry_block_reason(
+                settings=settings,
+                db=db,
+                plan_item=plan_item,
+                now=authority_checked_at,
+                lock=True,
+            ))
             if routed_command.side == "buy"
             and _is_new_buy_order(command=routed_command, plan_item=plan_item)
             else None
@@ -3605,13 +3619,19 @@ def _place_broker_order_serialized(
                 )
             authority_checked_at = boundary_checked_at
             scoped_authority_reason = (
-                core_buy_authority_block_reason(
+                (core_buy_authority_block_reason(
                     settings=settings,
                     db=db,
                     plan_item=plan_item,
                     now=authority_checked_at,
                     lock=True,
-                )
+                ) or rule_entry_block_reason(
+                    settings=settings,
+                    db=db,
+                    plan_item=plan_item,
+                    now=authority_checked_at,
+                    lock=True,
+                ))
                 if routed_command.side == "buy"
                 and _is_new_buy_order(command=routed_command, plan_item=plan_item)
                 else None
@@ -4049,6 +4069,7 @@ def _place_broker_order_serialized(
             snapshot_error=symbol_exposure_snapshot_error,
             exclude_order_id=order.id,
             observed_at=final_market_reference_at,
+            access_token=session_state.access_token or "",
         )
         if final_cash_decision is not None and not final_cash_decision.allowed:
             fenced = _persist_runtime_safety_fence(
@@ -4257,13 +4278,19 @@ def _place_broker_order_serialized(
                 ),
             )
         immediate_scoped_authority_reason = (
-            core_buy_authority_block_reason(
+            (core_buy_authority_block_reason(
                 settings=settings,
                 db=db,
                 plan_item=plan_item,
                 now=immediate_boundary_checked_at,
                 lock=True,
-            )
+            ) or rule_entry_block_reason(
+                settings=settings,
+                db=db,
+                plan_item=plan_item,
+                now=immediate_boundary_checked_at,
+                lock=True,
+            ))
             if is_new_buy
             else None
         )
@@ -4327,13 +4354,19 @@ def _place_broker_order_serialized(
                 ),
             )
         post_lock_scoped_authority_reason = (
-            core_buy_authority_block_reason(
+            (core_buy_authority_block_reason(
                 settings=settings,
                 db=db,
                 plan_item=plan_item,
                 now=immediate_boundary_checked_at,
                 lock=False,
-            )
+            ) or rule_entry_block_reason(
+                settings=settings,
+                db=db,
+                plan_item=plan_item,
+                now=immediate_boundary_checked_at,
+                lock=False,
+            ))
             if is_new_buy
             else None
         )
@@ -6764,6 +6797,12 @@ def _validate_plan_item(
     command: PlaceOrderRequest,
     request_source: str = "post:/orders",
 ) -> str | None:
+    if (
+        plan_item is not None and command.side == "buy"
+        and isinstance(plan_item.risk_context, dict) and "rule_origin" in plan_item.risk_context
+        and not request_source.startswith(ACCOUNT_DRAWDOWN_RECOVERY_AUTOMATED_SOURCE_PREFIXES)
+    ):
+        return "rule entries require the trusted deterministic runtime"
     if plan_item is None:
         return None
     if plan_item.symbol != command.symbol:
@@ -9926,6 +9965,7 @@ def _evaluate_final_automated_buy_cash_boundary(
     snapshot_error: str | None,
     exclude_order_id: str,
     observed_at: datetime,
+    access_token: str,
 ) -> AccountDrawdownDecision | None:
     """Recheck aggregate cash after the final executable price is durable."""
 
@@ -9948,6 +9988,18 @@ def _evaluate_final_automated_buy_cash_boundary(
             ),
             now=observed_at,
         )
+    is_rule = plan_item is not None and rule_origin_for_plan_item(plan_item) is not None
+    if is_rule and settings.runtime_mode != "mock":
+        snapshot_at = snapshot.observed_at
+        if (
+            snapshot.holdings_complete is not True or snapshot.open_orders_complete is not True
+            or snapshot_at.tzinfo is None or snapshot_at.utcoffset() is None
+            or not -timedelta(seconds=5) <= observed_at - snapshot_at <= timedelta(seconds=settings.exec_agent_max_account_snapshot_age_seconds)
+        ):
+            return account_drawdown_uncertain_decision(
+                order_idempotency_key=command.idempotency_key, execution_plan_item_id=plan_item.id,
+                reason="rule_account_snapshot_incomplete_or_stale", now=observed_at,
+            )
     reservation, indeterminate_order = _scoped_open_buy_reservation(
         settings=settings,
         db=db,
@@ -9966,6 +10018,19 @@ def _evaluate_final_automated_buy_cash_boundary(
             observed_at=observed_at,
         )
     assert reservation is not None
+    if is_rule:
+        from app.services.rule_execution import rule_cash_capacity_failure
+
+        rule_failure = rule_cash_capacity_failure(
+            settings=settings, adapter=adapter, access_token=access_token, command=command, item=plan_item,
+            local_unacknowledged_notional=reservation.local_unmatched_notional,
+            local_unknown_count=reservation.local_unknown_count + reservation.broker_unknown_count,
+        )
+        if rule_failure is not None:
+            return account_drawdown_uncertain_decision(
+                order_idempotency_key=command.idempotency_key, execution_plan_item_id=plan_item.id,
+                reason=rule_failure, now=observed_at,
+            )
     return _buy_capital_reservation_decision(
         settings=settings,
         snapshot=snapshot,
@@ -11406,7 +11471,7 @@ def _evaluate_automated_buy_lane_boundary(
                 ),
             )
         prior_lane = prior_identity["decision_lane"]
-        if prior_lane != candidate_lane:
+        if prior_lane != candidate_lane and candidate_lane != "krx_us_rebound":
             continue
         return PlaceBrokerOrderResult(
             status_code=409,
@@ -11730,6 +11795,15 @@ def _automated_buy_lane_inventory_failure(
         )
 
     candidate_lane = str(candidate_identity["decision_lane"])
+    if candidate_lane == "krx_us_rebound" and any(
+        quantity > 0 and lane != candidate_lane
+        for (_family_key, lane), quantity in ledger.family_balances.items()
+    ):
+        return failure(
+            block_reason="rule_baseline_holding_priority",
+            message="the original decision lanes own current symbol inventory",
+            manual_review_required=False,
+        )
     lane_remaining = sum(
         (
             quantity

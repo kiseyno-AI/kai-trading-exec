@@ -153,6 +153,26 @@ class BrokerAccountOpenOrder:
 
 
 @dataclass(frozen=True)
+class DomesticCashCapacity:
+    provider: str
+    runtime_mode: RuntimeMode
+    account_reference: str
+    symbol: str
+    exchange: str
+    currency: str
+    requested_price: Decimal
+    quantity_calculation_price: Decimal
+    orderable_cash_krw: Decimal
+    no_misu_buying_amount_krw: Decimal
+    no_misu_buying_quantity: int
+    received_at: datetime
+    capacity_id: str
+    source_order_type: str = "00"
+    cma_included: bool = False
+    overseas_included: bool = False
+
+
+@dataclass(frozen=True)
 class BrokerSymbolBuyingPower:
     symbol: str
     available_cash: Decimal | None

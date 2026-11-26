@@ -1,4 +1,5 @@
 from typing import Annotated
+import hmac
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -13,6 +14,11 @@ from app.api.dependencies import (
 from app.api.schemas.execution import (
     CoreExecutionActivationRequestV4,
     CoreExecutionPlanRequestV4,
+    CoreRuleExecutionPlanRequestV4,
+    CoreRuleExecutionActivationRequestV4,
+    CoreRuleExecutionRevocationRequestV4,
+    CORE_RULE_ORIGIN_CAPABILITY,
+    CORE_EXECUTION_PLAN_CAPABILITY,
     CoreExecutionRevocationRequestV4,
     CoreQuantityRevisionRequest,
     ExecutionFailureStatusUpdateRequest,
@@ -160,12 +166,39 @@ def core_execution_plans_v4(
     )
 
 
+@router.get("/v4/execution-plans/capabilities")
+def core_execution_plan_capabilities(request: Request) -> dict[str, object]:
+    from app.services.execution_account_route import configured_kis_account_reference, configured_kis_route_fingerprint
+
+    settings = get_settings(request)
+    intended_account = request.headers.get("X-Core-Account-Reference")
+    configured_account = configured_kis_account_reference(settings)
+    return {
+        "runtime_mode": settings.runtime_mode,
+        "broker_provider": settings.runtime_broker_provider,
+        "runtime_binding": {
+            "mode": settings.runtime_mode, "provider": settings.runtime_broker_provider,
+            "configured_route_fingerprint": configured_kis_route_fingerprint(settings),
+            "account_reference_matches": bool(
+                settings.runtime_broker_provider == "kis" and intended_account and configured_account
+                and hmac.compare_digest(intended_account.encode("utf-8"), configured_account.encode("utf-8"))
+            ),
+        },
+        "capabilities": [CORE_EXECUTION_PLAN_CAPABILITY, CORE_RULE_ORIGIN_CAPABILITY],
+        "rule_origin": {
+            "supported": True, "enabled": settings.krx_us_rebound_enabled,
+            "strategy_id": "krx_us_rebound", "core_sized_only": True,
+            "explicit_close_exit_at": True,
+        },
+    }
+
+
 @router.post("/v4/execution-plans")
 def create_core_execution_plan_v4_handler(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
     adapter: Annotated[BrokerAdapter, Depends(get_broker_adapter)],
-    payload: CoreExecutionPlanRequestV4 = Body(...),
+    payload: CoreExecutionPlanRequestV4 | CoreRuleExecutionPlanRequestV4 = Body(...),
 ) -> JSONResponse:
     settings: Settings = get_settings(request)
     result = create_core_execution_plan_v4(
@@ -187,7 +220,7 @@ def create_core_execution_plan_v4_handler(
 def revoke_core_execution_plan_v4_handler(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
-    payload: CoreExecutionRevocationRequestV4 = Body(...),
+    payload: CoreExecutionRevocationRequestV4 | CoreRuleExecutionRevocationRequestV4 = Body(...),
 ) -> JSONResponse:
     settings: Settings = get_settings(request)
     result = revoke_core_execution_plan_v4(
@@ -209,7 +242,7 @@ def revoke_core_execution_plan_v4_handler(
 def activate_core_execution_plan_v4_handler(
     request: Request,
     db: Annotated[Session, Depends(get_db_session)],
-    payload: CoreExecutionActivationRequestV4 = Body(...),
+    payload: CoreExecutionActivationRequestV4 | CoreRuleExecutionActivationRequestV4 = Body(...),
 ) -> JSONResponse:
     settings: Settings = get_settings(request)
     result = activate_core_execution_plan_v4(

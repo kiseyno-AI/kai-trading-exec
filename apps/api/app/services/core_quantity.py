@@ -14,6 +14,7 @@ from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
 from app.services.fill_economics import effective_fill_quantity
 from app.services.fill_idempotency import broker_reported_filled_quantity, dedupe_execution_fills
 from app.services.json_compaction import json_payload_hash
+from app.services.plan_item_identity import plan_item_origin_matches, rule_origin_for_plan_item
 
 REVISION_EVENT = "core_quantity_revision"
 REVISION_BINDING_KEY = "_core_quantity_revision"
@@ -389,7 +390,7 @@ def revise_core_quantities(*, settings, db: Session, command: CoreQuantityRevisi
                 ExecutionPlanItem.decision_snapshot_id == request.decision_snapshot_id,
                 ExecutionPlanItem.side == 'buy',
             ).options(selectinload(ExecutionPlanItem.plan)))
-            if item is None:
+            if item is None or not plan_item_origin_matches(item, request):
                 raise ValueError('quantity_item_binding_mismatch')
             with serialized_revocation_exposure(db=db, settings=settings, items=[item]):
                 db.refresh(item, with_for_update=True)
@@ -419,6 +420,10 @@ def revise_core_quantities(*, settings, db: Session, command: CoreQuantityRevisi
                     raise ValueError('quantity_price_contract_changed')
                 if new.sizing_inputs.get('sizing_price') != old.sizing_inputs.get('sizing_price'):
                     raise ValueError('quantity_entry_price_changed')
+                if rule_origin_for_plan_item(item) is not None:
+                    deadline = datetime.fromisoformat(item.risk_context['close_exit_at'].replace('Z', '+00:00'))
+                    if new.valid_until > deadline:
+                        raise ValueError('quantity_revision_exceeds_rule_exit_deadline')
                 now = utc_now()
                 local_expiry = new.valid_until.astimezone(KST)
                 if (

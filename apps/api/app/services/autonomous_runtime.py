@@ -56,6 +56,7 @@ from app.services.monitoring import (
     _load_core_monitoring_symbol_handoff,
 )
 from app.services.monitoring_price_source import is_us_regular_session
+from app.services.rule_execution import rule_close_exit_at_from_context
 from app.services.runtime_transitions import (
     ACTIVE_SELL_MONITORING_STATUSES,
     AGENT_ACTIVE_MONITORING_STATUSES,
@@ -340,6 +341,8 @@ class CachedMonitoringItem:
     close_exit_date: date | None = None
     provider: str | None = None
     exchange: str | None = None
+    close_exit_at: datetime | None = None
+    rule_origin_present: bool = False
 
 
 @dataclass(frozen=True)
@@ -2368,6 +2371,8 @@ class AutonomousRuntimeCoordinator:
                     else None
                 ),
                 close_exit_date=_cached_close_exit_date(row[5]),
+                close_exit_at=rule_close_exit_at_from_context(_cached_json_object(row[5])),
+                rule_origin_present='rule_origin' in _cached_json_object(row[5]),
                 provider=str(row[7] or "").strip().lower() or None,
                 exchange=_cached_item_exchange(
                     symbol=str(row[1]),
@@ -2663,6 +2668,8 @@ class AutonomousRuntimeCoordinator:
                     else None
                 ),
                 close_exit_date=_cached_close_exit_date(item.risk_context),
+                close_exit_at=rule_close_exit_at_from_context(_cached_json_object(item.risk_context)),
+                rule_origin_present='rule_origin' in _cached_json_object(item.risk_context),
                 provider=(
                     str(item.provider).strip().lower()
                     if item.provider is not None
@@ -3323,6 +3330,8 @@ def _cached_monitoring_item_triggered(
     triggered_at: datetime,
 ) -> bool:
     if item.intent == "max_holding_close_sell":
+        if item.rule_origin_present:
+            return bool(item.close_exit_at is not None and triggered_at.tzinfo is not None and triggered_at >= item.close_exit_at)
         exchange = str(item.exchange or "").strip().upper()
         if exchange in KRX_EXCHANGES:
             market_timezone = KRX_TIMEZONE
@@ -3387,7 +3396,10 @@ def _cached_json_object(value: object) -> dict[str, object]:
 
 
 def _cached_close_exit_date(risk_context: object) -> date | None:
-    raw_close_exit_date = _cached_json_object(risk_context).get("close_exit_date")
+    context = _cached_json_object(risk_context)
+    if 'rule_origin' in context:
+        return None
+    raw_close_exit_date = context.get("close_exit_date")
     if not isinstance(raw_close_exit_date, str):
         return None
     try:

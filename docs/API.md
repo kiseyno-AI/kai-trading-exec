@@ -658,6 +658,12 @@ states are terminal for this read model. Broker orders already submitted but
 still open remain nonterminal until broker truth reaches a terminal state.
 
 ### `POST /v4/execution-plans`
+The independent `origin_type=rule` variant for `krx_us_rebound` uses truthful
+typed provenance and null agent fields. Its strict KRX-only contract, capability
+and private account handshake, activation cutoff, controls, immutable price
+digest, and explicit timed exits are documented in
+[RULE_ORIGIN_CONTRACT.md](RULE_ORIGIN_CONTRACT.md).
+
 This is the only Core delegation endpoint. It requires the exact v4 request metadata and `delegated_final_full_cost_gate_recheck_v1` capability. The executable capability is currently limited to canonical KIS/stock/KRX/KRW plans. USD or US-equity delegated sizing returns 422 with `unsupported_us_equity_exec_agent_sizing` before plan or job persistence. Each supported entry family contains one buy, one linked target sell, and one linked stop sell. Intake is all-or-none: items remain non-claimable while persisted contract proof is checked, then the complete family is activated in the same commit. The response is accepted only when it includes exact contract metadata, counts, and a one-to-one accepted acknowledgement with durable IDs for every `core_item_key`.
 
 Both request timestamps must be timezone-aware and equal. A buy

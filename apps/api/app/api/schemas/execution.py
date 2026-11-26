@@ -1,11 +1,12 @@
 from copy import deepcopy
-from datetime import date, datetime
-from decimal import Decimal
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal, InvalidOperation
 import hashlib
 import hmac
 import json
 import re
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import (
     AliasChoices,
@@ -359,6 +360,32 @@ class CoreSizedQuantityPolicy(BaseModel):
         return self
 
 
+CORE_RULE_ORIGIN_CAPABILITY = "rule_origin_krx_us_rebound_v1"
+
+
+class CoreRuleOriginV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["rule_origin.v1"]
+    strategy_id: Literal["krx_us_rebound"]
+    strategy_lane: Literal["krx_us_rebound"]
+    rule_version: str = Field(min_length=1, max_length=128)
+    run_id: str = Field(min_length=1, max_length=128)
+    evaluation_id: str = Field(min_length=1, max_length=128)
+    input_manifest_id: str = Field(min_length=1, max_length=128)
+    config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_trade_date: date
+    setup_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("rule_version", "run_id", "evaluation_id", "input_manifest_id", "setup_id")
+    @classmethod
+    def require_exact_nonblank_identity(cls, value: str) -> str:
+        if not value.strip() or value != value.strip():
+            raise ValueError("rule identity must be nonblank without surrounding whitespace")
+        return value
+
+
 class CoreQuantityRevisionItem(CoreSizedQuantityPolicy):
     type: Literal["core_sized"] = "core_sized"
     external_plan_id: str = Field(min_length=1, max_length=128)
@@ -368,9 +395,14 @@ class CoreQuantityRevisionItem(CoreSizedQuantityPolicy):
     expected_revision: int = Field(ge=1, strict=True)
 
 
+class CoreRuleQuantityRevisionItem(CoreQuantityRevisionItem):
+    decision_snapshot_id: None = None
+    rule_origin: CoreRuleOriginV1
+
+
 class CoreQuantityRevisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    items: list[CoreQuantityRevisionItem] = Field(min_length=1, max_length=500)
+    items: list[CoreQuantityRevisionItem | CoreRuleQuantityRevisionItem] = Field(min_length=1, max_length=500)
 
 
 class CoreExecutionPlanItemV4(BaseModel):
@@ -685,6 +717,150 @@ class CoreExecutionActivationRequestV4(BaseModel):
         if len(keys) != len(set(keys)) or len(item_ids) != len(set(item_ids)):
             raise ValueError("activation item bindings must be one-to-one")
         return self
+
+
+class CoreRuleSessionV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    calendar_status: Literal["authoritative"]
+    calendar_source: str = Field(min_length=1, max_length=256)
+    session_close_at: datetime
+    close_buffer_seconds: int = Field(strict=True, gt=0, le=3600)
+
+    @field_validator("session_close_at")
+    @classmethod
+    def require_aware_close(cls, value: datetime) -> datetime:
+        return _require_timezone_aware_datetime(value)
+
+
+class CoreRuleExecutionPlanMetadataV4(CoreExecutionPlanMetadataV4):
+    agent_name: None = None
+    decision_agent_name: None = None
+
+
+class CoreRuleExecutionPlanItemV4(CoreExecutionPlanItemV4):
+    agent_name: None = None
+    decision_agent_name: None = None
+    decision_snapshot_id: None = None
+    rule_origin: CoreRuleOriginV1
+    close_exit_at: datetime
+
+    @field_validator("close_exit_at")
+    @classmethod
+    def require_aware_exit(cls, value: datetime) -> datetime:
+        return _require_timezone_aware_datetime(value)
+
+    @model_validator(mode="after")
+    def require_rule_execution_policy(self) -> "CoreRuleExecutionPlanItemV4":
+        if self.asset_class != "stock" or self.exchange != "KRX" or self.currency != "KRW":
+            raise ValueError("rule origin requires the KIS KRX stock route")
+        if self.side == "buy" and self.quantity_policy.get("type") != "core_sized":
+            raise ValueError("rule origin requires core_sized quantity authority")
+        session = CoreRuleSessionV1.model_validate(self.risk_context.get("rule_session"))
+        local_close = session.session_close_at.astimezone(ZoneInfo("Asia/Seoul"))
+        local_exit = self.close_exit_at.astimezone(ZoneInfo("Asia/Seoul"))
+        if (
+            local_close.date() != self.rule_origin.target_trade_date
+            or local_exit.date() != local_close.date()
+            or local_exit.time() <= time(9)
+            or self.close_exit_at != session.session_close_at - timedelta(seconds=session.close_buffer_seconds)
+        ):
+            raise ValueError("rule close_exit_at must equal the authoritative session close minus its buffer")
+        if CORE_EXECUTION_ACTIVATION_BINDING_KEY not in self.risk_context:
+            raise ValueError("rule origin requires Core-confirmed activation")
+        if any(self.risk_context.get(key) is not None for key in (
+            "agent_name", "decision_agent_name", "decision_snapshot_id", "decision_run_id", "confidence",
+        )):
+            raise ValueError("rule origin must not claim agent provenance")
+        if "rule_origin" in self.risk_context and self.risk_context["rule_origin"] != self.rule_origin.model_dump(mode="json"):
+            raise ValueError("rule risk context must match typed origin")
+        if "close_exit_at" in self.risk_context and self.risk_context["close_exit_at"] != self.model_dump(mode="json")["close_exit_at"]:
+            raise ValueError("rule risk context must match typed close_exit_at")
+        return self
+
+
+class CoreRuleExecutionPlanRequestV4(CoreExecutionPlanRequestV4):
+    origin_type: Literal["rule"]
+    rule_origin: CoreRuleOriginV1
+    strategy_run_id: None = None
+    items: list[CoreRuleExecutionPlanItemV4] = Field(min_length=3, max_length=3)
+    metadata: CoreRuleExecutionPlanMetadataV4
+
+    @model_validator(mode="after")
+    def require_exact_rule_family(self) -> "CoreRuleExecutionPlanRequestV4":
+        if self.rule_origin.target_trade_date != self.market_date:
+            raise ValueError("rule origin must match the target session")
+        if any(item.rule_origin != self.rule_origin for item in self.items):
+            raise ValueError("all items must match the exact root rule_origin")
+        if len({item.symbol for item in self.items}) != 1 or len({item.close_exit_at for item in self.items}) != 1:
+            raise ValueError("rule plan requires one symbol/setup and one exit deadline")
+        if any(item.risk_context['rule_session'] != self.items[0].risk_context['rule_session'] for item in self.items):
+            raise ValueError("all items must share authoritative session evidence")
+        entry = next(item for item in self.items if item.side == "buy")
+        target = next(item for item in self.items if item.intent == "target_sell")
+        stop = next(item for item in self.items if item.intent == "stop_sell")
+        if entry.quantity_policy['sizing_inputs']['price_contract_digest'] != rule_price_contract_digest(
+            entry_limit_price=entry.limit_price, entry_trigger_price=entry.trigger_price,
+            target_price=target.trigger_price, stop_price=stop.trigger_price, close_exit_at=entry.close_exit_at,
+        ):
+            raise ValueError("rule price_contract_digest does not match the immutable price contract")
+        policy = CoreSizedQuantityPolicy.model_validate(entry.quantity_policy)
+        if policy.valid_until > entry.close_exit_at:
+            raise ValueError("rule quantity authority must expire by close_exit_at")
+        try:
+            sizing_price = Decimal(str(policy.sizing_inputs.get("sizing_price")))
+        except (InvalidOperation, ValueError, TypeError):
+            raise ValueError("rule requires a finite positive entry sizing price") from None
+        if not sizing_price.is_finite() or not stop.trigger_price < sizing_price < target.trigger_price:
+            raise ValueError("rule requires ordered stop, entry ceiling, and target prices")
+        return self
+
+
+CoreExecutionPlanCommandV4 = CoreExecutionPlanRequestV4 | CoreRuleExecutionPlanRequestV4
+
+
+def rule_price_contract_digest(
+    *, entry_limit_price: Decimal | None, entry_trigger_price: Decimal | None,
+    target_price: Decimal, stop_price: Decimal, close_exit_at: datetime,
+) -> str:
+    material = {
+        key: format(value.normalize(), "f") if value is not None else None
+        for key, value in {
+            "entry_limit_price": entry_limit_price, "entry_trigger_price": entry_trigger_price,
+            "target_price": target_price, "stop_price": stop_price,
+        }.items()
+    }
+    material["close_exit_at"] = close_exit_at.astimezone(UTC).isoformat()
+    return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def parse_core_execution_plan_v4(value: object, *, context: dict | None = None) -> CoreExecutionPlanCommandV4:
+    # Keep the agent DTO and its serialized fingerprint material unchanged.
+    variant = CoreRuleExecutionPlanRequestV4 if isinstance(value, dict) and value.get("origin_type") == "rule" else CoreExecutionPlanRequestV4
+    return variant.model_validate(value, context=context)
+
+
+class CoreRuleExecutionActivationItemV4(CoreExecutionActivationItemV4):
+    decision_snapshot_id: None = None
+    rule_origin: CoreRuleOriginV1
+
+
+class CoreRuleExecutionActivationRequestV4(CoreExecutionActivationRequestV4):
+    origin_type: Literal["rule"]
+    items: list[CoreRuleExecutionActivationItemV4] = Field(min_length=1)
+
+
+class CoreRuleExecutionRevocationItemV4(CoreExecutionRevocationItemV4):
+    decision_snapshot_id: None = None
+    rule_origin: CoreRuleOriginV1
+
+
+class CoreRuleExecutionRevocationRequestV4(CoreExecutionRevocationRequestV4):
+    origin_type: Literal["rule"]
+    replacement_decision_snapshot_id: None = None
+    replacement_rule_origin: CoreRuleOriginV1
+    replacement_action: Literal["wait", "reject"]
+    items: list[CoreRuleExecutionRevocationItemV4] = Field(min_length=1)
 
 
 class PlaceOrderRequest(BaseModel):
