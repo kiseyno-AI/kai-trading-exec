@@ -6,9 +6,10 @@ from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 from sqlalchemy import or_, select, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, object_session, selectinload
 
-from app.api.schemas.execution import CoreSizedQuantityPolicy, CoreQuantityRevisionRequest
+from app.api.schemas.execution import CoreSizedQuantityPolicy, CoreQuantityRevisionRequest, PlaceOrderRequest
 from app.models.runtime import BrokerOrder, ExecutionPlan, ExecutionPlanItem, ExecutionPlanItemAudit, ExecutionJob, new_id
 from app.services.broker_order_state import CAPITAL_RESERVING_ORDER_STATUSES
 from app.services.fill_economics import effective_fill_quantity
@@ -128,6 +129,7 @@ def core_quantity_policy_matches(*, raw_policy: dict, item: ExecutionPlanItem) -
 def _entry_family_exit_started(*, db: Session, item: ExecutionPlanItem) -> bool:
     from app.services.execution_exposure import broker_order_is_provably_unsubmitted
 
+    rule_origin = rule_origin_for_plan_item(item)
     exits = db.scalars(select(ExecutionPlanItem).where(
         ExecutionPlanItem.execution_plan_id == item.execution_plan_id,
         ExecutionPlanItem.side == 'sell',
@@ -141,6 +143,21 @@ def _entry_family_exit_started(*, db: Session, item: ExecutionPlanItem) -> bool:
         ):
             continue
         exit_ids.append(sibling.id)
+        authority = (sibling.risk_context or {}).get('monitoring_order_authority')
+        if rule_origin is not None and rule_origin_for_plan_item(sibling) == rule_origin and isinstance(authority, dict):
+            from app.services.broker_orders import _server_owned_plan_command_matches
+
+            try:
+                command = PlaceOrderRequest.model_validate(authority.get('command'))
+            except ValidationError:
+                command = None
+            if (
+                command is not None and command.side == 'sell' and command.execution_plan_item_id == sibling.id
+                and command.symbol == sibling.symbol and type(authority.get('policy_version')) is int
+                and _server_owned_plan_command_matches(risk_context=sibling.risk_context, command=command,
+                    request_source='monitoring:intraday_target_stop_monitor')
+            ):
+                return True
         if sibling.status.endswith('_triggered_pending_dispatch') or sibling.status.startswith('broker_order_') or sibling.status in {'cancel_pending', 'manual_review_required'}:
             return True
     if not exit_ids:
@@ -169,7 +186,21 @@ def rule_entry_closure_reason(*, db: Session, item: ExecutionPlanItem, now: date
     return None
 
 
-def _latch_rule_entry_closure(*, db: Session, item: ExecutionPlanItem, now: datetime) -> bool:
+def _rule_entry_cancel_queue_needed(*, db: Session, item: ExecutionPlanItem) -> bool:
+    pending_order = db.scalar(select(BrokerOrder.id).where(
+        BrokerOrder.execution_plan_item_id == item.id, BrokerOrder.side == 'buy',
+        BrokerOrder.mode == item.plan.mode, BrokerOrder.status.in_(CAPITAL_RESERVING_ORDER_STATUSES),
+    ).limit(1))
+    if pending_order is None:
+        return False
+    active_job = db.scalar(select(ExecutionJob.id).where(
+        ExecutionJob.execution_plan_item_id == item.id, ExecutionJob.job_type == 'core_quantity_reduction',
+        ExecutionJob.status.in_(['queued', 'retrying', 'running']),
+    ).limit(1))
+    return active_job is None
+
+
+def _latch_rule_entry_closure(*, db: Session, item: ExecutionPlanItem, now: datetime, nowait: bool = False) -> bool:
     reason = rule_entry_closure_reason(db=db, item=item, now=now)
     if reason is None:
         return False
@@ -186,44 +217,95 @@ def _latch_rule_entry_closure(*, db: Session, item: ExecutionPlanItem, now: date
         db.add(ExecutionPlanItemAudit(execution_plan_item_id=item.id, event_type='rule_entry_closed',
             source='kai-trading-exec', summary={'reason_code': reason}, payload=closure, occurred_at=now))
         changed = True
-    pending_order = db.scalar(select(BrokerOrder.id).where(
-        BrokerOrder.execution_plan_item_id == item.id, BrokerOrder.side == 'buy',
-        BrokerOrder.mode == item.plan.mode, BrokerOrder.status.in_(CAPITAL_RESERVING_ORDER_STATUSES),
-    ).limit(1))
-    if pending_order is not None:
-        job = db.scalar(select(ExecutionJob).where(
-            ExecutionJob.execution_plan_item_id == item.id, ExecutionJob.job_type == 'core_quantity_reduction',
-        ).with_for_update())
-        if job is None or job.status not in {'queued', 'retrying', 'running'}:
-            from app.services.core_quantity_reductions import queue_core_quantity_reduction
+    if _rule_entry_cancel_queue_needed(db=db, item=item):
+        from app.services.core_quantity_reductions import queue_core_quantity_reduction
 
-            queue_core_quantity_reduction(db=db, item=item, now=now)
-            changed = True
+        queue_core_quantity_reduction(db=db, item=item, now=now, nowait=nowait)
+        changed = True
     return changed
 
 
-def maintain_rule_entry_closures(*, settings, db: Session, now: datetime, execution_plan_id: str | None = None) -> int:
+def maintain_rule_entry_closures(
+    *, settings, db: Session, now: datetime, execution_plan_id: str | None = None,
+    commit_rule_caller_state: bool = False,
+) -> int:
+    """Own short maintenance transactions; callers explicitly publish staged rule state."""
+    from app.services.account_drawdown_recovery import recovery_account_fingerprint
     from app.services.core_handoff_v4 import persisted_core_plan_contract_ack
+    from app.services.core_revocation_exposure import (
+        RevocationExposureSerializationBusy, _expected_identity, serialized_revocation_exposure,
+    )
+    from app.services.order_intent_serialization import order_intent_process_lock, order_intent_scope_key_for_account
+    from app.services.runtime_shutdown import COMMIT_GUARDED_SESSION_FACTORY_INFO_KEY, CommitGuardedSessionFactory
 
     active_buy = select(BrokerOrder.id).where(
         BrokerOrder.execution_plan_item_id == ExecutionPlanItem.id, BrokerOrder.side == 'buy',
         BrokerOrder.mode == settings.runtime_mode, BrokerOrder.status.in_(CAPITAL_RESERVING_ORDER_STATUSES),
     ).exists()
-    query = select(ExecutionPlanItem).join(ExecutionPlanItem.plan).where(
+    query = select(ExecutionPlanItem.id).join(ExecutionPlanItem.plan).where(
         ExecutionPlan.mode == settings.runtime_mode, ExecutionPlan.source == 'kai-trading-core',
+        ExecutionPlan.raw_payload['origin_type'].as_string() == 'rule',
         ExecutionPlanItem.side == 'buy', ExecutionPlanItem.quantity_policy['type'].as_string() == 'core_sized',
         ExecutionPlanItem.risk_context['rule_origin']['strategy_id'].as_string() == 'krx_us_rebound',
         or_(ExecutionPlanItem.risk_context[RULE_ENTRY_CLOSED_KEY]['schema_version'].as_string().is_(None), active_buy),
-    ).options(selectinload(ExecutionPlanItem.plan)).order_by(ExecutionPlanItem.id).with_for_update()
+    ).order_by(ExecutionPlanItem.id)
     if execution_plan_id is not None:
         query = query.where(ExecutionPlan.id == execution_plan_id)
+    with db.no_autoflush:
+        candidate_ids = list(db.scalars(query))
+    if not candidate_ids:
+        return 0
+    if commit_rule_caller_state:
+        db.commit()
+    elif any(db.is_modified(item) for item in db.dirty if isinstance(item, ExecutionPlanItem) and item.id in candidate_ids):
+        return 0
     changed = 0
-    for item in db.scalars(query).all():
-        proof = persisted_core_plan_contract_ack(item.plan)
-        if proof is not None and proof.get('origin_type') == 'rule':
-            changed += int(_latch_rule_entry_closure(db=db, item=item, now=now))
-    if changed:
-        db.flush()
+    scope = order_intent_scope_key_for_account(
+        provider='kis', runtime_mode=settings.runtime_mode,
+        account_scope=recovery_account_fingerprint(settings), market='KRW',
+    )
+    process_lock = order_intent_process_lock(scope)
+    # Use the Engine, never the caller's active Connection/transaction.
+    guarded_factory = db.info.get(COMMIT_GUARDED_SESSION_FACTORY_INFO_KEY)
+    create_session = guarded_factory if isinstance(guarded_factory, CommitGuardedSessionFactory) else Session
+    with create_session(bind=db.get_bind().engine, expire_on_commit=False) as maintenance:
+        for item_id in candidate_ids:
+            item = maintenance.get(ExecutionPlanItem, item_id)
+            if item is None or _expected_identity(settings=settings, item=item) is None:
+                continue
+            proof = persisted_core_plan_contract_ack(item.plan)
+            if proof is None or proof.get('origin_type') != 'rule' or rule_entry_closure_reason(db=maintenance, item=item, now=now) is None:
+                continue
+            if RULE_ENTRY_CLOSED_KEY in (item.risk_context or {}) and not _rule_entry_cancel_queue_needed(db=maintenance, item=item):
+                continue
+            if not process_lock.acquire(blocking=False):
+                continue
+            try:
+                # The outer reentrant lease also covers rollback when the
+                # existing serializer's advisory/table preflight rejects us.
+                with serialized_revocation_exposure(db=maintenance, settings=settings, items=[item]):
+                    maintenance.expire_all()
+                    item = maintenance.scalar(select(ExecutionPlanItem).where(
+                        ExecutionPlanItem.id == item_id).with_for_update(nowait=True))
+                    proof = persisted_core_plan_contract_ack(item.plan) if item is not None else None
+                    if proof is not None and proof.get('origin_type') == 'rule' and _expected_identity(settings=settings, item=item) is not None:
+                        updated = _latch_rule_entry_closure(db=maintenance, item=item, now=now, nowait=True)
+                        maintenance.commit()
+                        changed += int(updated)
+            except RevocationExposureSerializationBusy:
+                pass
+            except DBAPIError as exc:
+                if getattr(exc.orig, 'sqlstate', None) != '55P03':
+                    raise
+            finally:
+                try:
+                    maintenance.rollback()
+                finally:
+                    process_lock.release()
+    # The broker path may later replace JSON from these cached BUY objects.
+    for item in list(db.identity_map.values()):
+        if isinstance(item, ExecutionPlanItem) and item.id in candidate_ids and not db.is_modified(item):
+            db.expire(item, ['risk_context', 'quantity_policy', 'status'])
     return changed
 
 

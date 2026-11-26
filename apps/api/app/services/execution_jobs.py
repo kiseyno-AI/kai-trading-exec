@@ -292,8 +292,7 @@ def dispatch_due_execution_jobs(
             krx_calendar_state_by_date[market_date] = checker(session.access_token or '', market_date=market_date)
         return krx_calendar_state_by_date[market_date]
 
-    if maintain_rule_entry_closures(settings=settings, db=db, now=triggered_at):
-        db.commit()
+    maintain_rule_entry_closures(settings=settings, db=db, now=triggered_at, commit_rule_caller_state=True)
     if not automated_order_submission_allowed(control_state):
         # Entry controls cannot strand a closed rule's already-submitted BUY.
         reduction_count = process_core_quantity_reductions(

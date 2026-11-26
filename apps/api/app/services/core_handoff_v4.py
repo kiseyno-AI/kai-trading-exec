@@ -2091,6 +2091,8 @@ def _normalize_safe_legacy_watch_authority(
     settings: Settings | None = None,
 ) -> set[str]:
     """Canonicalize narrowly proven pre-fix watch outcomes item by item."""
+    if isinstance(plan.raw_payload, dict) and plan.raw_payload.get('origin_type') == 'rule':
+        return set()
     locked_items = db.scalars(
         select(ExecutionPlanItem)
         .where(ExecutionPlanItem.execution_plan_id == plan.id)
@@ -2110,9 +2112,6 @@ def _normalize_safe_legacy_watch_authority(
         )
     except ValidationError:
         return set()
-    if isinstance(command, CoreRuleExecutionPlanRequestV4):
-        return set()
-
     from app.services.watch_exec_agent_sizing import (
         _canonical_terminal_rejection,
         finalize_completed_no_trade_plan,

@@ -17777,13 +17777,15 @@ def _place_monitoring_order(
     if item.side == 'sell' and rule_origin_for_plan_item(item) is not None:
         from app.services.core_quantity import maintain_rule_entry_closures
 
+        # Publish the guarded rule SELL intent even when its BUY is already
+        # closed/flat and therefore absent from maintenance candidates.
+        db.commit()
         closed = maintain_rule_entry_closures(
             settings=settings, db=db, now=triggered_at, execution_plan_id=item.execution_plan_id,
         )
         if closed:
             # The closure and cancel debt survive even if the SELL is deferred
             # by the still-open BUY or its broker response is lost.
-            db.commit()
             db.info['rule_entry_closure_count'] = db.info.get('rule_entry_closure_count', 0) + closed
     return place_broker_order(
         settings=settings,

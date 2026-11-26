@@ -77,10 +77,10 @@ def _has_unresolved_cancel(*, db, order):
     return any(event.event_type == CANCEL_INTENT and event.id not in never_submitted for event in events)
 
 
-def queue_core_quantity_reduction(*, db, item, now):
+def queue_core_quantity_reduction(*, db, item, now, nowait=False):
     job = db.scalar(select(ExecutionJob).where(
         ExecutionJob.execution_plan_item_id == item.id, ExecutionJob.job_type == JOB_TYPE,
-    ).with_for_update())
+    ).with_for_update(nowait=nowait))
     if job is None:
         db.add(ExecutionJob(plan_item=item, job_type=JOB_TYPE, status='queued', scheduled_for=now))
     elif job.status != 'running':
@@ -94,8 +94,7 @@ def process_core_quantity_reductions(*, settings, db, adapter, now=None, krx_tra
     from app.services.core_revocation_exposure import serialized_revocation_exposure
 
     now = now or utc_now()
-    if maintain_rule_entry_closures(settings=settings, db=db, now=now):
-        db.commit()
+    maintain_rule_entry_closures(settings=settings, db=db, now=now, commit_rule_caller_state=True)
     processed_jobs = 0
     closed_rule = and_(
         ExecutionPlan.source == 'kai-trading-core',
