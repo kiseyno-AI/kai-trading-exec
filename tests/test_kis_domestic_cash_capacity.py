@@ -77,8 +77,9 @@ def _payload() -> dict[str, object]:
         ("live", "https://openapi.koreainvestment.com:9443", "TTTC8908R"),
     ],
 )
+@pytest.mark.parametrize("symbol", ["069500", "0017J0"])
 def test_cash_capacity_preserves_cash_only_fields_and_request_scope(
-    runtime_mode: str, base_url: str, transaction_id: str,
+    runtime_mode: str, base_url: str, transaction_id: str, symbol: str,
 ) -> None:
     http = MockJsonHttpClient(_payload())
     adapter = KisBrokerAdapter(settings=_settings(runtime_mode=runtime_mode), http_client=http)
@@ -86,7 +87,7 @@ def test_cash_capacity_preserves_cash_only_fields_and_request_scope(
 
     capacity = adapter.get_domestic_cash_capacity(
         access_token="fixture-token",
-        symbol="069500",
+        symbol=symbol,
         limit_price=Decimal("73400"),
     )
 
@@ -100,7 +101,7 @@ def test_cash_capacity_preserves_cash_only_fields_and_request_scope(
     assert dict(request.url.params) == {
         "CANO": "12345678",
         "ACNT_PRDT_CD": "01",
-        "PDNO": "069500",
+        "PDNO": symbol,
         "ORD_UNPR": "73400",
         "ORD_DVSN": "00",
         "CMA_EVLU_AMT_ICLD_YN": "N",
@@ -109,7 +110,7 @@ def test_cash_capacity_preserves_cash_only_fields_and_request_scope(
     assert capacity.provider == "kis"
     assert capacity.runtime_mode == runtime_mode
     assert capacity.account_reference == "KIS:12345678-01"
-    assert (capacity.symbol, capacity.exchange, capacity.currency) == ("069500", "KRX", "KRW")
+    assert (capacity.symbol, capacity.exchange, capacity.currency) == (symbol, "KRX", "KRW")
     assert capacity.requested_price == Decimal("73400")
     assert capacity.quantity_calculation_price == Decimal("73400")
     assert capacity.orderable_cash_krw == Decimal("980000")
@@ -130,6 +131,11 @@ def test_cash_capacity_preserves_cash_only_fields_and_request_scope(
         {"symbol": "69500"},
         {"symbol": "069500 "},
         {"symbol": "１２３４５６"},
+        {"symbol": "0017j0"},
+        {"symbol": " 0017J0"},
+        {"symbol": "0017J0 "},
+        {"symbol": "AAPLXX"},
+        {"symbol": "0017J-"},
         {"symbol": None},
         {"exchange": "NXT"},
         {"exchange": "NYSE"},

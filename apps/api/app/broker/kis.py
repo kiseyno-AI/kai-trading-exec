@@ -46,6 +46,7 @@ from app.broker.error_safety import (
     safe_broker_error_message,
     sanitize_broker_error_payload,
 )
+from app.services.execution_semantics import is_canonical_krx_short_code
 
 KIS_PROVIDER = "kis"
 KIS_DOMESTIC_EXCHANGES = frozenset({"KRX", "KOSPI", "KOSDAQ", "NXT", "SOR"})
@@ -1556,7 +1557,8 @@ class KisBrokerAdapter(BrokerAdapter):
             self.settings.runtime_broker_provider != self.provider
             or exchange != "KRX"
             or not isinstance(symbol, str)
-            or re.fullmatch(r"[0-9]{6}", symbol) is None
+            or symbol != symbol.strip()
+            or not is_canonical_krx_short_code(symbol)
             or not isinstance(limit_price, Decimal)
             or not limit_price.is_finite()
             or limit_price <= 0
