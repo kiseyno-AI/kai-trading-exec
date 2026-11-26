@@ -86,6 +86,16 @@ exponent; optional entry prices are null. The deadline is converted to UTC
 `295d5aa22d7dcc2102e8224094d8e273e953e04e43b73180f2f289b08f21a94f`.
 Quantity authority must expire no later than the close-exit deadline.
 
+Entry authority closes permanently at the first quantity-authority expiry,
+close-exit deadline, or protective-exit dispatch. Exec records this closure
+before queuing residual BUY cancellation; later quantity revisions cannot
+reopen it. The dispatch worker reuses durable cancellation/reconciliation jobs
+under exact account and family binding, including while entries are paused,
+killed, or disabled. A cancellation ACK alone never releases unknown exposure.
+Restart recovery retains retry backoff, reconciles prior sessions, and never
+repeats a possibly accepted cancellation. Protective SELLs retain their linked
+Core policy and immutable prices while family inventory accounts for late fills.
+
 Activation (`POST /v4/execution-plans/activations`), quantity revision
 (`/quantities`), and revocation (`/revocations`) use exact `rule_origin` in each
 item binding and null `decision_snapshot_id`. Activation and revocation have
@@ -108,7 +118,9 @@ new authority. Disabling the flag always blocks subsequent BUY submissions.
 Runtime ownership is stable across rule-version/run/evaluation changes:
 account route + target session + symbol + setup + neutral strategy lane. New
 rule entries yield to any potential original-lane entry, holding, open order,
-or ambiguous inventory on that symbol. The original two lanes retain their
+or ambiguous inventory on that symbol. An unsubmitted future-session plan alone
+does not reserve today's priority; actual or uncertain exposure still does.
+The original two lanes retain their
 independence. Every order still passes Core BUY authority, shared account/cash,
 exposure, session, quote, pause/kill and quantity gates under existing order
 serialization. Generated protection inherits the exact originating family.

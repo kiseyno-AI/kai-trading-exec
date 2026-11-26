@@ -4567,6 +4567,7 @@ def _evaluate_monitoring_cycle(
             details=checkpoint_details,
         )
     _log_cycle_step("checkpoint_update")
+    rule_entry_closure_count = db.info.pop('rule_entry_closure_count', 0)
     return EvaluateMonitoringResult(
         status_code=200,
         payload={
@@ -4577,6 +4578,7 @@ def _evaluate_monitoring_cycle(
             "submitted_order_count": submitted_order_count,
             "blocked_item_count": blocked_item_count,
             "deferred_item_count": deferred_item_count,
+            **({'rule_entry_closure_count': rule_entry_closure_count} if rule_entry_closure_count else {}),
             "evaluated_symbol_count": checkpoint_details["evaluated_symbol_count"],
             "triggered_symbol_count": checkpoint_details["triggered_symbol_count"],
             "rearmed_sell_monitor_count": checkpoint_details[
@@ -9678,6 +9680,10 @@ def _fixed_shares_quantity_policy(
     """Materialize shares without detaching the exit from its authority."""
 
     prior_policy = item.quantity_policy if isinstance(item.quantity_policy, dict) else {}
+    if rule_origin_for_plan_item(item) is not None and _quantity_policy_requires_position_exit(prior_policy):
+        # Rule exits remain linked to current family inventory; rewriting the
+        # immutable Core policy would invalidate cancellation/protection proof.
+        return dict(prior_policy)
     policy: dict[str, object] = {
         "kind": "shares",
         "quantity": quantity,
@@ -17635,6 +17641,8 @@ def _place_monitoring_order(
         )
         or {}
     )
+    if item.side == 'sell' and rule_origin_for_plan_item(item) is not None:
+        item.status = _pending_dispatch_status(item.intent)
     is_watch_buy = _is_watch_buy_item(item)
     limit_price = (
         limit_price_override
@@ -17766,6 +17774,17 @@ def _place_monitoring_order(
         return _plan_item_state_changed_result(side=order_request.side)
     set_committed_value(item, "status", item.status)
     set_committed_value(item, "risk_context", item.risk_context)
+    if item.side == 'sell' and rule_origin_for_plan_item(item) is not None:
+        from app.services.core_quantity import maintain_rule_entry_closures
+
+        closed = maintain_rule_entry_closures(
+            settings=settings, db=db, now=triggered_at, execution_plan_id=item.execution_plan_id,
+        )
+        if closed:
+            # The closure and cancel debt survive even if the SELL is deferred
+            # by the still-open BUY or its broker response is lost.
+            db.commit()
+            db.info['rule_entry_closure_count'] = db.info.get('rule_entry_closure_count', 0) + closed
     return place_broker_order(
         settings=settings,
         db=db,

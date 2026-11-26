@@ -5,7 +5,7 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session, object_session, selectinload
 
 from app.api.schemas.execution import CoreSizedQuantityPolicy, CoreQuantityRevisionRequest
@@ -20,6 +20,7 @@ REVISION_EVENT = "core_quantity_revision"
 REVISION_BINDING_KEY = "_core_quantity_revision"
 KST = ZoneInfo("Asia/Seoul")
 LIQUIDITY_EVIDENCE_KEY = 'exec_trigger_time_liquidity_evidence_v1'
+RULE_ENTRY_CLOSED_KEY = '_rule_entry_closed'
 
 
 def utc_now() -> datetime:
@@ -151,6 +152,119 @@ def _entry_family_exit_started(*, db: Session, item: ExecutionPlanItem) -> bool:
     return any(not broker_order_is_provably_unsubmitted(order) for order in orders)
 
 
+def rule_entry_closure_reason(*, db: Session, item: ExecutionPlanItem, now: datetime) -> str | None:
+    if rule_origin_for_plan_item(item) is None or not is_core_sized(item.quantity_policy):
+        return None
+    risk = item.risk_context or {}
+    if RULE_ENTRY_CLOSED_KEY in risk:
+        return 'rule_entry_closed'
+    from app.services.rule_execution import rule_close_exit_at
+
+    policy = _quantity_policy(item.quantity_policy)
+    close_at = rule_close_exit_at(item)
+    if now >= min(policy.valid_until, close_at or policy.valid_until):
+        return 'close_exit_at' if close_at is not None and close_at <= policy.valid_until else 'quantity_authority_expired'
+    if _entry_family_exit_started(db=db, item=item):
+        return 'protective_exit_started'
+    return None
+
+
+def _latch_rule_entry_closure(*, db: Session, item: ExecutionPlanItem, now: datetime) -> bool:
+    reason = rule_entry_closure_reason(db=db, item=item, now=now)
+    if reason is None:
+        return False
+    changed = False
+    risk = dict(item.risk_context or {})
+    if RULE_ENTRY_CLOSED_KEY not in risk:
+        policy = _quantity_policy(item.quantity_policy)
+        closure = {
+            'schema_version': 'rule_entry_closed_v1', 'reason_code': reason, 'observed_at': now.isoformat(),
+            'rule_origin': rule_origin_for_plan_item(item), 'quantity_revision': policy.revision,
+            'valid_until': policy.valid_until.isoformat(),
+        }
+        item.risk_context = {**risk, RULE_ENTRY_CLOSED_KEY: closure}
+        db.add(ExecutionPlanItemAudit(execution_plan_item_id=item.id, event_type='rule_entry_closed',
+            source='kai-trading-exec', summary={'reason_code': reason}, payload=closure, occurred_at=now))
+        changed = True
+    pending_order = db.scalar(select(BrokerOrder.id).where(
+        BrokerOrder.execution_plan_item_id == item.id, BrokerOrder.side == 'buy',
+        BrokerOrder.mode == item.plan.mode, BrokerOrder.status.in_(CAPITAL_RESERVING_ORDER_STATUSES),
+    ).limit(1))
+    if pending_order is not None:
+        job = db.scalar(select(ExecutionJob).where(
+            ExecutionJob.execution_plan_item_id == item.id, ExecutionJob.job_type == 'core_quantity_reduction',
+        ).with_for_update())
+        if job is None or job.status not in {'queued', 'retrying', 'running'}:
+            from app.services.core_quantity_reductions import queue_core_quantity_reduction
+
+            queue_core_quantity_reduction(db=db, item=item, now=now)
+            changed = True
+    return changed
+
+
+def maintain_rule_entry_closures(*, settings, db: Session, now: datetime, execution_plan_id: str | None = None) -> int:
+    from app.services.core_handoff_v4 import persisted_core_plan_contract_ack
+
+    active_buy = select(BrokerOrder.id).where(
+        BrokerOrder.execution_plan_item_id == ExecutionPlanItem.id, BrokerOrder.side == 'buy',
+        BrokerOrder.mode == settings.runtime_mode, BrokerOrder.status.in_(CAPITAL_RESERVING_ORDER_STATUSES),
+    ).exists()
+    query = select(ExecutionPlanItem).join(ExecutionPlanItem.plan).where(
+        ExecutionPlan.mode == settings.runtime_mode, ExecutionPlan.source == 'kai-trading-core',
+        ExecutionPlanItem.side == 'buy', ExecutionPlanItem.quantity_policy['type'].as_string() == 'core_sized',
+        ExecutionPlanItem.risk_context['rule_origin']['strategy_id'].as_string() == 'krx_us_rebound',
+        or_(ExecutionPlanItem.risk_context[RULE_ENTRY_CLOSED_KEY]['schema_version'].as_string().is_(None), active_buy),
+    ).options(selectinload(ExecutionPlanItem.plan)).order_by(ExecutionPlanItem.id).with_for_update()
+    if execution_plan_id is not None:
+        query = query.where(ExecutionPlan.id == execution_plan_id)
+    changed = 0
+    for item in db.scalars(query).all():
+        proof = persisted_core_plan_contract_ack(item.plan)
+        if proof is not None and proof.get('origin_type') == 'rule':
+            changed += int(_latch_rule_entry_closure(db=db, item=item, now=now))
+    if changed:
+        db.flush()
+    return changed
+
+
+def next_rule_entry_maintenance_at(*, settings, db: Session, now: datetime) -> datetime | None:
+    from app.services.core_handoff_v4 import persisted_core_plan_contract_ack
+    from app.services.rule_execution import rule_close_exit_at
+
+    deadlines = []
+    items = db.scalars(select(ExecutionPlanItem).join(ExecutionPlanItem.plan).where(
+        ExecutionPlan.mode == settings.runtime_mode, ExecutionPlan.source == 'kai-trading-core',
+        ExecutionPlan.raw_payload['origin_type'].as_string() == 'rule',
+        ExecutionPlanItem.side == 'buy', ExecutionPlanItem.quantity_policy['type'].as_string() == 'core_sized',
+        ExecutionPlanItem.risk_context['rule_origin']['strategy_id'].as_string() == 'krx_us_rebound',
+        ExecutionPlanItem.risk_context[RULE_ENTRY_CLOSED_KEY]['schema_version'].as_string().is_(None),
+    )).all()
+    for item in items:
+        proof = persisted_core_plan_contract_ack(item.plan)
+        if proof is None or proof.get('origin_type') != 'rule':
+            continue
+        close_at = rule_close_exit_at(item)
+        if close_at is not None:
+            deadline = min(_quantity_policy(item.quantity_policy).valid_until, close_at)
+            if deadline > now:
+                deadlines.append(deadline)
+    retries = db.scalars(select(ExecutionJob).join(ExecutionJob.plan_item).join(ExecutionPlan).where(
+        ExecutionPlan.mode == settings.runtime_mode, ExecutionPlan.source == 'kai-trading-core',
+        ExecutionPlan.raw_payload['origin_type'].as_string() == 'rule',
+        ExecutionPlanItem.risk_context[RULE_ENTRY_CLOSED_KEY]['schema_version'].as_string() == 'rule_entry_closed_v1',
+        ExecutionJob.job_type == 'core_quantity_reduction', ExecutionJob.status.in_(['queued', 'retrying', 'running']),
+    )).all()
+    for job in retries:
+        retry_at = job.scheduled_for
+        if retry_at is not None:
+            retry_at = retry_at.replace(tzinfo=UTC) if retry_at.tzinfo is None else retry_at
+            if job.status == 'running' and job.locked_at is not None:
+                locked = job.locked_at.replace(tzinfo=UTC) if job.locked_at.tzinfo is None else job.locked_at
+                retry_at = max(retry_at, locked + timedelta(seconds=60))
+            deadlines.append(max(retry_at, now + timedelta(seconds=1)))
+    return min(deadlines) if deadlines else None
+
+
 def core_quantity_state(*, db: Session, item: ExecutionPlanItem, exclude_order_id: str | None = None) -> dict:
     policy = _quantity_policy(item.quantity_policy)
     orders = db.scalars(select(BrokerOrder).where(
@@ -199,7 +313,10 @@ def core_quantity_state(*, db: Session, item: ExecutionPlanItem, exclude_order_i
     if reduction is not None:
         uncertain = True
     filled_count, open_count = int(filled), int(open_quantity)
-    entry_closed = _entry_family_exit_started(db=db, item=item)
+    entry_closed = (
+        rule_entry_closure_reason(db=db, item=item, now=utc_now()) is not None
+        if rule_origin_for_plan_item(item) is not None else _entry_family_exit_started(db=db, item=item)
+    )
     return {
         'target_quantity': policy.target_quantity, 'revision': policy.revision,
         'filled_quantity': filled_count, 'open_quantity': open_count,
@@ -396,6 +513,7 @@ def revise_core_quantities(*, settings, db: Session, command: CoreQuantityRevisi
                 db.refresh(item, with_for_update=True)
                 if not is_core_sized(item.quantity_policy) or persisted_core_plan_contract_ack(item.plan) is None:
                     raise ValueError('quantity_contract_unproven')
+                closure_latched = _latch_rule_entry_closure(db=db, item=item, now=utc_now())
                 old = _quantity_policy(item.quantity_policy)
                 new = CoreSizedQuantityPolicy.model_validate(request.model_dump(include=set(CoreSizedQuantityPolicy.model_fields)))
                 result['execution_item_id'] = item.id
@@ -409,6 +527,8 @@ def revise_core_quantities(*, settings, db: Session, command: CoreQuantityRevisi
                             from app.services.core_quantity_reductions import queue_core_quantity_reduction
 
                             queue_core_quantity_reduction(db=db, item=item, now=utc_now())
+                        db.commit()
+                    elif closure_latched:
                         db.commit()
                     else:
                         db.rollback()
@@ -493,6 +613,8 @@ def _rearm_quantity_item(*, db: Session, item: ExecutionPlanItem, now: datetime)
 
     # Quantity changes never grant missing activation or revive revoked authority.
     if item.status in {'core_activation_pending', 'revoked', 'superseded', 'manual_review_required', 'contract_quarantined'}:
+        return False
+    if rule_entry_closure_reason(db=db, item=item, now=now) is not None:
         return False
     if now.astimezone(KST).date() != item.plan.market_date or now.astimezone(KST).time() >= time(15, 30):
         return False

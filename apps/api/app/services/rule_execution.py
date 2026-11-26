@@ -163,6 +163,10 @@ def rule_entry_block_reason(
         return 'rule_v4_contract_unproven'
     if now.tzinfo is None or now.utcoffset() is None or now >= deadline:
         return 'rule_entry_deadline_passed'
+    from app.services.core_quantity import rule_entry_closure_reason
+
+    if rule_entry_closure_reason(db=db, item=plan_item, now=now) is not None:
+        return 'rule_entry_closed'
     scope = plan_item_inventory_scope_key(plan_item)
     if scope is None:
         return 'rule_account_scope_unproven'
@@ -185,6 +189,13 @@ def rule_entry_block_reason(
         lane = plan_item_strategy_lane(other)
         other_origin = rule_origin_for_plan_item(other)
         has_exposure = any(not broker_order_is_provably_unsubmitted(order) for order in other.broker_orders)
+        if other.plan.market_date is not None:
+            from app.services.monitoring import _monitoring_item_is_effective_at
+
+            if not _monitoring_item_is_effective_at(item=other, effective_at=now):
+                if has_exposure:
+                    return 'rule_baseline_entry_priority'
+                continue
         if lane != 'krx_us_rebound':
             if other.status not in terminal or other.status == 'manual_review_required':
                 return 'rule_baseline_entry_priority'

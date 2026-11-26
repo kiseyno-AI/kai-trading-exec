@@ -2110,6 +2110,8 @@ def _normalize_safe_legacy_watch_authority(
         )
     except ValidationError:
         return set()
+    if isinstance(command, CoreRuleExecutionPlanRequestV4):
+        return set()
 
     from app.services.watch_exec_agent_sizing import (
         _canonical_terminal_rejection,

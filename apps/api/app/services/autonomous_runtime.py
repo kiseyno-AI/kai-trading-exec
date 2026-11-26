@@ -1071,9 +1071,12 @@ class AutonomousRuntimeCoordinator:
         self._monitoring_cycle_mutex_started_at = started_at
         try:
             if quote_wake is None:
-                return self._monitoring_cycle_sync(started_at)
-            result = self._monitoring_cycle_sync(started_at, quote_wake)
-            if quote_wake.urgent_symbol is not None:
+                result = self._monitoring_cycle_sync(started_at)
+            else:
+                result = self._monitoring_cycle_sync(started_at, quote_wake)
+            if int(result.get('rule_entry_closure_count') or 0) > 0:
+                self.invalidate_dispatch_schedule(reason='rule_entry_closed')
+            if quote_wake is not None and quote_wake.urgent_symbol is not None:
                 result["core_book_urgent_symbol"] = quote_wake.urgent_symbol
             return result
         finally:

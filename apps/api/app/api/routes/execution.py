@@ -360,6 +360,7 @@ def monitoring_evaluate(
             request,
             reason="manual_monitoring_evaluation",
             monitoring=True,
+            dispatch=bool(result.payload.get('rule_entry_closure_count')),
         )
     return JSONResponse(status_code=result.status_code, content=result.payload)
 

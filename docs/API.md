@@ -1355,6 +1355,8 @@ Current response includes:
 - `submitted_order_count`
 - `blocked_item_count`
 - `deferred_item_count`
+- `rule_entry_closure_count` (only when rule entry closure or its cancellation
+  job is persisted; also wakes the dispatch worker)
 - `items[]`
   - `execution_plan_item_id`
   - `symbol`
